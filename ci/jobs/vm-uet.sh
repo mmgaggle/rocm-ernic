@@ -31,7 +31,14 @@
 # Checks, each with its own result record:
 #  - uet_ernic_rma in both directions, over RUDI and RUD;
 #  - fi_info -p uet in each guest, test_rma writes in both
-#    directions, one over RUD, and two writers into one window.
+#    directions, one over RUD, and two writers into one window;
+#  - with "interop" in UET_CHECKS, wire interop with the software
+#    provider: UET_HOST_PROV_DIR is a prov/ directory built with
+#    the reference core ("make -C prov"), and a test_rma of it on
+#    the host writes into a guest's window and takes a write from
+#    a guest.  The bridge needs an IPv4 address in the engines'
+#    subnet, and the host process gets CAP_NET_RAW through
+#    "sudo -n setpriv"; with sec=, it runs the same TSS mode.
 # With UET_PCAP=1, or UET_PCAP=auto (the default) and
 # "sudo -n tcpdump" allowed, every transfer is captured on the
 # bridge (ip proto 253 or arp) and the capture must show the
@@ -57,6 +64,8 @@ UET_LEN="${UET_LEN:-4194304}"
 UET_PORT="${UET_PORT:-18515}"
 UET_PCAP="${UET_PCAP:-auto}"
 UET_CHECKS="${UET_CHECKS:-rma prov}"
+UET_HOST_PROV_DIR="${UET_HOST_PROV_DIR:-}"
+UET_HOST_IF="${UET_HOST_IF:-${CI_TAP_BRIDGE}}"
 UET_GUEST_DIR="${UET_GUEST_DIR:-phase3}" # under the guest user's home
 UET_SEC="$(sed -n 's/.*\bsec=\([a-z]*\).*/\1/p' <<<"${ERNIC_UET:-}")"
 UET_SEC="${UET_SEC:-none}"
@@ -73,9 +82,11 @@ case "${ERNIC_UET:-}" in
 '') log_warn "ERNIC_UET is not set; the instances may not run engines" ;;
 esac
 
-# The engine of instance N, from ERNIC_UET's ip= (%i is N).
+# The engine of instance N, from ERNIC_UET's ip= (%i is N); an
+# address is taken as it is.
 engine_ip() {
     local spec="${ERNIC_UET//%i/$1}"
+    case "$1" in *.*) echo "$1"; return ;; esac
     sed -n 's/.*\bip=\([0-9.]*\).*/\1/p' <<<"${spec}"
 }
 
@@ -303,6 +314,81 @@ prov_case() {
     return "${rc}"
 }
 
+# ── Interop with the software provider on the host ─
+
+host_ip() {
+    ip -4 -br addr show "${UET_HOST_IF}" 2>/dev/null | \
+        awk '{print $3}' | cut -d/ -f1
+}
+
+# The host side runs the reference core's raw socket shim on the
+# bridge, which needs CAP_NET_RAW, and the engines' TSS mode and
+# retransmit timeout.
+host_run() {
+    local rto sec_env=()
+    rto="$(sed -n 's/.*\brto=\([0-9]*\).*/\1/p' <<<"${ERNIC_UET:-}")"
+    [ "${UET_SEC}" != none ] && sec_env+=("UET_SEC_MODE=${UET_SEC}")
+    [ -n "${rto}" ] && sec_env+=("FI_UET_TX_TIMEOUT=${rto}")
+    sudo -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+        --inh-caps=+net_raw --ambient-caps=+net_raw -- \
+        env FI_PROVIDER_PATH="${UET_HOST_PROV_DIR}" \
+        UET_IFNAME="${UET_HOST_IF}" "${sec_env[@]}" "$@"
+}
+
+# The host writes UET_LEN bytes into guest $1's window.
+interop_host_to_guest() {
+    local to="$1" f="${OUT}/interop-hostto${1}" A K B S i rc=0 hip
+    hip="$(host_ip)"
+    pcap_start "${f}.pcap"
+    gssh 120 "${to}" "${PROV_ENV} && rm -f /tmp/uet-addr && \
+        timeout 100 ./test_rma -o /tmp/uet-addr -t 90 target ${UET_LEN} 0" \
+        >"${f}.target.log" 2>&1 &
+    local tpid=$!
+    for i in $(seq 100); do
+        grep -q '^SIZE' "${f}.target.log" && break
+        sleep 0.2
+    done
+    read -r A K B S < <(gssh 30 "${to}" 'cat /tmp/uet-addr')
+    [ -n "${S:-}" ] || { cat "${f}.target.log"; return 1; }
+    (cd "${UET_HOST_PROV_DIR}" && host_run timeout 100 ./test_rma -n \
+        -t 90 write "${A}" "${K}" "${B}" 0 "${S}") >"${f}.host.log" 2>&1 \
+        || rc=1
+    wait "${tpid}" || rc=1
+    grep -a '^WROTE\|Next-Hop MAC\|^TIMEOUT\|error' "${f}.host.log"
+    cat "${f}.target.log"
+    grep -aq '^WROTE' "${f}.host.log" || rc=1
+    grep -q "^VERIFIED ${UET_LEN} bytes" "${f}.target.log" || rc=1
+    pcap_stop "${f}.pcap" test_rma:4096
+    pcap_verify "${f}.pcap" "${hip}" "${to}" RUDI_REQ || rc=1
+    return "${rc}"
+}
+
+# Guest $1 writes UET_LEN bytes into a window on the host.
+interop_guest_to_host() {
+    local from="$1" f="${OUT}/interop-${1}tohost" A K B S i rc=0 hip
+    hip="$(host_ip)"
+    rm -f "${f}.addr"
+    pcap_start "${f}.pcap"
+    (cd "${UET_HOST_PROV_DIR}" && host_run timeout 100 ./test_rma \
+        -o "${f}.addr" -t 90 target "${UET_LEN}" 0) >"${f}.host.log" 2>&1 &
+    local tpid=$!
+    for i in $(seq 100); do
+        [ -s "${f}.addr" ] && break
+        sleep 0.2
+    done
+    read -r A K B S <"${f}.addr" || { cat "${f}.host.log"; return 1; }
+    gssh 120 "${from}" "${PROV_ENV} && timeout 100 ./test_rma -n -t 90 \
+        write ${A} ${K} ${B} 0 ${S}" >"${f}.writer.log" 2>&1 || rc=1
+    wait "${tpid}" || rc=1
+    cat "${f}.writer.log"
+    grep -a '^VERIFIED\|^TIMEOUT\|in_auth_pkts\|out_auth_pkts' "${f}.host.log"
+    grep -q '^WROTE' "${f}.writer.log" || rc=1
+    grep -aq "^VERIFIED ${UET_LEN} bytes" "${f}.host.log" || rc=1
+    pcap_stop "${f}.pcap" test_rma:4096
+    pcap_verify "${f}.pcap" "${from}" "${hip}" RUDI_REQ || rc=1
+    return "${rc}"
+}
+
 # ── Run ───────────────────────────────────────────
 
 log_info "label ${UET_LABEL}, sec ${UET_SEC}, ${UET_LEN} bytes," \
@@ -350,6 +436,28 @@ if [[ " ${UET_CHECKS} " == *" prov "* ]] && [ -n "${UET_PROV_DIR}" ]; then
     run_check "${UET_SUITE}" "prov-two-writers-1to2" \
         prov_case prov-two-writers-1to2 2 "$((2 * UET_LEN))" "" RUDI_REQ \
         "1:0:${UET_LEN}" "1:${UET_LEN}:${UET_LEN}"
+    group_end
+fi
+
+if [[ " ${UET_CHECKS} " == *" interop "* ]]; then
+    group_start "Wire interop with the software provider on ${UET_HOST_IF}"
+    if [ -z "${UET_HOST_PROV_DIR}" ] || \
+            [ ! -f "${UET_HOST_PROV_DIR}/libuet-fi.so" ]; then
+        record_result "${UET_SUITE}" interop skip 0 \
+            "UET_HOST_PROV_DIR has no libuet-fi.so"
+        log_warn "interop skipped: UET_HOST_PROV_DIR has no libuet-fi.so"
+    elif [ -z "$(host_ip)" ]; then
+        record_result "${UET_SUITE}" interop skip 0 \
+            "${UET_HOST_IF} has no IPv4 address"
+        log_warn "interop skipped: ${UET_HOST_IF} has no IPv4 address"
+    else
+        for n in 1 2; do
+            run_check "${UET_SUITE}" "interop-host-to-vm${n}" \
+                interop_host_to_guest "${n}"
+            run_check "${UET_SUITE}" "interop-vm${n}-to-host" \
+                interop_guest_to_host "${n}"
+        done
+    fi
     group_end
 fi
 

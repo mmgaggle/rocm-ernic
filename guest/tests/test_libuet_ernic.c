@@ -197,6 +197,8 @@ static void close_all(struct guest *g, uet_handle_t h, uet_domain_handle_t dom,
         CHECK(g, uet_mr_disable(mrs[i]) == 0);
         CHECK(g, uet_mr_close(mrs[i]) == 0);
     }
+    /* The channel cannot take transfers back; the provider then waits. */
+    CHECK(g, uet_ep_abort(ep) == -FI_ENOSYS);
     CHECK(g, uet_ep_close(ep) == 0);
     CHECK(g, uet_domain_close(dom) == 0);
     CHECK(g, uet_finalize(h) == 0);
