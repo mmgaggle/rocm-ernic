@@ -94,6 +94,14 @@ Build Options
      - kernel.org stable
      - Linux kernel git repository the ionic sources are
        fetched from
+   * - ``ERNIC_UET``
+     - ``OFF``
+     - Build the Ultra Ethernet Transport engine (``--uet``)
+       on the UEC reference provider (see :doc:`uet`)
+   * - ``ERNIC_UET_SOURCE_DIR``
+     - (none)
+     - The provider's source tree, required with
+       ``ERNIC_UET``
    * - ``ERNIC_INSTALL_SERVICE``
      - ``OFF``
      - Also install the systemd units, ``ernicctl``, the

@@ -112,6 +112,21 @@ by ``ansible/playbooks/s3-tests.yml``, which the hosted
 ``ci/jobs/vm-s3.sh`` mirrors check-by-check for the
 self-hosted lane. See :doc:`s3`.
 
+UET engine tests
+^^^^^^^^^^^^^^^^
+
+With ``-DERNIC_UET=ON`` two more tests are registered.
+``uet-engine-unit`` runs two engines in two processes joined
+by a socketpair and moves 1 MiB between them over RUDI, RUD,
+RUD with forced drops and TSS, comparing every byte.
+``uet-ci`` is a shell test that starts the real server with
+``--uet`` and checks that bad options are refused. Neither
+needs a VM, a TAP or root.
+
+.. code-block:: bash
+
+   ctest --test-dir build -R '^uet-'
+
 Running Tests
 -------------
 

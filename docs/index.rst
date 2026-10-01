@@ -26,6 +26,9 @@ Key Features
 - An in-process S3-over-RDMA object store, with its own
   in-band HTTP endpoint on the emulated wire, so the same
   single VM is a complete object fabric (see :doc:`s3`)
+- An optional Ultra Ethernet Transport engine that runs the
+  UEC reference stack as the NIC's firmware, at its own
+  address on the wire (see :doc:`uet`)
 - Working Ethernet and TCP/IP to the host via a TAP
   interface
 - Comprehensive statistics collection
@@ -64,6 +67,7 @@ a host TAP:
    ionic
    nvmeof
    s3
+   uet
    service
    monitoring
    testing
