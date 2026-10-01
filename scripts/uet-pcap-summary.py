@@ -4,15 +4,16 @@
 # SPDX-License-Identifier: MIT
 """Summarise the UET frames in a capture (classic pcap, Ethernet).
 
-    uet-pcap-summary.py FILE.pcap [--probe-rma OFFSET] [--json]
+    uet-pcap-summary.py FILE.pcap [--probe TOOL:OFFSET] [--json]
 
 For every IPv4 source and destination pair, counts the UET frames
 (IPv4 protocol 253) by PDS type, the requests flagged RETX and the
 frames whose first header is TSS. ARP frames are counted per sender.
 
---probe-rma OFFSET looks for 32 bytes of uet_ernic_rma's pattern,
+--probe TOOL:OFFSET looks for 32 bytes of a test tool's pattern,
 starting at that offset of the window, in every UET frame: found in
-the clear without TSS, never found with it.
+the clear without TSS, never found with it. TOOL is uet_ernic_rma
+(guest/tools) or test_rma (the libfabric provider's test).
 
 The PDS types are decoded from the UET specification independently
 of the provider, as tests/test_uet_engine.c does.
@@ -42,6 +43,14 @@ def rma_pattern(off):
     z = ((z ^ (z >> 27)) * 0x94d049bb133111eb) & m
     z ^= z >> 31
     return (z >> ((off % 8) * 8)) & 0xff
+
+
+def test_rma_pattern(off):
+    """test_rma's byte at window offset off (uet-ref-prov prov/)."""
+    return (off * 131 + (off >> 12) * 7 + 13) & 0xff
+
+
+PATTERNS = {"uet_ernic_rma": rma_pattern, "test_rma": test_rma_pattern}
 
 
 def frames(path):
@@ -76,13 +85,17 @@ def ip4(b):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("pcap")
-    ap.add_argument("--probe-rma", type=int, metavar="OFFSET")
+    ap.add_argument("--probe", metavar="TOOL:OFFSET")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
 
     probe = None
-    if a.probe_rma is not None:
-        probe = bytes(rma_pattern(a.probe_rma + i) for i in range(32))
+    if a.probe:
+        tool, _, off = a.probe.partition(":")
+        if tool not in PATTERNS or not off.isdigit():
+            ap.error(f"--probe wants TOOL:OFFSET, TOOL one of "
+                     f"{', '.join(PATTERNS)}")
+        probe = bytes(PATTERNS[tool](int(off) + i) for i in range(32))
 
     flows = collections.OrderedDict()
     arp = collections.Counter()

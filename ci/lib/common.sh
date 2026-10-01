@@ -257,20 +257,38 @@ ernic_env() {
 # ssh command for CI VM N (1-based).
 vm_ssh_port() { echo $(( CI_VM_SSH_BASE_PORT + $1 - 1 )); }
 
-vm_ssh() {
-    local n="$1"; shift
+# The ssh command line for CI VM N, without the destination, left in
+# the array VM_SSH_CMD; the destination is in VM_SSH_DEST.
+_vm_ssh_cmd() {
+    local n="$1"
     local id=()
     # The artifact ships its own key; the guest trusts nothing else.
     [ -n "${CI_VM_SSH_IDENTITY:-}" ] && [ -f "${CI_VM_SSH_IDENTITY}" ] && \
         id=(-i "${CI_VM_SSH_IDENTITY}" -o IdentitiesOnly=yes)
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o PasswordAuthentication=no \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        "${id[@]}" \
-        -p "$(vm_ssh_port "$n")" \
-        "${CI_VM_SSH_USER}@localhost" "$@"
+    VM_SSH_CMD=(ssh -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o PasswordAuthentication=no
+        -o ConnectTimeout=10
+        -o LogLevel=ERROR
+        "${id[@]}"
+        -p "$(vm_ssh_port "$n")")
+    VM_SSH_DEST="${CI_VM_SSH_USER}@localhost"
+}
+
+vm_ssh() {
+    local n="$1"; shift
+    _vm_ssh_cmd "$n"
+    "${VM_SSH_CMD[@]}" "${VM_SSH_DEST}" "$@"
+}
+
+# vm_ssh with a deadline: vm_ssh_t <seconds> <n> <command...>.  A
+# guest command that hangs is killed rather than stalling the job.
+vm_ssh_t() {
+    local secs="$1" n="$2"; shift 2
+    _vm_ssh_cmd "$n"
+    timeout --kill-after=5 "${secs}" "${VM_SSH_CMD[@]}" \
+        -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+        "${VM_SSH_DEST}" "$@"
 }
 
 # Pull the pinned guest image if it is not already on disk.

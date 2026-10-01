@@ -27,6 +27,22 @@
 /* How long a WRITE/READ may wait to be posted (ARP, engine slots). */
 #define SVC_POST_TIMEOUT_MS 5000u
 
+/*
+ * RUDI has no window: the provider sends every packet of a message at once
+ * and retransmits each one that is not answered within the retransmit
+ * timeout.  A burst larger than the receiving side's TAP queue is lost, and
+ * the retransmissions of a large one come before the receiver has worked
+ * through it, so a 4 MiB write failed on its retry limit.  RUDI transfers
+ * therefore go to the engine in segments, with a cap on the RUDI bytes in
+ * the engine across all transfers.  RUD has the PDS's own window and goes
+ * as one message.
+ */
+#define SVC_RUDI_SEG    (256u * 1024u) /* bytes per RUDI segment */
+#define SVC_RUDI_WINDOW (512u * 1024u) /* RUDI bytes in the engine, at most */
+#define SVC_MAX_SEGS    4u             /* segments of one transfer in flight */
+_Static_assert(SVC_RUDI_WINDOW / SVC_RUDI_SEG <= SVC_MAX_SEGS,
+               "a transfer can have the whole window in flight");
+
 /* A region the engine cannot address is refused rather than registered:
  * 2^22 pages is 16 GiB of 4 KiB pages. */
 #define SVC_MAX_PAGES (1u << 22)
@@ -52,16 +68,22 @@ struct svc_peer {
 
 struct svc_op {
     bool used;
-    bool posted;
+    bool posted; /* some of it is, or was, in the engine */
     bool orphan; /* its QP went away: the completion is dropped */
+    bool stop;   /* post no more of it: it failed, or its QP went */
     uint8_t opcode;
     uint32_t qp_id;
     uint32_t mr;     /* region slot */
     uint32_t peer;   /* peer slot */
     uint64_t cookie; /* the guest's */
-    uint64_t seq;    /* tags the engine cookie */
+    uint64_t seq;    /* tags the engine cookies */
     uint64_t deadline_ms;
-    struct uet_engine_rma rma;
+    int status;    /* the first error, a positive errno */
+    uint64_t sent; /* bytes handed to the engine */
+    uint32_t segs_out;
+    uint8_t seg_busy; /* bit per entry of seg_len */
+    uint64_t seg_len[SVC_MAX_SEGS];
+    struct uet_engine_rma rma; /* the whole transfer */
 };
 
 struct svc_reply {
@@ -78,6 +100,7 @@ struct uet_svc {
     struct svc_peer peers[SVC_MAX_PEERS];
     struct svc_op ops_tab[SVC_MAX_OPS];
     uint64_t next_seq;
+    uint64_t rudi_out; /* RUDI bytes in the engine */
 
     struct svc_reply *replies; /* FIFO, oldest first */
     uint32_t nreplies;
@@ -225,22 +248,92 @@ static void op_finish(struct uet_svc *s, struct svc_op *op, int status)
     memset(op, 0, sizeof(*op));
 }
 
-/* Hand a waiting transfer to the engine.  Returns true once it is settled:
- * posted, or answered with an error. */
-static bool op_try_post(struct uet_svc *s, struct svc_op *op, uint64_t now)
+/*
+ * The engine cookie of segment @k of @op: the slot, the segment and the
+ * sequence number, so a completion for a slot that has since been reused
+ * is not mistaken for the new occupant's.
+ */
+static uint64_t op_engine_cookie(const struct uet_svc *s,
+                                 const struct svc_op *op, uint32_t k)
 {
-    int rc = op->opcode == UET_ERNIC_OP_WRITE
-                 ? uet_engine_post_write(s->e, &op->rma)
-                 : uet_engine_post_read(s->e, &op->rma);
+    return (op->seq << 16) | ((uint64_t)k << 8) |
+           (uint64_t)(op - s->ops_tab);
+}
 
-    if (rc == 0) {
-        op->posted = true;
-        return true;
+/*
+ * Hand what the engine can take of a transfer to it, and answer the
+ * transfer once nothing of it is left to post or in flight.
+ */
+static void op_pump(struct uet_svc *s, struct svc_op *op, uint64_t now)
+{
+    while (!op->stop && op->sent < op->rma.len &&
+           op->segs_out < SVC_MAX_SEGS) {
+        uint64_t seg = op->rma.len - op->sent;
+        uint32_t k = 0;
+
+        if (op->rma.rudi) {
+            if (seg > SVC_RUDI_SEG)
+                seg = SVC_RUDI_SEG;
+            /* Wait for the window; completions open it, so this is
+             * not a reason to time out. */
+            if (s->rudi_out != 0 && s->rudi_out + seg > SVC_RUDI_WINDOW)
+                break;
+        }
+        while (op->seg_busy & (1u << k))
+            k++;
+
+        struct uet_engine_rma r = op->rma;
+        r.local_addr += op->sent;
+        r.remote_addr += op->sent;
+        r.len = seg;
+        r.cookie = op_engine_cookie(s, op, k);
+        int rc = op->opcode == UET_ERNIC_OP_WRITE
+                     ? uet_engine_post_write(s->e, &r)
+                     : uet_engine_post_read(s->e, &r);
+        if (rc == 0) {
+            op->posted = true;
+            op->sent += seg;
+            op->segs_out++;
+            op->seg_busy |= (uint8_t)(1u << k);
+            op->seg_len[k] = seg;
+            if (op->rma.rudi)
+                s->rudi_out += seg;
+            op->deadline_ms = now + SVC_POST_TIMEOUT_MS;
+            continue;
+        }
+        if (rc == -EAGAIN && now < op->deadline_ms)
+            break;
+        op->status = rc == -EAGAIN ? ETIMEDOUT : -rc;
+        op->stop = true;
     }
-    if (rc == -EAGAIN && now < op->deadline_ms)
-        return false;
-    op_finish(s, op, rc == -EAGAIN ? ETIMEDOUT : -rc);
-    return true;
+    if (op->segs_out == 0 && (op->stop || op->sent == op->rma.len))
+        op_finish(s, op, op->status);
+}
+
+/* A segment of a transfer has left the engine. */
+static void op_seg_done(struct uet_svc *s, uint64_t cookie, int status,
+                        uint64_t now)
+{
+    uint64_t slot = cookie & 0xffu;
+    uint32_t k = (uint32_t)(cookie >> 8) & 0xffu;
+    struct svc_op *op;
+
+    if (slot >= SVC_MAX_OPS || k >= SVC_MAX_SEGS)
+        return;
+    op = &s->ops_tab[slot];
+    if (!op->used || op->seq != cookie >> 16 ||
+        (op->seg_busy & (1u << k)) == 0)
+        return;
+
+    op->seg_busy &= (uint8_t) ~(1u << k);
+    op->segs_out--;
+    if (op->rma.rudi)
+        s->rudi_out -= op->seg_len[k];
+    if (status != 0 && op->status == 0) {
+        op->status = status;
+        op->stop = true;
+    }
+    op_pump(s, op, now);
 }
 
 static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
@@ -304,22 +397,28 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     op->rma.remote_addr = le64toh(req.remote_offset);
     op->rma.rkey = le64toh(req.rkey);
     op->rma.rudi = (flags & UET_ERNIC_RMA_RUDI) != 0;
-    /* The slot and the sequence number, so a completion for a slot that
-     * has since been reused is not mistaken for the new occupant's. */
-    op->rma.cookie = ((uint64_t)op->seq << 16) | (uint64_t)(op - s->ops_tab);
 
-    (void)op_try_post(s, op, now);
+    op_pump(s, op, now);
 }
 
-/* Settle every waiting transfer that uses a region or peer slot. */
+/*
+ * Post nothing more of the transfers that use a region or peer slot.  Those
+ * with nothing in the engine are answered at once; the others when their
+ * segments in the engine have failed there.
+ */
 static void cancel_waiting(struct uet_svc *s, bool by_mr, uint32_t slot)
 {
     for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
         struct svc_op *op = &s->ops_tab[i];
 
-        if (op->used && !op->posted &&
-            (by_mr ? op->mr == slot : op->peer == slot))
-            op_finish(s, op, ECANCELED);
+        if (!op->used || op->stop || op->sent == op->rma.len ||
+            (by_mr ? op->mr != slot : op->peer != slot))
+            continue;
+        op->stop = true;
+        if (op->status == 0)
+            op->status = ECANCELED;
+        if (op->segs_out == 0)
+            op_finish(s, op, op->status);
     }
 }
 
@@ -658,26 +757,17 @@ void uet_svc_poll(struct uet_svc *s)
     if (s == NULL)
         return;
 
+    uint64_t now = now_ms();
     while ((n = uet_engine_poll_comp(s->e, comp, 16)) > 0) {
-        for (size_t i = 0; i < n; i++) {
-            uint64_t slot = comp[i].cookie & 0xffffu;
-            struct svc_op *op;
-
-            if (slot >= SVC_MAX_OPS)
-                continue;
-            op = &s->ops_tab[slot];
-            if (!op->used || !op->posted || op->seq != comp[i].cookie >> 16)
-                continue;
-            op_finish(s, op, -comp[i].status);
-        }
+        for (size_t i = 0; i < n; i++)
+            op_seg_done(s, comp[i].cookie, -comp[i].status, now);
     }
 
-    uint64_t now = now_ms();
     for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
         struct svc_op *op = &s->ops_tab[i];
 
-        if (op->used && !op->posted)
-            (void)op_try_post(s, op, now);
+        if (op->used && !op->stop && op->sent < op->rma.len)
+            op_pump(s, op, now);
     }
 
     if (s->nreplies > 0)
@@ -689,7 +779,9 @@ bool uet_svc_has_work(const struct uet_svc *s)
     if (s == NULL)
         return false;
     for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
-        if (s->ops_tab[i].used && !s->ops_tab[i].posted)
+        const struct svc_op *op = &s->ops_tab[i];
+
+        if (op->used && !op->stop && op->sent < op->rma.len)
             return true;
     }
     return false;
@@ -720,10 +812,13 @@ void uet_svc_qp_gone(struct uet_svc *s, uint32_t qp_id)
 
         if (!op->used || op->qp_id != qp_id)
             continue;
-        if (op->posted)
+        if (op->segs_out > 0) {
+            /* Settled, unanswered, once the engine is done with it. */
             op->orphan = true;
-        else
+            op->stop = true;
+        } else {
             memset(op, 0, sizeof(*op));
+        }
     }
     for (uint32_t i = 0; i < SVC_MAX_MRS; i++) {
         if (s->mrs[i].used && s->mrs[i].qp_id == qp_id)
