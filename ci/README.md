@@ -465,6 +465,7 @@ bash ci/jobs/loopback.sh       # loopback backend suite
 bash ci/jobs/vm-up.sh          # boot the CI VMs
 bash ci/jobs/vm-functional.sh  # RDMA functional tests
 bash ci/jobs/vm-nvmeof.sh      # NVMe-oF functional tests
+bash ci/jobs/vm-uet.sh         # UET between the guests' engines
 bash ci/jobs/perf.sh           # performance sweeps
 bash ci/jobs/vm-down.sh        # tear down
 ```
@@ -502,6 +503,21 @@ export ERNIC_BACKEND=nvmeof:size=256M,bs=4096
 bash ci/jobs/vm-up.sh
 bash ci/jobs/vm-nvmeof.sh
 bash ci/jobs/vm-down.sh
+```
+
+`vm-uet.sh` needs the instances to run UET engines, so it
+needs a build with `-DERNIC_UET=ON` and `ERNIC_UET` set for the
+launcher, and guest setup from `vm-functional.sh`. See
+`docs/uet.rst` ("Two VMs") for the checks, the TSS pass and
+the opt-in interop with the software provider on the host.
+
+```bash
+export CI_BUILD_DIR=$PWD/build-uet
+export ERNIC_UET='ip=192.168.200.10%i'
+export UET_PROV_DIR=/path/to/uet-ref-prov
+bash ci/jobs/vm-up.sh
+bash ci/jobs/vm-functional.sh
+bash ci/jobs/vm-uet.sh
 ```
 
 Useful overrides:

@@ -10,15 +10,17 @@ address on the emulated wire, and it sends and receives real
 UET frames: Ethernet, IPv4 protocol 253, the PDS and SES
 headers, and a TSS header when security is on.
 
-Phases 1, 2 and 4 of the work are done. The engine runs and
+Phases 1 to 4 of the work are done. The engine runs and
 moves data between two engines with every delivery mode Slice
 A asks for (phase 1). A guest drives it through a command
 channel on an ordinary RC queue pair (phase 2). A guest library,
 ``libuet_ernic``, implements the part of the reference API that
 the libfabric ``uet`` provider calls, on top of that channel
-(phase 4). Everything is tested without a VM. Running it in two
-VMs is phase 3, and what it still needs is listed at the end of
-this page.
+(phase 4). Two VMs move data through their engines, with the
+guest tool and with the libfabric provider built over
+``libuet_ernic``, and a guest interoperates on the wire with
+the software provider running on the host (phase 3, see
+`Two VMs`_).
 
 .. contents::
    :local:
@@ -327,6 +329,19 @@ yet, because ARP is still running or the engine is busy,
 waits in the device for up to 5 s. After that it fails with
 ``ETIMEDOUT``.
 
+A ``WRITE`` or ``READ`` that asks for RUDI goes to the engine
+in segments of 256 KiB, with at most 512 KiB of RUDI in the
+engine at a time across all transfers. RUDI has no window: the
+provider sends every packet of a message at once and
+retransmits each unanswered one after the retransmit timeout.
+In two VMs, a 4 MiB RUDI write in one message overflowed the
+receiving TAP's queue, and the retransmissions came before the
+receiver had worked through the first burst: the capture showed
+24555 requests and 11941 responses, and the write failed with
+``EIO``. RUD transfers go as one message, under the PDS's own
+window. A transfer is answered once all its segments are done,
+with the first error of any of them.
+
 A reply is delivered as a SEND into the next receive the
 guest has posted on the service QP. So the guest must keep a
 receive of 64 bytes or more posted for every command in
@@ -383,9 +398,12 @@ reference's ``uet_api.h``, so a prototype or constant that
 drifts breaks the build. So the provider can link this library
 instead of the reference library and run unchanged.
 
-``uet_initialize()`` opens the first ionic device, or the one
-named by ``UET_ERNIC_DEVICE``. It never falls back to another
-kind of device. It creates the service QP, connects it, posts
+``uet_initialize()`` opens the device named by
+``UET_ERNIC_DEVICE``, or else the first ionic one: one whose
+name starts with ``ionic``, or, because the guest image's udev
+rule renames it ``rocm-rdma-ernic0``, one whose PCI function
+has Pensando's vendor ID 0x1dd8 (``uet_ernic_device_match()``).
+It never falls back to another kind of device. It creates the service QP, connects it, posts
 64 receives and sends ``QUERY``. Commands that the engine
 answers at once are waited for. Each ``WRITE`` and ``READ``
 reply becomes an entry in the completion queue of the
@@ -397,10 +415,23 @@ These are the differences from the reference library:
 
 - One engine endpoint serves every endpoint opened here, so
   they share its address and JobID.
-- RMA writes and reads only, and only from registered memory:
-  the local buffer must lie in the region named by the
-  handle. No immediate data, no messages, no atomics, no
-  target-side events.
+- RMA writes and reads only. No immediate data, no messages,
+  no atomics, no target-side events.
+- A local buffer passed without a region, as the libfabric
+  provider passes every source buffer, is registered on
+  demand: the 2 MiB-aligned window around it, clipped to its
+  mapping, is registered with ibverbs and the engine once and
+  kept, up to 16 of them, evicted least recently used.
+  ``UET_ERNIC_MR_CACHE=0`` drops each one when its transfers
+  are done instead. As with any registration cache, a buffer
+  must not be written from after it is unmapped and mapped
+  again at the same address while the old registration is
+  cached.
+- ``uet_ep_abort()`` returns ``-FI_ENOSYS``: the channel cannot
+  take back a transfer the device has accepted. The provider
+  then does what it does with the reference's stop-and-go PDS:
+  ``fi_close()`` drops the writes it has not handed over yet
+  and waits up to 10 s for the ones it has.
 - ``uet_mr_disable()`` keeps the region reachable by peers
   until ``uet_mr_close()``. Re-enabling it would need a new
   key, and callers keep the old one.
@@ -412,9 +443,9 @@ initiator over TCP on the guests' own network. The initiator
 writes a known pattern over RUDI (``-r``) or RUD, reads the
 start back, and the target compares every byte.
 
-The library has been compiled and tested only against a fake
-libibverbs (see below). It has not run on an ionic device or
-the ionic kernel driver, which needs a VM.
+The library is tested against a fake libibverbs (see below)
+and, in two VMs, on the ionic kernel driver and rdma-core's
+ionic provider (see `Two VMs`_).
 
 What Works
 ----------
@@ -546,6 +577,126 @@ One run, on a Debug build with AddressSanitizer:
      device A: left: 0 regions 0 peers 0 ops
      device B: left: 0 regions 0 peers 0 ops
 
+Two VMs
+-------
+
+Phase 3 runs the engine for real: two rocm-ernic instances,
+each with ``--tap`` on one Linux bridge and its own
+``--uet ip=``, and a VM on each. The guests are the CI image
+(Ubuntu 26.04, kernel 7.2.3, the ionic DKMS modules and
+rdma-core 61 from guest setup). Guest RC traffic still goes
+over the TCP mesh; UET frames go over the TAPs and the bridge.
+
+``ci/jobs/vm-uet.sh`` is the lane. It copies the guest-side
+sources into both guests and builds them there:
+``libuet_ernic.so``, ``uet_ernic_rma`` and, from the
+reference tree in ``UET_PROV_DIR``, the libfabric ``uet``
+provider over ``libuet_ernic`` (``make -C prov ernic``) and its
+``test_rma``. It installs ``libfabric-dev`` and
+``libfabric-bin`` in the guests if they are missing. Then it
+runs, each as its own result record:
+
+- ``uet_ernic_rma``, 4 MiB, from VM 1 to VM 2 and back, over
+  RUDI and over RUD, with a 64 KiB read back;
+- ``fi_info -p uet`` in each guest;
+- ``test_rma`` writes of 4 MiB through the provider, both
+  ways, one over RUD (``FI_UET_RUDI=0``), and two writer
+  processes into one 8 MiB window;
+- with ``interop`` in ``UET_CHECKS``, the software provider on
+  the host against each guest, both ways (see `Interop with
+  the software provider`_).
+
+With ``sudo -n tcpdump`` allowed, every transfer is captured on
+the bridge (``ip proto 253 or arp``) and summarised by
+``scripts/uet-pcap-summary.py``. A check fails unless the
+capture shows UET frames both ways between the two engines and
+nowhere else, with the expected requests (``RUDI_REQ`` or
+``RUD_REQ``) and the payload in the clear, or, with ``sec=``,
+every frame wrapped in TSS and the payload nowhere in the clear.
+
+To run it:
+
+.. code-block:: bash
+
+   export CI_BUILD_DIR=$PWD/build-uet   # -DERNIC_UET=ON
+   export ERNIC_UET='ip=192.168.200.10%i'
+   export UET_PROV_DIR=/path/to/uet-ref-prov   # prov/ has CORE=ernic
+   bash ci/jobs/vm-up.sh
+   bash ci/jobs/vm-functional.sh   # guest setup
+   bash ci/jobs/vm-uet.sh
+
+For the TSS pass, restart the instances with
+``ERNIC_UET='ip=192.168.200.10%i,sec=cluster,rto=1000'``:
+``CI_KEEP_OVERLAYS=true bash ci/jobs/vm-down.sh``, then
+``vm-up.sh``, ``vm-functional.sh`` and ``vm-uet.sh`` again. The
+overlays keep the guest setup, so it takes about 30 s.
+
+Results
+^^^^^^^
+
+One run, KVM, 4 vCPUs and 8 GiB per guest, Release build of
+the server, every check passed. Rates are the tools' own, for
+4 MiB, from VM 1 to VM 2 and from VM 2 to VM 1:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 22 50
+
+   * - Case
+     - sec=none
+     - On the wire, one way (sec=none)
+   * - ``uet_ernic_rma`` RUDI
+     - 163, 150 MiB/s
+     - 4160 ``RUDI_REQ``, 4160 ``RUDI_RESP``: the write and
+       the read, no retransmission
+   * - ``uet_ernic_rma`` RUD
+     - 180, 179 MiB/s
+     - 4160 ``RUD_REQ`` and 64 ``ACK`` out, 380 ``ACK`` and
+       64 ``RUD_REQ`` back (the read)
+   * - ``test_rma`` RUDI
+     - 152, 163 MiB/s
+     - 4096 ``RUDI_REQ``, 4096 ``RUDI_RESP``
+   * - ``test_rma`` RUD (1 to 2)
+     - 184 MiB/s
+     - 4096 ``RUD_REQ``, 256 ``ACK``
+   * - ``test_rma``, two writers in VM 1
+     - 75 and 78 MiB/s
+     - 8818 ``RUDI_REQ`` for 8192 packets
+
+With ``sec=cluster,rto=1000`` every frame both ways starts with
+a TSS header, the payload is never in the clear, and the rates
+are 3.7 to 4.0 MiB/s for one writer and 1.9 and 2.0 MiB/s for
+two. That is the provider's software AES-GCM, which the engine
+runs on its one thread.
+
+Interop with the software provider
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The engine and the reference provider's software path speak
+the same protocol, so a guest can exchange UET with a process
+on the host. Give the bridge an address in the engines' subnet,
+build the provider with the reference core, and add the checks:
+
+.. code-block:: bash
+
+   sudo ip addr add 192.168.200.250/24 dev ernic-ci-br0
+   make -C /path/to/uet-ref-prov/prov   # CORE=ref
+   UET_HOST_PROV_DIR=/path/to/uet-ref-prov/prov \
+   UET_CHECKS="rma prov interop" bash ci/jobs/vm-uet.sh
+
+The host's ``test_rma`` runs the raw socket NIC shim on the
+bridge, with ``CAP_NET_RAW`` from ``sudo -n setpriv``. It writes
+4 MiB into each guest's window, and each guest writes 4 MiB into
+a window on the host. All four passed with ``sec=none`` (4096
+``RUDI_REQ`` and 4096 ``RUDI_RESP`` each) and with
+``sec=cluster`` (all TSS; the host's TSS counted 4096 packets
+authenticated each way). Guests wrote to the host at
+217 and 218 MiB/s, the host to the guests at 106 and 110 MiB/s
+(3.7 to 3.9 MiB/s with TSS). The host's first write to a
+guest takes about 10 s longer, because the reference provider
+resolves the next hop with ``ping``, and the engine answers ARP
+but not ICMP.
+
 Known Limits and Findings
 -------------------------
 
@@ -574,37 +725,28 @@ Known Limits and Findings
   provider before phase 3.
 - ``sec=server`` (TSS client/server mode) and key rotation
   are not offered.
+- The libfabric provider over ``libuet_ernic`` offers no
+  immediate data (``cq_data_size`` is 0, ``fi_writedata()``
+  returns ``-FI_ENOSYS``), because the engine raises no events at
+  the target. ``test_rma`` targets therefore check their window
+  rather than wait for a signal.
+- ``fi_close()`` on that provider cannot discard writes already
+  in the device (see the guest library's differences). A late
+  write cut off by closing the endpoint can still land.
 
 Next Phases
 -----------
 
-Phase 3: two VMs
-^^^^^^^^^^^^^^^^
-
-Two instances, each with ``--tap`` on one Linux bridge and its
-own ``--uet ip=``, and ``uet_ernic_rma`` built and run in each
-guest. What is left:
-
-- Host: the bridge and two TAPs that ``ci/doctor.sh`` asks for,
-  the guest image (``scripts/fetch-guest-image.sh``, which needs
-  ``oras``), a writable image directory, and the QEMU the CI
-  jobs expect (Fedora's QEMU 10.2.2 has ``vfio-user-pci``, but
-  the jobs look for a custom build first).
-- Guest: libfabric's headers and the reference tree's
-  ``uet_addr.h``, to build ``libuet_ernic`` and
-  ``uet_ernic_rma`` in the guest, or a host-built copy.
-- A CI job (``ci/jobs/vm-uet.sh`` and a playbook) that starts
-  both instances with ``--uet`` and runs the tool both ways,
-  RUDI and RUD, plus ``sec=cluster``.
-- Not yet shown: that the ionic driver and the userspace
-  provider accept an RC QP connected to QPN ``0x00e00001`` at
-  the guest's own GID. The datapath sees only the destination
-  QPN, so this is expected to work.
-
-Phase 4 leftovers
-^^^^^^^^^^^^^^^^^
-
-The library is complete for the provider's calls. To run the
-provider on it, link the provider against ``libuet_ernic``
-instead of the reference library and set ``UET_FORCE_RUDI`` as
-the provider already does.
+- Discarding transfers. ``uet_ep_abort()`` needs the channel
+  to take back a guest endpoint's transfers: drop those still
+  waiting in the device, post no more segments of the others,
+  and abort what is in the engine. The last part needs the
+  provider's ``uet_ep_abort()`` (on the provider's
+  ``wip-libfabric-provider-cutoff`` branch, not yet on the
+  hooks branch the engine builds from), which aborts a whole
+  provider endpoint. The engine has one, shared by every
+  service QP, so it would have to post again the transfers of
+  other QPs that the abort took with it.
+- Target-side events, for immediate data and ``fi_writedata``.
+- Throughput: each segment is a command and a reply on the
+  service QP, and the engine runs on the vfio-user thread.
