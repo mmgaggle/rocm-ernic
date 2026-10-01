@@ -100,6 +100,32 @@ void ionic_eth_emu_register_tx_filter(struct ionic_eth_emu *emu,
                                       ionic_eth_tx_filter_fn fn, void *ctx);
 
 /*
+ * Give an in-process endpoint first refusal on every frame that arrives
+ * from the wire (the host TAP), before the guest's Rx ring sees it.
+ *
+ * The filter returns true when the frame was addressed to it and has been
+ * consumed, in which case the guest never sees it.  This is how a device
+ * function with an address of its own on the wire -- the UET engine --
+ * receives its traffic.  With a filter registered the wire is drained even
+ * while the guest has no Rx ring, so the function keeps working before the
+ * driver loads and after it unloads; frames the filter leaves are then
+ * dropped, as a NIC with no posted buffers drops them.
+ */
+typedef bool (*ionic_eth_rx_filter_fn)(void *ctx, const void *frame,
+                                       size_t len);
+void ionic_eth_emu_register_rx_filter(struct ionic_eth_emu *emu,
+                                      ionic_eth_rx_filter_fn fn, void *ctx);
+
+/*
+ * Transmit a frame on the wire on behalf of an in-process endpoint, without
+ * involving the guest's queues.  Returns 0, -ENETDOWN when the LIF has no
+ * host backend, or another negative errno from the backend (-EAGAIN when
+ * the TAP's queue is full).
+ */
+int ionic_eth_emu_wire_send(struct ionic_eth_emu *emu, const void *frame,
+                            size_t len);
+
+/*
  * Hand a received frame to the emulated LIF from a thread that may not DMA
  * (the TCP mesh receive thread).  The frame is copied onto an internal queue
  * and delivered to the guest by the next ionic_eth_emu_poll_rx().
@@ -115,5 +141,12 @@ int ionic_eth_emu_queue_rx_frame(struct ionic_eth_emu *emu, const void *frame,
  * vfio-user context; the server's main loop does this on every iteration.
  */
 void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu);
+
+/*
+ * Serve only the wire-side Rx filter, for use while no client is attached:
+ * the guest's Rx ring, which may be left over from a client that has gone,
+ * is not touched, and frames the filter does not take are dropped.
+ */
+void ionic_eth_emu_poll_wire(struct ionic_eth_emu *emu);
 
 #endif /* IONIC_ETH_EMU_H */

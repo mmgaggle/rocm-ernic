@@ -308,6 +308,9 @@ struct ionic_eth_emu {
     /* In-process endpoint offered every Tx frame before the backend. */
     ionic_eth_tx_filter_fn tx_filter;
     void *tx_filter_ctx;
+    /* In-process endpoint offered every wire Rx frame before the guest. */
+    ionic_eth_rx_filter_fn rx_filter;
+    void *rx_filter_ctx;
     /* Staging buffer for one frame in either direction. */
     uint8_t frame[IONIC_ETH_NET_MTU_MAX];
 
@@ -476,6 +479,23 @@ void ionic_eth_emu_register_tx_filter(struct ionic_eth_emu *emu,
 {
     emu->tx_filter = fn;
     emu->tx_filter_ctx = ctx;
+}
+
+void ionic_eth_emu_register_rx_filter(struct ionic_eth_emu *emu,
+                                      ionic_eth_rx_filter_fn fn, void *ctx)
+{
+    emu->rx_filter = fn;
+    emu->rx_filter_ctx = ctx;
+}
+
+int ionic_eth_emu_wire_send(struct ionic_eth_emu *emu, const void *frame,
+                            size_t len)
+{
+    if (!emu || !frame || len == 0 || len > IONIC_ETH_NET_MTU_MAX)
+        return -EINVAL;
+    if (!emu->net)
+        return -ENETDOWN;
+    return ionic_eth_net_send(emu->net, frame, len);
 }
 
 void ionic_eth_emu_register_adminq(struct ionic_eth_emu *emu,
@@ -1581,13 +1601,17 @@ static int eth_rx_deliver(struct ionic_eth_emu *emu, struct eth_queue *q,
     return 0;
 }
 
-void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
+static void eth_poll_rx(struct ionic_eth_emu *emu, bool guest_attached)
 {
     if (!emu)
         return;
 
     struct eth_queue *q = &emu->eth_q[IONIC_QTYPE_RXQ][0];
-    if (!q->valid)
+    bool guest_rx = guest_attached && q->valid;
+
+    /* With no Rx ring and no in-process endpoint nobody would take a
+     * frame, so leave them queued in the tap. */
+    if (!guest_rx && !emu->rx_filter)
         return;
 
     /* Bounded per poll so a busy tap cannot starve the RDMA admin queue. */
@@ -1598,11 +1622,21 @@ void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
         if (len <= 0)
             break;
 
-        if (eth_rx_deliver(emu, q, emu->frame, (size_t)len) == 0) {
+        /* The wire-side endpoint (the UET engine) sees each frame first;
+         * what it takes is not the guest's. */
+        if (emu->rx_filter &&
+            emu->rx_filter(emu->rx_filter_ctx, emu->frame, (size_t)len))
+            continue;
+
+        if (guest_rx && eth_rx_deliver(emu, q, emu->frame, (size_t)len) == 0) {
             delivered = true;
             pvrdma_eth_bytes_count(emu->pvrdma_handle, (uint64_t)len, false);
         }
     }
+
+    /* Mesh frames only ever go to the guest; they wait for its ring. */
+    if (!guest_rx)
+        return;
 
     /* Frames queued by off-thread producers (TCP mesh).  A frame that the
      * guest has no buffer for is put back at the head so ordering holds and
@@ -1638,6 +1672,16 @@ void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
 
     if (delivered)
         ionic_eth_emu_trigger_irq(emu, q->intr_index);
+}
+
+void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)
+{
+    eth_poll_rx(emu, true);
+}
+
+void ionic_eth_emu_poll_wire(struct ionic_eth_emu *emu)
+{
+    eth_poll_rx(emu, false);
 }
 
 int ionic_eth_emu_attach_tap(struct ionic_eth_emu *emu, const char *ifname,
