@@ -58,6 +58,11 @@ if(ERNIC_UET)
           "(uet_nic_register_shim, uet_set_dma_translate) the engine needs")
     endif()
 
+    # The guest library (guest/) uses libfabric's types, not the library,
+    # so only the headers are needed; without them it is not built.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBFABRIC libfabric)
+
     set(ERNIC_UET_INCLUDE_DIRS
         ${ERNIC_UET_SOURCE_DIR}
         ${ERNIC_UET_SOURCE_DIR}/nic_shim

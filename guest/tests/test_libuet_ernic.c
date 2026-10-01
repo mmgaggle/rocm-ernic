@@ -1,0 +1,512 @@
+/*
+ * test_libuet_ernic.c -- libuet_ernic between two fake guests
+ *
+ * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * Two guests and their two devices, four processes. Each guest runs
+ * libuet_ernic over the fake libibverbs in fake_ibverbs.c; each device is
+ * tests/uet_fake_device.c, which runs the real UET command channel and
+ * engine; the two engines exchange real UET frames over a socketpair. A
+ * guest's memory is a memfd its device maps too, as a VM's is.
+ *
+ * The guests use the library the way the libfabric "uet" provider does:
+ * initialize, domain, endpoint, completion queues, register, bind, enable,
+ * getname, av_insert, then RMA, reaping completions with uet_cq_read().
+ * The initiator WRITEs to the target's window over RUDI and RUD, READs
+ * some of it back and checks the calls the library refuses; the target
+ * compares its window byte for byte. Then both tear everything down, and
+ * each device must be left holding nothing.
+ *
+ * Only libibverbs is faked. Nothing here runs on an ionic device or the
+ * kernel driver; that needs a VM.
+ *
+ * Usage: test_libuet_ernic PATH_TO_uet_fake_device
+ */
+
+#include <errno.h>
+#include <inttypes.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <rdma/fi_errno.h>
+
+#include "fake_ibverbs.h"
+#include "uet_ernic.h"
+
+#define MEM_LEN (8u * 1024u * 1024u)
+#define IP_A    0xc0a8c865u /* 192.168.200.101 */
+#define IP_B    0xc0a8c866u /* 192.168.200.102 */
+
+#define HALF    (512u * 1024u)
+#define SRC_LEN (2u * HALF)
+#define WIN_LEN (2u * 1024u * 1024u)
+#define RD_LEN  (32u * 1024u)
+#define W1      (4096u + 5u)
+#define W2      (W1 + HALF + 9u)
+
+struct report {
+    int ok;
+    char why[240];
+    double write_ms;
+    struct fake_ibv_stats fake;
+};
+
+struct guest {
+    uint8_t *mem;
+    int ctl;
+    struct report *rep;
+};
+
+struct hello {
+    struct uet_addr addr;
+    uint64_t key;
+};
+
+static void fail(struct report *rep, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void fail(struct report *rep, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!rep->ok)
+        return;
+    rep->ok = 0;
+    va_start(ap, fmt);
+    vsnprintf(rep->why, sizeof(rep->why), fmt, ap);
+    va_end(ap);
+}
+
+#define CHECK(g, cond)                                              \
+    do {                                                            \
+        if (!(cond)) {                                              \
+            fail((g)->rep, "%s:%d: %s", __FILE__, __LINE__, #cond); \
+            return;                                                 \
+        }                                                           \
+    } while (0)
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static uint8_t pattern(size_t off)
+{
+    uint64_t z = (uint64_t)(off / 8) + UINT64_C(0x9e3779b97f4a7c15);
+
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    z ^= z >> 31;
+    return (uint8_t)(z >> ((off % 8) * 8));
+}
+
+/* What a libfabric provider does to get one endpoint going. */
+static bool open_ep(struct guest *g, uet_handle_t *h, uet_domain_handle_t *dom,
+                    uet_ep_handle_t *ep, uet_cq_handle_t *txcq)
+{
+    struct fi_cq_attr attr = {.format = FI_CQ_FORMAT_DATA, .size = 64};
+    uet_cq_handle_t rxcq;
+    int rc;
+
+    if ((rc = uet_initialize(h)) != 0 ||
+        (rc = uet_domain(*h, NULL, NULL, NULL, NULL, NULL, NULL, dom)) != 0 ||
+        (rc = uet_endpoint(*dom, NULL, NULL, NULL, ep)) != 0 ||
+        (rc = uet_ep_bind_cq(*ep, &attr, NULL, FI_SEND, NULL, txcq)) != 0 ||
+        (rc = uet_ep_bind_cq(*ep, &attr, NULL, FI_RECV, NULL, &rxcq)) != 0) {
+        fail(g->rep, "opening the endpoint: %s", strerror(-rc));
+        return false;
+    }
+    return true;
+}
+
+static bool reg(struct guest *g, uet_domain_handle_t dom, uet_ep_handle_t ep,
+                void *buf, size_t len, uint64_t access, uint64_t key,
+                uet_mr_handle_t *mr)
+{
+    int rc;
+
+    if ((rc = uet_mr_reg(dom, buf, len, access, key, 0, NULL, mr)) != 0 ||
+        (rc = uet_ep_bind_mr(ep, *mr, 0)) != 0 ||
+        (rc = uet_mr_enable(*mr)) != 0) {
+        fail(g->rep, "registering %zu bytes: %s", len, strerror(-rc));
+        return false;
+    }
+    return true;
+}
+
+/* Wait for one completion: 0 with its entry, or the error's errno. */
+static int reap(struct guest *g, uet_ep_handle_t ep, uet_cq_handle_t cq,
+                struct fi_cq_data_entry *out)
+{
+    double end = now_ms() + 30000.0;
+
+    for (;;) {
+        ssize_t n = uet_cq_read(cq, out, 1);
+
+        if (n == 1)
+            return 0;
+        if (n == -FI_EAVAIL) {
+            struct fi_cq_err_entry e;
+
+            memset(&e, 0, sizeof(e));
+            if (uet_cq_readerr(cq, &e) != 1)
+                return -1;
+            memset(out, 0, sizeof(*out));
+            out->op_context = e.op_context;
+            return e.err != 0 ? e.err : -1;
+        }
+        if (n < 0 || now_ms() > end) {
+            fail(g->rep, "no completion (%zd)", n);
+            return -1;
+        }
+        (void)uet_ep_progress(ep);
+    }
+}
+
+static ssize_t write_retry(uet_ep_handle_t ep, void *buf, size_t len,
+                           uet_mr_handle_t mr, uet_addr_handle_t ah,
+                           uint64_t remote, uint64_t key, void *ctx)
+{
+    ssize_t rc;
+
+    while ((rc = uet_write(ep, UET_DEF_JOB_ID, buf, len, NULL, mr, ah, remote,
+                           key, ctx)) == -FI_EAGAIN)
+        (void)uet_ep_progress(ep);
+    return rc;
+}
+
+static void close_all(struct guest *g, uet_handle_t h, uet_domain_handle_t dom,
+                      uet_ep_handle_t ep, uet_mr_handle_t *mrs, unsigned nmrs)
+{
+    for (unsigned i = 0; i < nmrs; i++) {
+        CHECK(g, uet_mr_disable(mrs[i]) == 0);
+        CHECK(g, uet_mr_close(mrs[i]) == 0);
+    }
+    CHECK(g, uet_ep_close(ep) == 0);
+    CHECK(g, uet_domain_close(dom) == 0);
+    CHECK(g, uet_finalize(h) == 0);
+}
+
+static void run_target(struct guest *g)
+{
+    uet_handle_t h;
+    uet_domain_handle_t dom;
+    uet_ep_handle_t ep;
+    uet_cq_handle_t txcq;
+    uet_mr_handle_t mr;
+    struct hello hi;
+    uint8_t *win = g->mem + 1024u * 1024u;
+    char done;
+
+    if (!open_ep(g, &h, &dom, &ep, &txcq))
+        return;
+    memset(win, 0, WIN_LEN);
+    if (!reg(g, dom, ep, win, WIN_LEN, FI_REMOTE_READ | FI_REMOTE_WRITE,
+             UET_MR_KEY_IDEMPOTENT_SAFE, &mr))
+        return;
+    CHECK(g, uet_ep_enable(ep) == 0);
+
+    memset(&hi, 0, sizeof(hi));
+    CHECK(g, uet_getname(ep, &hi.addr) == 0);
+    CHECK(g, hi.addr.fa.v4 == IP_B && hi.addr.start_index == 15 &&
+                 (hi.addr.fep_cap & UET_FEP_CAP_HPC) != 0);
+    hi.key = uet_mr_key(mr);
+    CHECK(g, (hi.key & UET_MR_KEY_IDEMPOTENT_SAFE) != 0);
+    CHECK(g, send(g->ctl, &hi, sizeof(hi), 0) == (ssize_t)sizeof(hi));
+
+    /* Nothing to do while the peer writes: the engine is in the device. */
+    CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
+    for (size_t off = 0; off < WIN_LEN; off++) {
+        uint8_t want = 0;
+
+        if (off >= W1 && off < W1 + HALF)
+            want = pattern(off - W1);
+        else if (off >= W2 && off < W2 + HALF)
+            want = pattern(HALF + (off - W2));
+        if (win[off] != want) {
+            fail(g->rep, "window byte %zu is wrong", off);
+            break;
+        }
+    }
+    done = g->rep->ok ? 'y' : 'n';
+    CHECK(g, send(g->ctl, &done, 1, 0) == 1);
+
+    close_all(g, h, dom, ep, &mr, 1);
+}
+
+static void run_initiator(struct guest *g)
+{
+    uet_handle_t h;
+    uet_domain_handle_t dom;
+    uet_ep_handle_t ep;
+    uet_cq_handle_t txcq;
+    uet_mr_handle_t mrs[2];
+    uet_addr_handle_t ah;
+    struct uet_addr me;
+    struct hello peer;
+    struct fi_cq_data_entry c;
+    uint8_t *src = g->mem + 1024u * 1024u;
+    uint8_t *rd = g->mem + 3u * 1024u * 1024u;
+    int ctx[5];
+    uint64_t imm = 7;
+    bool on;
+    char done;
+
+    if (!open_ep(g, &h, &dom, &ep, &txcq))
+        return;
+    for (size_t i = 0; i < SRC_LEN; i++)
+        src[i] = pattern(i);
+    memset(rd, 0, RD_LEN);
+    if (!reg(g, dom, ep, src, SRC_LEN, 0, UET_MR_KEY_NONE, &mrs[0]) ||
+        !reg(g, dom, ep, rd, RD_LEN, 0, UET_MR_KEY_NONE, &mrs[1]))
+        return;
+    CHECK(g, uet_ep_enable(ep) == 0);
+
+    CHECK(g, uet_getname(ep, &me) == 0);
+    CHECK(g, me.fa.v4 == IP_A && me.pid_on_fep == 0 && me.start_index == 15);
+
+    CHECK(g, recv(g->ctl, &peer, sizeof(peer), 0) == (ssize_t)sizeof(peer));
+    CHECK(g, uet_av_insert(dom, &peer.addr, &ah) == 0);
+
+    /* RUDI for the first half, RUD for the second, both in flight. */
+    double t0 = now_ms();
+    on = true;
+    CHECK(g, uet_ep_setopt(ep, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    CHECK(g,
+          write_retry(ep, src, HALF, mrs[0], ah, W1, peer.key, &ctx[0]) == 0);
+    on = false;
+    CHECK(g, uet_ep_setopt(ep, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    CHECK(g, write_retry(ep, src + HALF, HALF, mrs[0], ah, W2, peer.key,
+                         &ctx[1]) == 0);
+    bool seen0 = false, seen1 = false;
+    for (int i = 0; i < 2; i++) {
+        CHECK(g, reap(g, ep, txcq, &c) == 0);
+        CHECK(g, (c.flags & (FI_RMA | FI_WRITE)) == (FI_RMA | FI_WRITE) &&
+                     c.len == HALF);
+        seen0 = seen0 || c.op_context == &ctx[0];
+        seen1 = seen1 || c.op_context == &ctx[1];
+    }
+    CHECK(g, seen0 && seen1);
+    g->rep->write_ms = now_ms() - t0;
+
+    /* Read some of it back. */
+    ssize_t rc;
+    while ((rc = uet_read(ep, UET_DEF_JOB_ID, rd, RD_LEN, mrs[1], ah, W1,
+                          peer.key, &ctx[2])) == -FI_EAGAIN)
+        (void)uet_ep_progress(ep);
+    CHECK(g, rc == 0);
+    CHECK(g, reap(g, ep, txcq, &c) == 0 && c.op_context == &ctx[2] &&
+                 (c.flags & FI_READ) != 0 && c.len == RD_LEN);
+    for (size_t i = 0; i < RD_LEN; i++)
+        CHECK(g, rd[i] == pattern(i));
+
+    /* What the library refuses before anything reaches the device. */
+    CHECK(g, uet_write(ep, UET_DEF_JOB_ID, src, 64, &imm, mrs[0], ah, W1,
+                       peer.key, &ctx[3]) == -FI_ENOSYS);
+    CHECK(g, uet_write(ep, UET_DEF_JOB_ID, src + SRC_LEN - 10, 20, NULL, mrs[0],
+                       ah, W1, peer.key, &ctx[3]) == -FI_EINVAL);
+    CHECK(g, uet_write(ep, 7, src, 64, NULL, mrs[0], ah, W1, peer.key,
+                       &ctx[3]) == -FI_EINVAL);
+
+    /* A key the target never handed out: an error completion. */
+    CHECK(g, write_retry(ep, src, 4096, mrs[0], ah, W1, peer.key ^ 1u,
+                         &ctx[4]) == 0);
+    int err = reap(g, ep, txcq, &c);
+    CHECK(g, err > 0 && c.op_context == &ctx[4]);
+
+    done = 'd';
+    CHECK(g, send(g->ctl, &done, 1, 0) == 1);
+    CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
+    if (done != 'y')
+        fail(g->rep, "the target's compare failed");
+
+    CHECK(g, uet_av_remove(ah) == 0);
+    close_all(g, h, dom, ep, mrs, 2);
+}
+
+/* ---- Driver ------------------------------------------------------------- */
+
+static pid_t start_device(const char *path, uint32_t ip, int mem_fd, int chan,
+                          int wire, const char *log)
+{
+    char a_ip[16], a_mem[16], a_len[16], a_chan[16], a_wire[16];
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+
+    FILE *f = freopen(log, "w", stdout);
+    if (f != NULL)
+        (void)dup2(fileno(stdout), STDERR_FILENO);
+    snprintf(a_ip, sizeof(a_ip), "%u", ip);
+    snprintf(a_mem, sizeof(a_mem), "%d", mem_fd);
+    snprintf(a_len, sizeof(a_len), "%u", MEM_LEN);
+    snprintf(a_chan, sizeof(a_chan), "%d", chan);
+    snprintf(a_wire, sizeof(a_wire), "%d", wire);
+    execl(path, path, a_ip, a_mem, a_len, a_chan, a_wire, (char *)NULL);
+    perror(path);
+    _exit(2);
+}
+
+static pid_t start_guest(bool target, int mem_fd, int chan, int ctl, int rep_fd,
+                         const char *log)
+{
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid != 0)
+        return pid;
+
+    struct report rep;
+    struct guest g;
+
+    alarm(90);
+    FILE *f = freopen(log, "w", stdout);
+    if (f != NULL)
+        (void)dup2(fileno(stdout), STDERR_FILENO);
+    memset(&rep, 0, sizeof(rep));
+    rep.ok = 1;
+    g.rep = &rep;
+    g.ctl = ctl;
+    g.mem = mmap(NULL, MEM_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0);
+    if (g.mem == MAP_FAILED) {
+        fail(&rep, "mmap: %s", strerror(errno));
+    } else {
+        fake_ibv_attach(chan, g.mem, MEM_LEN);
+        if (target)
+            run_target(&g);
+        else
+            run_initiator(&g);
+        fake_ibv_get_stats(&rep.fake);
+        if (rep.fake.bad_sends != 0 || rep.fake.qp_destroys != 1 ||
+            rep.fake.mr_regs != rep.fake.mr_deregs)
+            fail(&rep,
+                 "verbs left behind: %" PRIu64 " regs, %" PRIu64
+                 " deregs, %" PRIu64 " QPs destroyed, %" PRIu64 " bad sends",
+                 rep.fake.mr_regs, rep.fake.mr_deregs, rep.fake.qp_destroys,
+                 rep.fake.bad_sends);
+    }
+    if (write(rep_fd, &rep, sizeof(rep)) != (ssize_t)sizeof(rep))
+        rep.ok = 0;
+    fflush(NULL);
+    _exit(rep.ok ? 0 : 1);
+}
+
+/* A log, or only its lines that start with @only. */
+static void show(const char *log, const char *prefix, const char *only)
+{
+    char line[512];
+    FILE *f = fopen(log, "r");
+
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (only == NULL || strncmp(line, only, strlen(only)) == 0)
+            printf("%s%s", prefix, line);
+    }
+    fclose(f);
+}
+
+int main(int argc, char **argv)
+{
+    int wire[2], chan_a[2], chan_b[2], ctl[2], rep_a[2], rep_b[2];
+    int mem_a, mem_b;
+    char logs[4][256];
+    const char *tmp = getenv("TMPDIR");
+    struct report ra, rb;
+    int st[4];
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s PATH_TO_uet_fake_device\n", argv[0]);
+        return 2;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    for (int i = 0; i < 4; i++)
+        snprintf(logs[i], sizeof(logs[i]), "%s/uet-guestlib-%d-%d.log",
+                 tmp != NULL ? tmp : "/tmp", i, (int)getpid());
+
+    mem_a = memfd_create("guest-a", 0);
+    mem_b = memfd_create("guest-b", 0);
+    if (mem_a < 0 || mem_b < 0 || ftruncate(mem_a, MEM_LEN) != 0 ||
+        ftruncate(mem_b, MEM_LEN) != 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, wire) != 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, chan_a) != 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, chan_b) != 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ctl) != 0 || pipe(rep_a) != 0 ||
+        pipe(rep_b) != 0) {
+        perror("setup");
+        return 1;
+    }
+    for (int i = 0; i < 2; i++) {
+        int sz = 4 * 1024 * 1024;
+        (void)setsockopt(wire[i], SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+        (void)setsockopt(wire[i], SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    }
+
+    printf("case guest-lib: libuet_ernic over fake verbs, real channel and "
+           "engines\n");
+    fflush(stdout);
+
+    pid_t pids[4];
+    pids[0] = start_device(argv[1], IP_A, mem_a, chan_a[1], wire[0], logs[0]);
+    pids[1] = start_device(argv[1], IP_B, mem_b, chan_b[1], wire[1], logs[1]);
+    pids[2] = start_guest(false, mem_a, chan_a[0], ctl[0], rep_a[1], logs[2]);
+    pids[3] = start_guest(true, mem_b, chan_b[0], ctl[1], rep_b[1], logs[3]);
+    close(rep_a[1]);
+    close(rep_b[1]);
+    close(wire[0]);
+    close(wire[1]);
+
+    memset(&ra, 0, sizeof(ra));
+    memset(&rb, 0, sizeof(rb));
+    bool have_a = read(rep_a[0], &ra, sizeof(ra)) == (ssize_t)sizeof(ra);
+    bool have_b = read(rep_b[0], &rb, sizeof(rb)) == (ssize_t)sizeof(rb);
+    for (int i = 0; i < 4; i++)
+        (void)waitpid(pids[i], &st[i], 0);
+
+    bool ok = have_a && have_b && ra.ok && rb.ok;
+    for (int i = 0; i < 4; i++)
+        ok = ok && WIFEXITED(st[i]) && WEXITSTATUS(st[i]) == 0;
+
+    if (have_a && have_b)
+        printf("  2 x 512 KiB uet_write (RUDI + RUD) in %.1f ms, 32 KiB "
+               "uet_read back, 1 error completion; guest A sent %" PRIu64
+               " capsules, got %" PRIu64 " replies\n",
+               ra.write_ms, ra.fake.sends, ra.fake.replies);
+    show(logs[0], "  device A: ", ok ? "fake-device:" : NULL);
+    show(logs[1], "  device B: ", ok ? "fake-device:" : NULL);
+
+    if (ok) {
+        printf("  PASS\n\n1/1 cases passed\n");
+        for (int i = 0; i < 4; i++)
+            unlink(logs[i]);
+        return 0;
+    }
+    if (have_a && !ra.ok)
+        printf("  FAIL: initiator: %s\n", ra.why);
+    if (have_b && !rb.ok)
+        printf("  FAIL: target: %s\n", rb.why);
+    for (int i = 0; i < 4; i++)
+        printf("  process %d exit status %#x\n", i, (unsigned)st[i]);
+    show(logs[2], "  guest A: ", NULL);
+    show(logs[3], "  guest B: ", NULL);
+    printf("\n0/1 cases passed\n");
+    return 1;
+}

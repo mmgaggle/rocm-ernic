@@ -565,6 +565,52 @@ if(ERNIC_UET)
     target_link_directories(test_uet_datapath PRIVATE ${GLIB2_LIBRARY_DIRS})
     target_link_libraries(test_uet_datapath PRIVATE ${GLIB2_LIBRARIES})
     ernic_uet_link(test_uet_datapath)
+
+    # The device half of the guest library's test: the command channel and
+    # the engine behind a socket protocol, in a process of its own because
+    # the guest half links libuet_ernic, whose uet_* functions the
+    # reference library also defines.
+    add_executable(uet_fake_device
+        uet_fake_device.c
+        ${CMAKE_SOURCE_DIR}/src/uet_engine.c
+        ${CMAKE_SOURCE_DIR}/src/uet_nic_ernic.c
+        ${CMAKE_SOURCE_DIR}/src/uet_svc.c
+    )
+    target_include_directories(uet_fake_device PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/shared
+        ${CMAKE_SOURCE_DIR}/guest/tests
+    )
+    target_compile_definitions(uet_fake_device PRIVATE _GNU_SOURCE)
+    target_compile_options(uet_fake_device PRIVATE ${ERNIC_UNIT_TEST_SAN})
+    target_link_options(uet_fake_device PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+    ernic_uet_link(uet_fake_device)
+
+    # The guest half: libuet_ernic over a fake libibverbs, built from source
+    # here so the fake stands in for the real library.
+    if(LIBFABRIC_FOUND)
+        add_executable(test_libuet_ernic
+            ${CMAKE_SOURCE_DIR}/guest/tests/test_libuet_ernic.c
+            ${CMAKE_SOURCE_DIR}/guest/tests/fake_ibverbs.c
+            ${CMAKE_SOURCE_DIR}/guest/libuet_ernic/uet_ernic.c
+        )
+        target_include_directories(test_libuet_ernic PRIVATE
+            ${CMAKE_SOURCE_DIR}/guest/libuet_ernic
+            ${CMAKE_SOURCE_DIR}/guest/tests
+            ${CMAKE_SOURCE_DIR}/shared
+        )
+        target_include_directories(test_libuet_ernic SYSTEM PRIVATE
+            ${ERNIC_UET_SOURCE_DIR}
+            ${LIBFABRIC_INCLUDE_DIRS}
+            ${ERNIC_IBVERBS_INCLUDE_DIRS}
+        )
+        target_compile_definitions(test_libuet_ernic PRIVATE _GNU_SOURCE)
+        target_compile_options(test_libuet_ernic PRIVATE
+            ${ERNIC_UNIT_TEST_SAN})
+        target_link_options(test_libuet_ernic PRIVATE
+            ${ERNIC_UNIT_TEST_SAN_LINK})
+        target_link_libraries(test_libuet_ernic PRIVATE pthread)
+    endif()
 endif()
 
 # ---------------------------------------------------------------
@@ -597,7 +643,11 @@ set(ERNIC_TEST_TARGETS
     test_qemu_stubs
 )
 if(ERNIC_UET)
-    list(APPEND ERNIC_TEST_TARGETS test_uet_engine test_uet_datapath)
+    list(APPEND ERNIC_TEST_TARGETS
+        test_uet_engine test_uet_datapath uet_fake_device)
+    if(LIBFABRIC_FOUND)
+        list(APPEND ERNIC_TEST_TARGETS test_libuet_ernic)
+    endif()
 endif()
 
 foreach(ernic_test_target IN LISTS ERNIC_TEST_TARGETS)
@@ -867,6 +917,18 @@ if(ERNIC_UET)
         COMMAND $<TARGET_FILE:test_uet_datapath>
     )
     set_tests_properties(uet-datapath-unit PROPERTIES TIMEOUT 120)
+
+    # Phase 4: the guest library, two fake guests and two devices, the
+    # devices running the real command channel and engines. Only
+    # libibverbs is faked.
+    if(LIBFABRIC_FOUND)
+        add_test(
+            NAME uet-guest-lib-unit
+            COMMAND $<TARGET_FILE:test_libuet_ernic>
+                $<TARGET_FILE:uet_fake_device>
+        )
+        set_tests_properties(uet-guest-lib-unit PROPERTIES TIMEOUT 120)
+    endif()
 
     # UET engine CI suite: the server starts with --uet and announces the
     # engine's address, and refuses a bad --uet before startup.
