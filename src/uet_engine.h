@@ -34,7 +34,7 @@
 #include <stdint.h>
 
 #define UET_ENGINE_MAX_PEERS 32u
-#define UET_ENGINE_MAX_MRS   64u
+#define UET_ENGINE_MAX_MRS   256u
 #define UET_ENGINE_MAX_OPS   64u /* operations in flight at once */
 
 /* Packet delivery sublayer implementation. */
@@ -66,6 +66,14 @@ struct uet_engine_cfg {
     uint32_t drop_thresh; /* test only: drop this many 1/100 % of PDS
                            * transmits (UET_PKT_DROP_THRESH), 0: none */
     uint16_t mtu;         /* IP MTU of the wire */
+    /*
+     * How long a deregistered region's provider descriptor is kept, disabled
+     * and unreachable, before it is closed and may be reused.  A partially
+     * received message holds a pointer to the descriptor until it completes
+     * or goes idle (5 s in the provider), so this has to outlast that.  Not
+     * an --uet option; tests shorten it.
+     */
+    uint32_t mr_quarantine_ms;
 };
 
 /* Fill in the defaults: everything but the address. */
@@ -109,6 +117,10 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
                                      char *err, size_t errlen);
 void uet_engine_destroy(struct uet_engine *e);
 
+/* The configuration the engine runs with, its MAC filled in. */
+void uet_engine_identity(const struct uet_engine *e,
+                         struct uet_engine_cfg *out);
+
 /*
  * Wire-side receive filter.  Returns true when the frame was the engine's
  * (UET for its address, or ARP for its address) and has been consumed;
@@ -124,7 +136,8 @@ bool uet_engine_has_work(const struct uet_engine *e);
 
 /*
  * A memory region, described the way a driver describes one: by a page
- * buffer list of DMA addresses.  Offsets within the region start at 0.
+ * buffer list of DMA addresses that lives in region memory itself.  Offsets
+ * within the region start at 0.
  */
 struct uet_engine_mr_desc {
     uint64_t root;        /* level 0: DMA address of the first page;
@@ -142,6 +155,37 @@ struct uet_engine_mr_desc {
 /* Returns 0 with the region's handle and remote key, or a negative errno. */
 int uet_engine_mr_reg(struct uet_engine *e, const struct uet_engine_mr_desc *d,
                       uint32_t *mr, uint64_t *rkey);
+
+/*
+ * A memory region given as a list of page DMA addresses held in the
+ * caller's own memory, which is how the datapath keeps an ionic MR.  The
+ * engine copies the list and serves the provider's page-list reads from its
+ * copy, so the caller may free its list at once, and the engine can make the
+ * region unreachable on its own when it is deregistered.  Offsets within the
+ * region start at 0.
+ */
+struct uet_engine_pages {
+    const uint64_t *pages; /* DMA address of each page, in order */
+    uint32_t npages;
+    uint32_t page_size;   /* power of 2 */
+    uint32_t page_offset; /* where the region starts in pages[0] */
+    uint64_t len;
+    bool remote_read;
+    bool remote_write;
+    bool idempotent_safe;
+};
+
+int uet_engine_mr_reg_pages(struct uet_engine *e,
+                            const struct uet_engine_pages *p, uint32_t *mr,
+                            uint64_t *rkey);
+
+/*
+ * Deregister a region.  Peers lose access at once, and for a region from
+ * uet_engine_mr_reg_pages() so does everything else: an operation that
+ * still needs it fails instead of touching memory the owner may already
+ * have taken back.  The handle is released once no operation refers to it
+ * and the quarantine has passed.  Returns 0, or -EINVAL for a bad handle.
+ */
 int uet_engine_mr_dereg(struct uet_engine *e, uint32_t mr);
 
 /*
@@ -150,12 +194,14 @@ int uet_engine_mr_dereg(struct uet_engine *e, uint32_t mr);
  */
 int uet_engine_peer_add(struct uet_engine *e, uint32_t ip, uint16_t pid_on_fep,
                         uint16_t resource_index, uint32_t *peer);
+
+/* Removal, like deregistration, waits for operations still using it. */
 int uet_engine_peer_remove(struct uet_engine *e, uint32_t peer);
 
-struct uet_engine_write {
+struct uet_engine_rma {
     uint32_t peer;
-    uint32_t mr;     /* local region the data is read from */
-    uint64_t offset; /* where in it */
+    uint32_t mr;         /* local region */
+    uint64_t local_addr; /* offset within it */
     uint64_t len;
     uint64_t remote_addr; /* offset within the remote region */
     uint64_t rkey;        /* the remote region's key */
@@ -164,12 +210,14 @@ struct uet_engine_write {
 };
 
 /*
- * Post an RMA write.  Returns 0 when posted, -EAGAIN when it cannot be
- * posted yet (no free operation slot, or the peer's MAC is still being
- * resolved) and should be retried after polling, or another negative errno.
+ * Post an RMA write or read.  Returns 0 when posted; -EAGAIN when it cannot
+ * be posted yet (no free operation slot, or the peer's MAC is still being
+ * resolved) and should be retried after polling; -ECANCELED when the region
+ * or the peer is being released; -EHOSTUNREACH when the peer never answered
+ * ARP; or another negative errno.
  */
-int uet_engine_post_write(struct uet_engine *e,
-                          const struct uet_engine_write *w);
+int uet_engine_post_write(struct uet_engine *e, const struct uet_engine_rma *w);
+int uet_engine_post_read(struct uet_engine *e, const struct uet_engine_rma *r);
 
 struct uet_engine_comp {
     uint64_t cookie;
@@ -197,6 +245,11 @@ struct uet_engine_stats {
     uint64_t dma_read_maps;
     uint64_t dma_write_maps;
     uint64_t dma_faults;
+    uint64_t revoked_hits; /* page-list reads refused after deregistration */
+    /* tables, now */
+    uint32_t mrs;   /* region handles held, quarantined ones included */
+    uint32_t peers; /* peer handles held, ones being removed included */
+    uint32_t ops_in_flight;
 };
 
 void uet_engine_get_stats(const struct uet_engine *e,

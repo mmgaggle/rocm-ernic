@@ -581,7 +581,7 @@ static void run_target(struct node *n, struct report *rep)
 static void run_initiator(struct node *n, struct report *rep)
 {
     struct uet_engine_mr_desc d;
-    struct uet_engine_write w;
+    struct uet_engine_rma w;
     struct uet_engine_comp c;
     struct ctl m;
     uint32_t mr, peer;
@@ -628,7 +628,7 @@ static void run_initiator(struct node *n, struct report *rep)
     memset(&w, 0, sizeof(w));
     w.peer = peer;
     w.mr = mr;
-    w.offset = 0;
+    w.local_addr = 0;
     w.len = XFER_LEN;
     w.remote_addr = DST_OFF;
     w.rkey = m.rkey;

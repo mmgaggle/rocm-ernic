@@ -48,13 +48,32 @@ _Static_assert(SIZE_MAX >= UINT64_MAX, "size_t must hold a 64-bit length");
 #define MAX_PID   0xfffu /* 12-bit SES field */
 #define MAX_INDEX 0xfffu /* 12-bit SES field */
 
+/*
+ * Page lists from uet_engine_mr_reg_pages() live in the engine and are
+ * handed to the provider as DMA addresses in a window no guest memory can
+ * occupy: WINDOW_BASE, plus the region's slot in bits 32 and up, plus the
+ * byte offset into its list.  The translator serves that window itself.
+ */
+#define WINDOW_BASE  UINT64_C(0xffff000000000000)
+#define WINDOW_SHIFT 32u
+
+#define DEFAULT_QUARANTINE_MS 6000u
+
 struct engine_mr {
     bool used;
     uet_mr_handle_t h;
+    uint64_t *dir; /* engine-owned page list, or NULL */
+    uint32_t ndir; /* entries in it */
+    bool revoked;  /* the page list is no longer served */
+    bool closing;  /* deregistered: close once idle and quarantined */
+    uint32_t refs; /* operations in flight that use it */
+    uint64_t close_after_ms;
 };
 
 struct engine_peer {
     bool used;
+    bool removing; /* remove once no operation uses it */
+    uint32_t refs;
     uint16_t resource_index;
     /* uet_av_insert() keeps a pointer to this, so it lives here. */
     struct uet_addr addr;
@@ -64,6 +83,8 @@ struct engine_peer {
 struct engine_op {
     bool used;
     uint64_t cookie;
+    uint32_t mr;
+    uint32_t peer;
 };
 
 struct uet_engine {
@@ -87,6 +108,7 @@ struct uet_engine {
     struct engine_peer peers[UET_ENGINE_MAX_PEERS];
     struct engine_op ops[UET_ENGINE_MAX_OPS];
     unsigned ops_in_flight;
+    unsigned closing; /* regions and peers waiting to be released */
 
     struct uet_engine_stats stats;
 };
@@ -186,6 +208,7 @@ void uet_engine_cfg_defaults(struct uet_engine_cfg *cfg)
     cfg->pds = UET_ENGINE_PDS_FULL;
     cfg->sec = UET_ENGINE_SEC_NONE;
     cfg->mtu = DEFAULT_MTU;
+    cfg->mr_quarantine_ms = DEFAULT_QUARANTINE_MS;
 }
 
 static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
@@ -478,11 +501,42 @@ static int engine_wire_tx(void *ctx, const void *frame, size_t len)
     return e->wire.tx(e->wire.ctx, frame, len);
 }
 
+/* A read of an engine-owned page list.  Lists are never written through. */
+static void *window_map(struct uet_engine *e, uint64_t addr, size_t len,
+                        bool write)
+{
+    uint64_t rel = addr - WINDOW_BASE;
+    uint64_t slot = rel >> WINDOW_SHIFT;
+    uint64_t off = rel & ((UINT64_C(1) << WINDOW_SHIFT) - 1u);
+    struct engine_mr *m;
+
+    if (slot >= UET_ENGINE_MAX_MRS)
+        return NULL;
+    m = &e->mrs[slot];
+    if (!m->used || m->dir == NULL || write)
+        return NULL;
+    if (m->revoked) {
+        e->stats.revoked_hits++;
+        return NULL;
+    }
+    if (off > (uint64_t)m->ndir * sizeof(uint64_t) ||
+        len > (uint64_t)m->ndir * sizeof(uint64_t) - off)
+        return NULL;
+    return (uint8_t *)m->dir + off;
+}
+
 static void *engine_dma_translate(void *ctx, uet_dma_addr_t addr, size_t len,
                                   bool write)
 {
     struct uet_engine *e = ctx;
-    void *p = e->dma.map(e->dma.ctx, addr, len, write);
+    void *p;
+
+    if (addr >= WINDOW_BASE)
+        p = window_map(e, addr, len, write);
+    else if (e->dma.map != NULL)
+        p = e->dma.map(e->dma.ctx, addr, len, write);
+    else
+        p = (void *)(uintptr_t)addr;
 
     if (p == NULL)
         e->stats.dma_faults++;
@@ -519,6 +573,15 @@ static int set_rudi(struct uet_engine *e, bool rudi)
 /* ------------------------------------------------------------------ */
 /* Lifecycle                                                          */
 /* ------------------------------------------------------------------ */
+
+void uet_engine_identity(const struct uet_engine *e, struct uet_engine_cfg *out)
+{
+    if (e == NULL || out == NULL)
+        return;
+    *out = e->cfg;
+    engine_mac(&e->cfg, out->mac);
+    out->mac_set = true;
+}
 
 struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
                                      const struct uet_engine_wire *wire,
@@ -575,12 +638,12 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
         goto fail;
     }
 
-    if (e->dma.map != NULL) {
-        rc = uet_set_dma_translate(e->uet, engine_dma_translate, e);
-        if (rc != 0) {
-            set_err(err, errlen, "uet_set_dma_translate: %s", strerror(-rc));
-            goto fail;
-        }
+    /* Always installed: even with process addresses for region memory, the
+     * engine-owned page lists are reached through it. */
+    rc = uet_set_dma_translate(e->uet, engine_dma_translate, e);
+    if (rc != 0) {
+        set_err(err, errlen, "uet_set_dma_translate: %s", strerror(-rc));
+        goto fail;
     }
 
     /* uet_domain() and uet_endpoint() read the fi_info even in a verbs
@@ -635,18 +698,48 @@ fail:
     return NULL;
 }
 
+/* Close a region's provider descriptor and give its slot back. */
+static void mr_release(struct uet_engine *e, uint32_t slot)
+{
+    struct engine_mr *m = &e->mrs[slot];
+
+    (void)uet_mr_close(m->h);
+    free(m->dir);
+    if (m->closing)
+        e->closing--;
+    memset(m, 0, sizeof(*m));
+}
+
+static void peer_release(struct uet_engine *e, uint32_t slot)
+{
+    struct engine_peer *p = &e->peers[slot];
+
+    if (p->removing)
+        e->closing--;
+    memset(p, 0, sizeof(*p));
+}
+
 void uet_engine_destroy(struct uet_engine *e)
 {
     if (e == NULL)
         return;
 
-    for (unsigned i = 0; i < UET_ENGINE_MAX_MRS; i++) {
-        if (e->mrs[i].used)
-            (void)uet_engine_mr_dereg(e, i);
+    /* Nothing is left to wait for: whatever is in flight dies with the
+     * instance. */
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++) {
+        struct engine_mr *m = &e->mrs[i];
+
+        if (!m->used)
+            continue;
+        if (!m->closing)
+            (void)uet_mr_disable(m->h);
+        mr_release(e, i);
     }
-    for (unsigned i = 0; i < UET_ENGINE_MAX_PEERS; i++) {
-        if (e->peers[i].used)
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_PEERS; i++) {
+        if (e->peers[i].used) {
             (void)uet_av_remove(e->peers[i].av);
+            peer_release(e, i);
+        }
     }
     if (e->ep != NULL)
         (void)uet_ep_close(e->ep);
@@ -688,6 +781,31 @@ static void drain_rx_cq(struct uet_engine *e)
     } while (n > 0);
 }
 
+/* Finish releasing regions and peers whose last operation has gone. */
+static void reap_closing(struct uet_engine *e)
+{
+    uint64_t now;
+
+    if (e->closing == 0)
+        return;
+    now = now_ms();
+
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++) {
+        struct engine_mr *m = &e->mrs[i];
+
+        if (m->used && m->closing && m->refs == 0 && now >= m->close_after_ms)
+            mr_release(e, i);
+    }
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_PEERS; i++) {
+        struct engine_peer *p = &e->peers[i];
+
+        /* The provider counts its own references and refuses while any
+         * remain, so a refusal is simply tried again on a later poll. */
+        if (p->used && p->removing && p->refs == 0 && uet_av_remove(p->av) == 0)
+            peer_release(e, i);
+    }
+}
+
 void uet_engine_poll(struct uet_engine *e)
 {
     if (e == NULL)
@@ -702,6 +820,7 @@ void uet_engine_poll(struct uet_engine *e)
     }
 
     drain_rx_cq(e);
+    reap_closing(e);
 }
 
 bool uet_engine_has_work(const struct uet_engine *e)
@@ -710,11 +829,56 @@ bool uet_engine_has_work(const struct uet_engine *e)
            (uet_nic_ernic_rx_pending(e->nic) || e->ops_in_flight > 0);
 }
 
+static int mr_slot_alloc(struct uet_engine *e, uint32_t *slot)
+{
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++) {
+        if (!e->mrs[i].used) {
+            *slot = i;
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+/* Register, bind and enable; the slot is filled in only on success. */
+static int mr_finish_reg(struct uet_engine *e, uint32_t slot, uet_mr_handle_t h,
+                         uint64_t *dir, uint32_t ndir, uint32_t *mr,
+                         uint64_t *rkey)
+{
+    int rc = uet_ep_bind_mr(e->ep, h, UET_FLAGS_NONE);
+
+    if (rc == 0)
+        rc = uet_mr_enable(h);
+    if (rc != 0) {
+        (void)uet_mr_close(h);
+        free(dir);
+        return fi_to_errno(rc);
+    }
+
+    e->mrs[slot].used = true;
+    e->mrs[slot].h = h;
+    e->mrs[slot].dir = dir;
+    e->mrs[slot].ndir = ndir;
+    *mr = slot;
+    *rkey = uet_mr_key(h);
+    return 0;
+}
+
+static uint64_t mr_access(bool remote_read, bool remote_write)
+{
+    uint64_t access = FI_READ | FI_WRITE;
+
+    if (remote_read)
+        access |= FI_REMOTE_READ;
+    if (remote_write)
+        access |= FI_REMOTE_WRITE;
+    return access;
+}
+
 int uet_engine_mr_reg(struct uet_engine *e, const struct uet_engine_mr_desc *d,
                       uint32_t *mr, uint64_t *rkey)
 {
-    unsigned slot;
-    uint64_t access = FI_READ | FI_WRITE;
+    uint32_t slot;
     uet_mr_handle_t h;
     int rc;
 
@@ -722,57 +886,82 @@ int uet_engine_mr_reg(struct uet_engine *e, const struct uet_engine_mr_desc *d,
         return -EINVAL;
     if (d->level > UET_PBL_LEVEL_2 || d->len == 0)
         return -EINVAL;
-
-    for (slot = 0; slot < UET_ENGINE_MAX_MRS; slot++) {
-        if (!e->mrs[slot].used)
-            break;
-    }
-    if (slot == UET_ENGINE_MAX_MRS)
-        return -ENOSPC;
-
-    if (d->remote_read)
-        access |= FI_REMOTE_READ;
-    if (d->remote_write)
-        access |= FI_REMOTE_WRITE;
+    rc = mr_slot_alloc(e, &slot);
+    if (rc != 0)
+        return rc;
 
     /* The provider assigns the key and keeps the IDEMPOTENT_SAFE bit asked
      * for here.  base_va 0 makes addresses within the region offsets. */
     rc = uet_mr_reg_pbl(
         e->dom, d->root, d->page_size, (uet_pbl_level_t)d->level,
-        d->page_offset, 0, (size_t)d->len, access,
+        d->page_offset, 0, (size_t)d->len,
+        mr_access(d->remote_read, d->remote_write),
         d->idempotent_safe ? UET_MR_KEY_IDEMPOTENT_SAFE : UET_MR_KEY_NONE,
         UET_FLAGS_NONE, NULL, &h);
     if (rc != 0)
         return fi_to_errno(rc);
+    return mr_finish_reg(e, slot, h, NULL, 0, mr, rkey);
+}
 
-    rc = uet_ep_bind_mr(e->ep, h, UET_FLAGS_NONE);
-    if (rc == 0)
-        rc = uet_mr_enable(h);
+int uet_engine_mr_reg_pages(struct uet_engine *e,
+                            const struct uet_engine_pages *p, uint32_t *mr,
+                            uint64_t *rkey)
+{
+    uint32_t slot;
+    uint64_t *dir;
+    uet_mr_handle_t h;
+    int rc;
+
+    if (e == NULL || p == NULL || mr == NULL || rkey == NULL ||
+        p->pages == NULL || p->npages == 0 || p->len == 0)
+        return -EINVAL;
+    if (p->page_size < 512 || (p->page_size & (p->page_size - 1u)) != 0 ||
+        p->page_offset >= p->page_size)
+        return -EINVAL;
+    /* The list has to cover the region, and fit its window. */
+    if (p->len > (uint64_t)p->npages * p->page_size - p->page_offset ||
+        (uint64_t)p->npages * sizeof(uint64_t) > (UINT64_C(1) << WINDOW_SHIFT))
+        return -EINVAL;
+
+    rc = mr_slot_alloc(e, &slot);
+    if (rc != 0)
+        return rc;
+
+    dir = malloc((size_t)p->npages * sizeof(uint64_t));
+    if (dir == NULL)
+        return -ENOMEM;
+    memcpy(dir, p->pages, (size_t)p->npages * sizeof(uint64_t));
+
+    rc = uet_mr_reg_pbl(
+        e->dom, WINDOW_BASE + ((uint64_t)slot << WINDOW_SHIFT), p->page_size,
+        UET_PBL_LEVEL_1, p->page_offset, 0, (size_t)p->len,
+        mr_access(p->remote_read, p->remote_write),
+        p->idempotent_safe ? UET_MR_KEY_IDEMPOTENT_SAFE : UET_MR_KEY_NONE,
+        UET_FLAGS_NONE, NULL, &h);
     if (rc != 0) {
-        (void)uet_mr_close(h);
+        free(dir);
         return fi_to_errno(rc);
     }
-
-    e->mrs[slot].used = true;
-    e->mrs[slot].h = h;
-    *mr = slot;
-    *rkey = uet_mr_key(h);
-    return 0;
+    return mr_finish_reg(e, slot, h, dir, p->npages, mr, rkey);
 }
 
 int uet_engine_mr_dereg(struct uet_engine *e, uint32_t mr)
 {
-    int rc;
+    struct engine_mr *m;
 
-    if (e == NULL || mr >= UET_ENGINE_MAX_MRS || !e->mrs[mr].used)
+    if (e == NULL || mr >= UET_ENGINE_MAX_MRS || !e->mrs[mr].used ||
+        e->mrs[mr].closing)
         return -EINVAL;
+    m = &e->mrs[mr];
 
-    rc = uet_mr_disable(e->mrs[mr].h);
-    if (rc == 0)
-        rc = uet_mr_close(e->mrs[mr].h);
-    if (rc != 0)
-        return fi_to_errno(rc);
-    e->mrs[mr].used = false;
+    /* Peers stop finding it, and its page list stops resolving, now; the
+     * descriptor itself waits until nothing can still point at it. */
+    (void)uet_mr_disable(m->h);
+    m->revoked = true;
+    m->closing = true;
+    m->close_after_ms = now_ms() + e->cfg.mr_quarantine_ms;
+    e->closing++;
+    reap_closing(e);
     return 0;
 }
 
@@ -820,23 +1009,25 @@ int uet_engine_peer_add(struct uet_engine *e, uint32_t ip, uint16_t pid_on_fep,
 
 int uet_engine_peer_remove(struct uet_engine *e, uint32_t peer)
 {
-    int rc;
+    struct engine_peer *p;
 
-    if (e == NULL || peer >= UET_ENGINE_MAX_PEERS || !e->peers[peer].used)
+    if (e == NULL || peer >= UET_ENGINE_MAX_PEERS || !e->peers[peer].used ||
+        e->peers[peer].removing)
         return -EINVAL;
-    rc = uet_av_remove(e->peers[peer].av);
-    if (rc != 0)
-        return fi_to_errno(rc);
-    e->peers[peer].used = false;
+    p = &e->peers[peer];
+    p->removing = true;
+    e->closing++;
+    reap_closing(e);
     return 0;
 }
 
-int uet_engine_post_write(struct uet_engine *e,
-                          const struct uet_engine_write *w)
+static int post_rma(struct uet_engine *e, const struct uet_engine_rma *w,
+                    bool write)
 {
     unsigned slot;
     struct uet_mr_seg seg;
     struct engine_peer *p;
+    struct engine_mr *m;
     ssize_t rc;
     int erc;
 
@@ -844,6 +1035,10 @@ int uet_engine_post_write(struct uet_engine *e,
         !e->peers[w->peer].used || w->mr >= UET_ENGINE_MAX_MRS ||
         !e->mrs[w->mr].used || w->len == 0)
         return -EINVAL;
+    p = &e->peers[w->peer];
+    m = &e->mrs[w->mr];
+    if (p->removing || m->closing)
+        return -ECANCELED;
 
     for (slot = 0; slot < UET_ENGINE_MAX_OPS; slot++) {
         if (!e->ops[slot].used)
@@ -852,9 +1047,8 @@ int uet_engine_post_write(struct uet_engine *e,
     if (slot == UET_ENGINE_MAX_OPS)
         return -EAGAIN;
 
-    p = &e->peers[w->peer];
-    seg.mr = e->mrs[w->mr].h;
-    seg.addr = w->offset;
+    seg.mr = m->h;
+    seg.addr = w->local_addr;
     seg.len = (size_t)w->len;
 
     /* The endpoint's RUDI setting is read when the operation is posted,
@@ -863,17 +1057,35 @@ int uet_engine_post_write(struct uet_engine *e,
     if (erc != 0)
         return erc;
 
-    rc =
-        uet_writeseg(e->ep, e->cfg.job_id, &seg, 1, NULL, p->av, w->remote_addr,
-                     w->rkey, &e->ops[slot], p->resource_index);
+    if (write)
+        rc = uet_writeseg(e->ep, e->cfg.job_id, &seg, 1, NULL, p->av,
+                          w->remote_addr, w->rkey, &e->ops[slot],
+                          p->resource_index);
+    else
+        rc = uet_readseg(e->ep, e->cfg.job_id, &seg, 1, p->av, w->remote_addr,
+                         w->rkey, &e->ops[slot], p->resource_index);
     if (rc != 0)
         return fi_to_errno(rc);
 
     e->ops[slot].used = true;
     e->ops[slot].cookie = w->cookie;
+    e->ops[slot].mr = w->mr;
+    e->ops[slot].peer = w->peer;
+    m->refs++;
+    p->refs++;
     e->ops_in_flight++;
     e->stats.ops_posted++;
     return 0;
+}
+
+int uet_engine_post_write(struct uet_engine *e, const struct uet_engine_rma *w)
+{
+    return post_rma(e, w, true);
+}
+
+int uet_engine_post_read(struct uet_engine *e, const struct uet_engine_rma *r)
+{
+    return post_rma(e, r, false);
 }
 
 /* The op_context the provider hands back, if it is one of ours. */
@@ -894,10 +1106,14 @@ static bool comp_add(struct uet_engine *e, void *ctx, int status,
     if (op == NULL)
         return false;
     out->cookie = op->cookie;
-    out->status = status;
+    /* A region taken away underneath the operation is why it failed,
+     * whatever the provider made of the missing page list. */
+    out->status = (status != 0 && e->mrs[op->mr].revoked) ? -ECANCELED : status;
+    e->mrs[op->mr].refs--;
+    e->peers[op->peer].refs--;
     op->used = false;
     e->ops_in_flight--;
-    if (status == 0)
+    if (out->status == 0)
         e->stats.ops_completed++;
     else
         e->stats.ops_failed++;
@@ -934,6 +1150,8 @@ size_t uet_engine_poll_comp(struct uet_engine *e, struct uet_engine_comp *out,
         }
         break;
     }
+    if (got > 0)
+        reap_closing(e);
     return got;
 }
 
@@ -954,4 +1172,12 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->arp_requests = ns.arp_requests;
     out->arp_replies = ns.arp_replies;
     out->nh_pending = ns.nh_pending;
+
+    out->mrs = 0;
+    for (unsigned i = 0; i < UET_ENGINE_MAX_MRS; i++)
+        out->mrs += e->mrs[i].used ? 1u : 0u;
+    out->peers = 0;
+    for (unsigned i = 0; i < UET_ENGINE_MAX_PEERS; i++)
+        out->peers += e->peers[i].used ? 1u : 0u;
+    out->ops_in_flight = e->ops_in_flight;
 }
