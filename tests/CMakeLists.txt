@@ -522,6 +522,25 @@ target_link_directories(test_qemu_stubs PRIVATE
 target_link_libraries(test_qemu_stubs PRIVATE
     ${GLIB2_LIBRARIES} ${IBVERBS_LIBRARIES} pthread)
 
+# UET engine test (only with -DERNIC_UET=ON). Two engine processes joined by
+# a socketpair "wire", each with a window of fake guest memory behind the DMA
+# hook. It links the engine translation units and the reference provider's
+# libuet_verbs.a; no VM, TAP or RDMA device is involved.
+if(ERNIC_UET)
+    add_executable(test_uet_engine
+        test_uet_engine.c
+        ${CMAKE_SOURCE_DIR}/src/uet_engine.c
+        ${CMAKE_SOURCE_DIR}/src/uet_nic_ernic.c
+    )
+    target_include_directories(test_uet_engine PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_compile_definitions(test_uet_engine PRIVATE _GNU_SOURCE)
+    target_compile_options(test_uet_engine PRIVATE ${ERNIC_UNIT_TEST_SAN})
+    target_link_options(test_uet_engine PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+    ernic_uet_link(test_uet_engine)
+endif()
+
 # ---------------------------------------------------------------
 # Apply the project warning / hardening flags to every test target
 # ---------------------------------------------------------------
@@ -551,6 +570,9 @@ set(ERNIC_TEST_TARGETS
     test_rdma_res_tbl
     test_qemu_stubs
 )
+if(ERNIC_UET)
+    list(APPEND ERNIC_TEST_TARGETS test_uet_engine)
+endif()
 
 foreach(ernic_test_target IN LISTS ERNIC_TEST_TARGETS)
     ernic_set_compiler_flags(${ernic_test_target})
@@ -800,6 +822,31 @@ set_tests_properties(s3-ci PROPERTIES
     SKIP_RETURN_CODE 77
     ENVIRONMENT "SERVER_BIN=$<TARGET_FILE:rocm-ernic>"
 )
+
+if(ERNIC_UET)
+    # UET engine, Slice A: a 1 MiB RMA write between two engines over RUDI
+    # and RUD, with forced retransmissions and with TSS, byte-compared at
+    # the target and dissected on the wire.
+    add_test(
+        NAME uet-engine-unit
+        COMMAND $<TARGET_FILE:test_uet_engine>
+    )
+    set_tests_properties(uet-engine-unit PROPERTIES TIMEOUT 600)
+
+    # UET engine CI suite: the server starts with --uet and announces the
+    # engine's address, and refuses a bad --uet before startup.
+    add_test(
+        NAME uet-ci
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_uet_ci.sh
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+    set_tests_properties(uet-ci PROPERTIES
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "SERVER_BIN=$<TARGET_FILE:rocm-ernic>"
+    )
+endif()
 
 # ---------------------------------------------------------------
 # Compile checks for the Nix fuzz harnesses
