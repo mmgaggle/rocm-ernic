@@ -29,6 +29,7 @@ set(ERNIC_UET_LIBRARY "" CACHE FILEPATH
 set(ERNIC_UET_SOURCES
     src/uet_engine.c
     src/uet_nic_ernic.c
+    src/uet_svc.c
 )
 
 if(ERNIC_UET)

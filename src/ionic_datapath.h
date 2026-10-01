@@ -140,6 +140,19 @@ bool ionic_datapath_attach_s3(struct ionic_datapath *dp,
                               size_t errlen);
 
 /*
+ * Attach the UET engine's guest command channel (see uet_svc.h and
+ * shared/uet_ernic_abi.h): SENDs on an RC QP connected to a QPN in
+ * UET_ERNIC_SVC_QPN_BASE's range become engine commands, and their replies
+ * are delivered into that QP's receives.  @engine NULL detaches it, which
+ * must happen before the engine is destroyed.  Only in a build with the
+ * engine (ERNIC_HAVE_UET).  Returns false and fills @err on failure.
+ */
+struct uet_engine;
+bool ionic_datapath_attach_uet(struct ionic_datapath *dp,
+                               struct uet_engine *engine, char *err,
+                               size_t errlen);
+
+/*
  * Set the pvrdma handle so the datapath can post sends via the backend.
  * Call this once after ionic_device_init() and pvrdma_device_realize().
  * @handle: pvrdma_handle_t (void *) from pvrdma_device_create().

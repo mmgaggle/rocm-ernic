@@ -47,6 +47,10 @@
 #include "rocm_ernic_compat.h"
 #include "s3_tcp.h"
 #include "s3_target.h"
+#ifdef ERNIC_HAVE_UET
+#include "uet_ernic_abi.h"
+#include "uet_svc.h"
+#endif
 
 /* -------------------------------------------------------------------------
  * ionic_fw.h wire format constants (keep in sync with pinned kernel ref)
@@ -353,6 +357,9 @@ struct ionic_datapath {
     /* In-process S3 object store, NULL unless --backend s3. */
     struct s3_target *s3;
     struct s3_tcp *s3_tcp;
+
+    /* The UET engine's guest command channel, NULL unless --uet. */
+    struct uet_svc *uet_svc;
 
     struct ionic_qp_ring *qp; /* indexed by driver qp_id */
     struct ionic_cq_ring *cq; /* indexed by driver cq_id */
@@ -667,6 +674,9 @@ void ionic_datapath_destroy(struct ionic_datapath *dp)
 
     nvmeof_cm_destroy(dp->nvmeof_cm);
     nvmeof_target_destroy(dp->nvmeof);
+#ifdef ERNIC_HAVE_UET
+    uet_svc_destroy(dp->uet_svc);
+#endif
 
     if (dp->eth_emu && dp->s3_tcp)
         ionic_eth_emu_register_tx_filter(dp->eth_emu, NULL, NULL);
@@ -797,6 +807,11 @@ void ionic_datapath_unregister_qp(struct ionic_datapath *dp, uint32_t qp_id)
         return;
     if (dp->nvmeof_cm)
         nvmeof_cm_drop_qp(dp->nvmeof_cm, qp_id);
+#ifdef ERNIC_HAVE_UET
+    /* Its handles go with it, and replies still owed to it must not land on
+     * the next QP to get this number. */
+    uet_svc_qp_gone(dp->uet_svc, qp_id);
+#endif
     buf_release(&dp->qp[qp_id].sq_buf);
     buf_release(&dp->qp[qp_id].rq_buf);
     dp->qp[qp_id].valid = false;
@@ -840,6 +855,12 @@ void ionic_datapath_register_mr(struct ionic_datapath *dp, uint32_t lkey,
         return;
 
     struct dp_mr *m = mr_find(dp, lkey);
+#ifdef ERNIC_HAVE_UET
+    /* Re-registering a live key points it at new pages; the engine's copy
+     * of the old list must not outlive that. */
+    if (m)
+        uet_svc_mr_gone(dp->uet_svc, lkey);
+#endif
     if (!m) {
         for (int i = 0; i < MAX_MR; i++) {
             if (!dp->mr[i].valid) {
@@ -876,6 +897,12 @@ void ionic_datapath_unregister_mr(struct ionic_datapath *dp, uint32_t lkey)
     struct dp_mr *m = dp ? mr_find(dp, lkey) : NULL;
     if (!m)
         return;
+#ifdef ERNIC_HAVE_UET
+    /* DESTROY_MR, LOCAL_INV or a key rotation: once this returns the guest
+     * may reuse the pages, so the engine loses them now, not when its
+     * transfers drain. */
+    uet_svc_mr_gone(dp->uet_svc, lkey);
+#endif
     buf_release(&m->buf);
     m->valid = false;
 }
@@ -1552,6 +1579,11 @@ static uint64_t dp_now_ms(void)
 static bool dp_is_remote(const struct ionic_datapath *dp,
                          const struct ionic_qp_ring *q)
 {
+#ifdef ERNIC_HAVE_UET
+    /* The UET engine is in this process, whatever GID the guest used. */
+    if (q->dest_valid && uet_ernic_is_svc_qpn(q->dest_qp_id))
+        return false;
+#endif
     return dp->local_node != UINT32_MAX && q->dest_valid &&
            q->dest_node_id != UINT32_MAX && q->dest_node_id != dp->local_node;
 }
@@ -2014,6 +2046,108 @@ static bool dp_nvmeof_rc_send(struct ionic_datapath *dp,
     return true;
 }
 
+#ifdef ERNIC_HAVE_UET
+/* -------------------------------------------------------------------------
+ * UET engine command channel
+ *
+ * A guest's "service QP" is an RC QP connected to a QPN in
+ * UET_ERNIC_SVC_QPN_BASE's range.  Each SEND on it is a command capsule for
+ * the engine (shared/uet_ernic_abi.h); each reply goes back as a SEND into
+ * the next receive posted on the same QP.  The protocol lives in uet_svc.c;
+ * this is the part that knows about rings and MRs.
+ * -------------------------------------------------------------------------
+ */
+
+/* An lkey's pages, as uet_svc wants them.  The engine copies the list. */
+static bool dp_uet_mr_view(void *ctx, uint32_t lkey,
+                           struct uet_svc_mr_view *out)
+{
+    struct ionic_datapath *dp = ctx;
+    struct dp_mr *m = mr_find(dp, lkey);
+
+    if (!m)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    out->length = m->length;
+    out->page_size = 1u << m->buf.page_size_log2;
+    if (m->buf.npages > 1 && m->buf.pages) {
+        out->pages = m->buf.pages;
+        out->npages = m->buf.npages;
+        out->first_off = m->buf.first_off;
+    } else {
+        out->base = m->buf.base;
+    }
+    return true;
+}
+
+static bool dp_uet_reply(void *ctx, uint32_t qp_id, const void *capsule,
+                         size_t len)
+{
+    struct ionic_datapath *dp = ctx;
+
+    if (qp_id >= dp->qp_count || !dp->qp[qp_id].valid)
+        return true; /* gone: nothing to wait for */
+
+    struct ionic_qp_ring *q = &dp->qp[qp_id];
+    struct dp_sge_list in = {.count = 0, .total = (uint32_t)len};
+
+    return deliver_recv(dp, q, qp_id,
+                        q->dest_valid ? q->dest_qp_id : UET_ERNIC_SVC_QPN, &in,
+                        capsule, CQE_RECV_OP_SEND, 0) >= 0;
+}
+
+static const struct uet_svc_ops dp_uet_svc_ops = {
+    .mr_view = dp_uet_mr_view,
+    .reply = dp_uet_reply,
+};
+
+bool ionic_datapath_attach_uet(struct ionic_datapath *dp,
+                               struct uet_engine *engine, char *err,
+                               size_t errlen)
+{
+    if (!dp)
+        return false;
+
+    uet_svc_destroy(dp->uet_svc);
+    dp->uet_svc = NULL;
+    if (!engine)
+        return true;
+
+    dp->uet_svc = uet_svc_create(engine, &dp_uet_svc_ops, dp);
+    if (!dp->uet_svc) {
+        if (err)
+            snprintf(err, errlen, "out of memory");
+        return false;
+    }
+    vfu_log(dp->vfu_ctx, LOG_INFO, "ionic_datapath: UET service QPN %#x",
+            UET_ERNIC_SVC_QPN);
+    return true;
+}
+
+/*
+ * A SEND on a service QP.  The capsule is fetched through the WQE's own SGEs
+ * and answered asynchronously, so the SEND itself completes like any other.
+ */
+static bool dp_uet_rc_send(struct ionic_datapath *dp, struct ionic_qp_ring *q,
+                           uint32_t qp_id, const struct dp_sge_list *src)
+{
+    if (!dp->uet_svc || !q->dest_valid || !uet_ernic_is_svc_qpn(q->dest_qp_id))
+        return false;
+
+    uint8_t capsule[UET_ERNIC_CAPSULE_SIZE];
+    uint32_t len =
+        src->total < sizeof(capsule) ? src->total : (uint32_t)sizeof(capsule);
+    if (dp_gather(dp, src, capsule, len) != len) {
+        vfu_log(dp->vfu_ctx, LOG_WARNING,
+                "ionic_datapath: QP %u UET capsule fetch failed", qp_id);
+        return true;
+    }
+    uet_svc_command(dp->uet_svc, qp_id, capsule, len);
+    return true;
+}
+#endif /* ERNIC_HAVE_UET */
+
 static void process_sq_wqe(struct ionic_datapath *dp, struct ionic_qp_ring *q,
                            uint32_t qp_id, uint32_t slot)
 {
@@ -2119,6 +2253,10 @@ static void process_sq_wqe(struct ionic_datapath *dp, struct ionic_qp_ring *q,
             break;
         if (remote && dp_nvmeof_rc_send(dp, q, qp_id, &src))
             break;
+#ifdef ERNIC_HAVE_UET
+        if (remote && dp_uet_rc_send(dp, q, qp_id, &src))
+            break;
+#endif
 
         uint32_t dst_id = q->dest_valid ? q->dest_qp_id : qp_id;
         struct ionic_qp_ring *dq = dst_id < dp->qp_count && dp->qp[dst_id].valid
@@ -2532,6 +2670,10 @@ bool ionic_datapath_has_work(struct ionic_datapath *dp)
 
     if (!work && dp->s3_tcp)
         work = s3_tcp_has_work(dp->s3_tcp);
+#ifdef ERNIC_HAVE_UET
+    if (!work)
+        work = uet_svc_has_work(dp->uet_svc);
+#endif
     return work;
 }
 
@@ -2544,6 +2686,12 @@ void ionic_datapath_poll(struct ionic_datapath *dp)
 
     if (dp->s3_tcp)
         s3_tcp_poll(dp->s3_tcp, dp_now_ms());
+
+#ifdef ERNIC_HAVE_UET
+    /* Completed transfers become reply capsules, delivered from here
+     * because it is the thread that may DMA. */
+    uet_svc_poll(dp->uet_svc);
+#endif
 
     pthread_mutex_lock(&dp->rx_lock);
     list = dp->rx_head;

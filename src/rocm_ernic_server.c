@@ -696,6 +696,18 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
     ionic_eth_emu_register_rx_filter(dev->ionic_emu, uet_wire_rx_filter,
                                      dev->uet_engine);
 
+    /* The guest reaches the engine through its service QP. */
+    if (!ionic_datapath_attach_uet(dev->ionic_dp, dev->uet_engine, err,
+                                   sizeof(err))) {
+        fprintf(stderr, "Error: uet engine: %s\n", err);
+        ionic_eth_emu_register_rx_filter(dev->ionic_emu, NULL, NULL);
+        uet_engine_destroy(dev->uet_engine);
+        dev->uet_engine = NULL;
+        free(g_uet_dma.sg);
+        g_uet_dma.sg = NULL;
+        return -1;
+    }
+
     uet_engine_cfg_describe(cfg, desc, sizeof(desc));
     ernic_startup_report("rocm-ernic: UET engine %s%s", desc,
                          have_wire ? ""
@@ -719,6 +731,8 @@ static void uet_engine_stop(rocm_ernic_dev_t *dev)
         st.arp_requests, st.arp_replies, st.ops_posted, st.ops_completed,
         st.ops_failed);
 
+    /* The command channel holds engine handles, so it goes first. */
+    (void)ionic_datapath_attach_uet(dev->ionic_dp, NULL, NULL, 0);
     ionic_eth_emu_register_rx_filter(dev->ionic_emu, NULL, NULL);
     uet_engine_destroy(dev->uet_engine);
     dev->uet_engine = NULL;
