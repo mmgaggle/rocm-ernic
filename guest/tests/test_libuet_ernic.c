@@ -306,6 +306,25 @@ static void run_initiator(struct guest *g)
     CHECK(g, seen0 && seen1);
     g->rep->write_ms = now_ms() - t0;
 
+    /* No region, as the libfabric provider writes: the library registers
+     * the buffer itself, once for both of these, and the bytes are the
+     * ones already there. */
+    struct fake_ibv_stats before, after;
+    fake_ibv_get_stats(&before);
+    for (int i = 0; i < 2; i++) {
+        size_t off = (size_t)i * 128u * 1024u;
+        ssize_t w;
+
+        while ((w = uet_write(ep, UET_DEF_JOB_ID, src + off, 64u * 1024u, NULL,
+                              NULL, ah, W1 + off, peer.key, &ctx[0])) ==
+               -FI_EAGAIN)
+            (void)uet_ep_progress(ep);
+        CHECK(g, w == 0);
+        CHECK(g, reap(g, ep, txcq, &c) == 0 && c.op_context == &ctx[0]);
+    }
+    fake_ibv_get_stats(&after);
+    CHECK(g, after.mr_regs == before.mr_regs + 1);
+
     /* Read some of it back. */
     ssize_t rc;
     while ((rc = uet_read(ep, UET_DEF_JOB_ID, rd, RD_LEN, mrs[1], ah, W1,

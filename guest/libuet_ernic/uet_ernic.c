@@ -20,6 +20,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -31,6 +32,8 @@
 #include "uet_ernic_abi.h"
 
 #define SLOTS        64u /* commands in flight per instance */
+#define AUTO_MRS     16u /* local buffers registered on demand */
+#define AUTO_WINDOW  (2u * 1024u * 1024u)
 #define CQ_DEPTH     (2u * SLOTS)
 #define SEND_TAG     (UINT64_C(1) << 63)
 #define SYNC_WAIT_MS 10000u
@@ -42,6 +45,22 @@ enum pend_kind {
     PEND_RMA,  /* the reply is a completion for an endpoint */
 };
 
+/*
+ * A local buffer registered on demand, for a uet_write() or uet_read()
+ * given no memory region: the engine moves only registered memory, and the
+ * reference API lets the caller pass none.  Kept and reused, so a buffer
+ * written in segments is registered once.
+ */
+struct auto_mr {
+    bool used;
+    uintptr_t start;
+    size_t len;
+    struct ibv_mr *ibmr;
+    uint32_t handle;
+    unsigned refs; /* transfers in flight from it */
+    uint64_t last_use;
+};
+
 struct pending {
     enum pend_kind kind;
     uint8_t gen;
@@ -50,7 +69,8 @@ struct pending {
     struct uet_ernic_ep *ep;      /* PEND_RMA */
     void *context;
     uint64_t len;
-    uint64_t flags; /* FI_RMA | FI_WRITE or FI_READ */
+    uint64_t flags;          /* FI_RMA | FI_WRITE or FI_READ */
+    struct auto_mr *auto_mr; /* PEND_RMA from an unregistered buffer */
 };
 
 struct uet_ernic_dev {
@@ -63,6 +83,9 @@ struct uet_ernic_dev {
     struct ibv_mr *slots_mr;
     uint64_t send_busy; /* bit per send slot */
     struct pending pend[PENDING];
+    struct auto_mr auto_mrs[AUTO_MRS];
+    uint64_t use_clock;
+    bool auto_cache; /* keep on-demand registrations (UET_ERNIC_MR_CACHE) */
 
     /* From QUERY. */
     uint32_t ipv4;
@@ -237,6 +260,9 @@ static void dispatch(struct uet_ernic_dev *d, const uint8_t *capsule)
     int status = (int32_t)le32toh((uint32_t)r.status);
     cq_push(p->ep->tx_cq, p->context, p->flags, p->len, status);
     p->ep->in_flight--;
+    if (p->auto_mr != NULL)
+        p->auto_mr->refs--;
+    p->auto_mr = NULL;
     p->kind = PEND_FREE;
 }
 
@@ -391,6 +417,135 @@ static int call(struct uet_ernic_dev *d, void *capsule, size_t len,
 }
 
 /* ------------------------------------------------------------------ */
+/* Local buffers registered on demand                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The mapping containing @addr, from /proc/self/maps.  A registration may
+ * grow past the buffer it is for, but never past the mapping, which is the
+ * memory ibv_reg_mr() is sure to accept.
+ */
+static bool vma_of(uintptr_t addr, uintptr_t *lo, uintptr_t *hi)
+{
+    char line[512];
+    FILE *f = fopen("/proc/self/maps", "r");
+    bool found = false;
+
+    if (f == NULL)
+        return false;
+    while (!found && fgets(line, sizeof(line), f) != NULL) {
+        unsigned long a, b;
+
+        if (sscanf(line, "%lx-%lx", &a, &b) == 2 && addr >= a && addr < b) {
+            *lo = a;
+            *hi = b;
+            found = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int auto_mr_drop(struct uet_ernic_dev *d, struct auto_mr *a)
+{
+    struct uet_ernic_release q;
+    struct uet_ernic_reply r;
+    int rc;
+
+    memset(&q, 0, sizeof(q));
+    hdr_init(&q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+    q.handle = htole32(a->handle);
+    rc = call(d, &q, sizeof(q), &r);
+    (void)ibv_dereg_mr(a->ibmr);
+    memset(a, 0, sizeof(*a));
+    return rc;
+}
+
+/*
+ * A registration covering [@buf, @buf + @len): an existing one, or a new
+ * one over the 2 MiB-aligned window around it, clipped to its mapping, so
+ * the segments of one buffer share it.  Called with the lock held.
+ */
+static int auto_mr_get(struct uet_ernic_dev *d, const uint8_t *buf, size_t len,
+                       struct auto_mr **out)
+{
+    uintptr_t b = (uintptr_t)buf, lo, hi, start, end;
+    struct auto_mr *a = NULL, *victim = NULL;
+    struct uet_ernic_mr_reg q;
+    struct uet_ernic_reply r;
+    int rc;
+
+    for (unsigned i = 0; i < AUTO_MRS; i++) {
+        struct auto_mr *m = &d->auto_mrs[i];
+
+        if (m->used && b >= m->start && len <= m->len &&
+            b - m->start <= m->len - len) {
+            m->last_use = ++d->use_clock;
+            *out = m;
+            return 0;
+        }
+        if (!m->used && a == NULL)
+            a = m;
+        else if (m->used && m->refs == 0 &&
+                 (victim == NULL || m->last_use < victim->last_use))
+            victim = m;
+    }
+    if (a == NULL) {
+        if (victim == NULL)
+            return -FI_EAGAIN; /* every one is in use; try again */
+        rc = auto_mr_drop(d, victim);
+        if (rc != 0 && rc != -FI_EBADF)
+            return rc;
+        a = victim;
+    }
+
+    start = b & ~(uintptr_t)4095u;
+    end = (b + len + 4095u) & ~(uintptr_t)4095u;
+    if (d->auto_cache && vma_of(b, &lo, &hi) && b + len <= hi) {
+        uintptr_t wlo = b & ~(uintptr_t)(AUTO_WINDOW - 1u);
+        uintptr_t whi =
+            (b + len + AUTO_WINDOW - 1u) & ~(uintptr_t)(AUTO_WINDOW - 1u);
+
+        start = wlo > lo ? wlo : lo;
+        end = whi < hi ? whi : hi;
+    }
+
+    a->ibmr =
+        ibv_reg_mr(d->pd, (void *)start, end - start, IBV_ACCESS_LOCAL_WRITE);
+    if (a->ibmr == NULL)
+        return -FI_ENOMEM;
+
+    memset(&q, 0, sizeof(q));
+    hdr_init(&q.hdr, UET_ERNIC_OP_MR_REG, 0);
+    q.lkey = htole32(a->ibmr->lkey);
+    rc = call(d, &q, sizeof(q), &r);
+    if (rc != 0) {
+        (void)ibv_dereg_mr(a->ibmr);
+        a->ibmr = NULL;
+        return rc;
+    }
+    a->used = true;
+    a->start = start;
+    a->len = end - start;
+    a->handle = le32toh(r.u.mr_reg.handle);
+    a->refs = 0;
+    a->last_use = ++d->use_clock;
+    *out = a;
+    return 0;
+}
+
+/* Without the cache, a registration goes once its transfers are done. */
+static void auto_mr_release(struct uet_ernic_dev *d)
+{
+    if (d->auto_cache)
+        return;
+    for (unsigned i = 0; i < AUTO_MRS; i++) {
+        if (d->auto_mrs[i].used && d->auto_mrs[i].refs == 0)
+            (void)auto_mr_drop(d, &d->auto_mrs[i]);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Instance                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -462,6 +617,12 @@ static int connect_svc_qp(struct uet_ernic_dev *d)
 
 static void dev_free(struct uet_ernic_dev *d)
 {
+    for (unsigned i = 0; i < AUTO_MRS; i++) {
+        /* The service QP's destruction below releases the engine's
+         * handles; only the ionic registrations are left to undo. */
+        if (d->auto_mrs[i].used)
+            (void)ibv_dereg_mr(d->auto_mrs[i].ibmr);
+    }
     if (d->qp != NULL)
         (void)ibv_destroy_qp(d->qp);
     if (d->slots_mr != NULL)
@@ -493,6 +654,11 @@ int uet_initialize(uet_handle_t *handle)
     if (d == NULL)
         return -FI_ENOMEM;
     pthread_mutex_init(&d->lock, NULL);
+    {
+        const char *cache = getenv("UET_ERNIC_MR_CACHE");
+
+        d->auto_cache = cache == NULL || strcmp(cache, "0") != 0;
+    }
 
     list = ibv_get_device_list(&n);
     dev = list != NULL ? pick_device(list, n) : NULL;
@@ -1050,7 +1216,7 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
     const uint8_t *b = buf;
     int rc;
 
-    if (ep == NULL || mr == NULL || av == NULL || buf == NULL || len == 0)
+    if (ep == NULL || av == NULL || buf == NULL || len == 0)
         return -FI_EINVAL;
     d = ep->dom->dev;
     if (!ep->enabled || ep->tx_cq == NULL)
@@ -1059,19 +1225,35 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
     if (job_id != d->job_id && job_id != UET_JOB_ID_ANY)
         return -FI_EINVAL;
     /* The engine moves registered memory only, named within its region. */
-    if (b < mr->buf || len > mr->len || (size_t)(b - mr->buf) > mr->len - len)
+    if (mr != NULL &&
+        (b < mr->buf || len > mr->len || (size_t)(b - mr->buf) > mr->len - len))
         return -FI_EINVAL;
 
     memset(&q, 0, sizeof(q));
     q.peer = htole32(av->handle);
-    q.mr = htole32(mr->handle);
-    q.local_offset = htole64((uint64_t)(b - mr->buf));
     q.length = htole64(len);
     q.remote_offset = htole64(remote_mem_addr);
     q.rkey = htole64(remote_key);
     q.flags = htole32(ep->rudi ? UET_ERNIC_RMA_RUDI : 0u);
 
     pthread_mutex_lock(&d->lock);
+    auto_mr_release(d);
+
+    struct auto_mr *am = NULL;
+    if (mr != NULL) {
+        q.mr = htole32(mr->handle);
+        q.local_offset = htole64((uint64_t)(b - mr->buf));
+    } else {
+        rc = auto_mr_get(d, b, len, &am);
+        if (rc != 0) {
+            progress(d);
+            pthread_mutex_unlock(&d->lock);
+            return rc;
+        }
+        q.mr = htole32(am->handle);
+        q.local_offset = htole64((uint64_t)((uintptr_t)b - am->start));
+    }
+
     p = pend_alloc(d, &cookie);
     if (p == NULL) {
         progress(d);
@@ -1084,11 +1266,16 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
     p->context = context;
     p->len = len;
     p->flags = FI_RMA | (op == UET_ERNIC_OP_WRITE ? FI_WRITE : FI_READ);
+    p->auto_mr = am;
     rc = send_capsule(d, &q, sizeof(q));
-    if (rc != 0)
+    if (rc != 0) {
         p->kind = PEND_FREE;
-    else
+        p->auto_mr = NULL;
+    } else {
         ep->in_flight++;
+        if (am != NULL)
+            am->refs++;
+    }
     pthread_mutex_unlock(&d->lock);
     return rc;
 }

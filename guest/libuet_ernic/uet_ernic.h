@@ -23,8 +23,13 @@
  * Differences from the reference library:
  *  - One device-side endpoint serves every endpoint opened here, so they
  *    all share its address (uet_getname) and JobID.
- *  - RMA writes and reads only, and only from registered memory: the
- *    local buffer must lie in the region named by mr_handle.
+ *  - RMA writes and reads only.  A local buffer passed with no region is
+ *    registered on demand: the 2 MiB-aligned window around it, within its
+ *    mapping, is registered once and reused (UET_ERNIC_MR_CACHE=0 drops
+ *    each registration when its transfers are done instead).  As with any
+ *    registration cache, a buffer that is unmapped and mapped again at the
+ *    same address must not be written from while the stale registration
+ *    is cached.
  *  - No immediate data, no messages, no atomics, no target-side events.
  *  - Remote addresses are offsets from the start of the remote region.
  *  - uet_mr_disable() keeps the region reachable by peers until
@@ -35,6 +40,7 @@
  *  UET_ERNIC_DEVICE     ibverbs device to use (default: the first ionic
  *                       one; there is no fallback to other devices)
  *  UET_ERNIC_GID_INDEX  GID index for the service QP's address (default 0)
+ *  UET_ERNIC_MR_CACHE   0 to drop on-demand registrations after use
  *  UET_FORCE_RUDI       new endpoints use RUDI for idempotent RMA, as in the
  *                       reference library; uet_ep_setopt() overrides it
  */
