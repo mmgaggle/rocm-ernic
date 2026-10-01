@@ -1,0 +1,107 @@
+/*
+ * uet_nic_ernic.h -- the UET engine's port on the emulated wire
+ *
+ * The UEC reference provider reaches the network through a "NIC shim": a
+ * table of callbacks that move whole Ethernet frames. Its built-in shims
+ * open a raw socket or an AF_XDP socket on a kernel netdev. Neither fits a
+ * device model, which owns its wire (the TAP behind the emulated LIF) and
+ * must keep every packet on the thread that services the guest.
+ *
+ * This shim is that port. Frames the provider transmits go to a callback
+ * the owner supplies; frames the owner takes off the wire are offered to
+ * uet_nic_ernic_rx_frame(), which keeps the ones addressed to the engine and
+ * queues them until the provider polls for them. It also answers ARP for the
+ * engine's address and resolves next hops by ARP without ever blocking,
+ * which is what the provider's own resolver (popen of "ip route", system()
+ * of "ping", SIOCGARP) cannot do.
+ *
+ * Everything here runs on one thread. Nothing is locked.
+ *
+ * Copyright (C) Advanced Micro Devices, Inc.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef UET_NIC_ERNIC_H
+#define UET_NIC_ERNIC_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* Name the shim registers under, and the value of UET_NIC_SHIM for it. */
+#define UET_NIC_ERNIC_NAME "ernic"
+
+/* IP protocol number UET is carried in when it runs directly over IP. */
+#define UET_NIC_ERNIC_IPPROTO 253
+
+struct uet_nic_ernic;
+
+/*
+ * Put one Ethernet frame on the wire.  Returns 0 or a negative errno.  A
+ * frame the wire cannot take right now (a full TAP queue) is dropped rather
+ * than retried: the provider's reliability layer recovers it, as it would a
+ * loss anywhere else on the path.
+ */
+typedef int (*uet_nic_ernic_tx_fn)(void *ctx, const void *frame, size_t len);
+
+struct uet_nic_ernic_cfg {
+    uint32_t ip;            /* the engine's IPv4 address, host order */
+    uint8_t mac[6];         /* the engine's MAC address */
+    uint16_t mtu;           /* IP MTU of the wire */
+    const char *name;       /* interface name the provider reports */
+    uet_nic_ernic_tx_fn tx; /* where transmitted frames go */
+    void *tx_ctx;
+};
+
+struct uet_nic_ernic_stats {
+    uint64_t rx_frames;    /* UET frames queued for the provider */
+    uint64_t rx_dropped;   /* UET frames dropped: queue full or too big */
+    uint64_t tx_frames;    /* frames the provider transmitted */
+    uint64_t tx_dropped;   /* frames the wire would not take */
+    uint64_t arp_requests; /* ARP requests sent to resolve a next hop */
+    uint64_t arp_replies;  /* ARP replies sent for the engine's address */
+    uint64_t arp_learned;  /* neighbors learned or refreshed from ARP */
+    uint64_t nh_pending;   /* resolutions answered with -EAGAIN */
+};
+
+/*
+ * Create the shim.  It is not visible to the provider until
+ * uet_nic_ernic_register() is called.  Returns NULL on a bad configuration
+ * or when out of memory.
+ */
+struct uet_nic_ernic *uet_nic_ernic_create(const struct uet_nic_ernic_cfg *cfg);
+void uet_nic_ernic_destroy(struct uet_nic_ernic *n);
+
+/*
+ * Make this shim the provider's NIC shim.  Must be called before
+ * uet_initialize().  The provider holds one external shim per process, so
+ * only one instance can be registered at a time.  Returns 0 or a negative
+ * errno.
+ */
+int uet_nic_ernic_register(struct uet_nic_ernic *n);
+void uet_nic_ernic_unregister(void);
+
+/*
+ * Wire-side receive filter.  Offer it every frame taken off the wire.  It
+ * returns true when the frame belonged to the engine and has been consumed:
+ * a UET frame (IPv4 protocol 253) addressed to the engine's IP and MAC, or
+ * an ARP packet whose target is the engine's IP.  Everything else, including
+ * ARP for other addresses (which is only looked at to refresh neighbors the
+ * engine already knows), is left for the guest.
+ */
+bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
+                            size_t len);
+
+/* True while received frames are waiting for the provider to poll them. */
+bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n);
+
+/*
+ * Resend ARP for next hops that have not answered yet, and give up on ones
+ * that never will.  @now_ms is a monotonic millisecond clock.
+ */
+void uet_nic_ernic_tick(struct uet_nic_ernic *n, uint64_t now_ms);
+
+void uet_nic_ernic_get_stats(const struct uet_nic_ernic *n,
+                             struct uet_nic_ernic_stats *out);
+
+#endif /* UET_NIC_ERNIC_H */

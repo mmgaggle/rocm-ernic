@@ -22,6 +22,7 @@
 
 /* Forward declarations */
 typedef struct rocm_ernic_dev rocm_ernic_dev_t;
+struct uet_engine;
 
 /* ---------------------------------------------------------------------------
  * Legacy PVRDMA BAR layout (kept for reference during ionic migration).
@@ -112,6 +113,9 @@ struct rocm_ernic_dev {
     struct ionic_eth_emu *ionic_emu;
     struct ionic_rdma_devcmd_state *ionic_rdma;
     struct ionic_datapath *ionic_dp;
+
+    /* UET engine on the wire (--uet), or NULL */
+    struct uet_engine *uet_engine;
 
     /* BAR memory backing stores */
     void *bar0_mem; /* MSI-X table/PBA shadow, above the ionic register block */

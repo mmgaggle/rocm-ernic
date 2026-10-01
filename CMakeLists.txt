@@ -60,6 +60,7 @@ include(CTest)
 # ---------------------------------------------------------------
 include(ErnicGitInfo)
 include(ErnicCompilerOptions)
+include(ErnicUet)
 
 # ---------------------------------------------------------------
 # Dependencies
@@ -218,6 +219,11 @@ set(ALL_SOURCES
     ${ERNIC_VENDORED_SOURCES}
 )
 
+# UET engine on the UEC reference provider (optional, see cmake/ErnicUet.cmake)
+if(ERNIC_UET)
+    list(APPEND ALL_SOURCES ${ERNIC_UET_SOURCES})
+endif()
+
 # ---------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------
@@ -285,6 +291,10 @@ target_link_libraries(rocm-ernic PRIVATE
 
 ernic_set_compiler_flags(rocm-ernic)
 
+if(ERNIC_UET)
+    ernic_uet_link(rocm-ernic)
+endif()
+
 # Off by default so a downstream or distro build is never broken by a
 # warning from a compiler version we have not seen. CI passes
 # -DERNIC_WERROR=ON on every lane that compiles the project, so new
@@ -345,6 +355,12 @@ message("")
 message("  Sanitizers:")
 message("    ASAN/LSAN/UBSAN : ${ERNIC_USE_SANITIZERS}")
 message("    TSAN            : ${ERNIC_USE_THREAD_SANITIZER}")
+message("")
+message("  UET engine:")
+message("    ERNIC_UET : ${ERNIC_UET}")
+if(ERNIC_UET)
+    message("    provider  : ${ERNIC_UET_SOURCE_DIR}")
+endif()
 message("")
 message("  Kernel module (DKMS):")
 message("    ERNIC_BUILD_KMOD : ${ERNIC_BUILD_KMOD}")

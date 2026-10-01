@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,6 +45,9 @@
 #include "nvmeof_target.h"
 #include "s3_target.h"
 #include "rocm-ernic-warnings.h"
+#ifdef ERNIC_HAVE_UET
+#include "uet_engine.h"
+#endif
 
 static const char *get_backend_type_base(const char *backend_str);
 
@@ -608,6 +612,142 @@ static int setup_interrupts(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
     return 0;
 }
 
+#ifdef ERNIC_HAVE_UET
+/* ---------------------------------------------------------------------------
+ * UET engine glue
+ *
+ * The engine is device firmware: it owns an address of its own on the wire
+ * (the TAP), takes the frames for that address before the guest sees them,
+ * and reaches guest memory through the same vfio-user DMA mappings as the
+ * rest of the device.  All of it runs on this thread, from the main loop.
+ * ---------------------------------------------------------------------------
+ */
+struct uet_dma_vfu {
+    vfu_ctx_t *vfu_ctx;
+    dma_sg_t *sg; /* scratch, reused: everything runs on one thread */
+};
+
+static struct uet_dma_vfu g_uet_dma;
+
+/*
+ * Map a range of guest memory for the engine.  The engine asks for one page
+ * of a region at a time, so the range never straddles two DMA regions.  A
+ * write marks the pages dirty before the engine stores to them; the store
+ * happens before this thread returns to vfu_run_ctx(), which is the only
+ * place the dirty bitmap is read, so migration cannot miss it.
+ */
+static void *uet_dma_vfu_map(void *ctx, uint64_t addr, size_t len, bool write)
+{
+    struct uet_dma_vfu *d = ctx;
+    struct iovec iov;
+
+    if (!d->vfu_ctx || !d->sg || len == 0)
+        return NULL;
+    if (vfu_addr_to_sgl(d->vfu_ctx, (vfu_dma_addr_t)(uintptr_t)addr, len, d->sg,
+                        1, write ? PROT_READ | PROT_WRITE : PROT_READ) != 1)
+        return NULL;
+    if (vfu_sgl_get(d->vfu_ctx, d->sg, &iov, 1, 0) < 0)
+        return NULL;
+    if (write)
+        vfu_sgl_mark_dirty(d->vfu_ctx, d->sg, 1);
+    vfu_sgl_put(d->vfu_ctx, d->sg, &iov, 1);
+    return iov.iov_base;
+}
+
+static int uet_wire_tx(void *ctx, const void *frame, size_t len)
+{
+    return ionic_eth_emu_wire_send(ctx, frame, len);
+}
+
+static bool uet_wire_rx_filter(void *ctx, const void *frame, size_t len)
+{
+    return uet_engine_rx_frame(ctx, frame, len);
+}
+
+static int uet_engine_start(rocm_ernic_dev_t *dev,
+                            const struct uet_engine_cfg *cfg, bool have_wire)
+{
+    char err[256] = "";
+    char desc[192];
+
+    if (!dev->ionic_emu) {
+        fprintf(stderr, "Error: uet engine: Ethernet emulation is not "
+                        "initialized\n");
+        return -1;
+    }
+
+    g_uet_dma.vfu_ctx = dev->vfu_ctx;
+    g_uet_dma.sg = malloc(dma_sg_size());
+    if (!g_uet_dma.sg) {
+        fprintf(stderr, "Error: uet engine: out of memory\n");
+        return -1;
+    }
+
+    struct uet_engine_wire wire = {.tx = uet_wire_tx, .ctx = dev->ionic_emu};
+    struct uet_engine_dma dma = {.map = uet_dma_vfu_map, .ctx = &g_uet_dma};
+
+    dev->uet_engine = uet_engine_create(cfg, &wire, &dma, err, sizeof(err));
+    if (!dev->uet_engine) {
+        fprintf(stderr, "Error: uet engine: %s\n", err);
+        free(g_uet_dma.sg);
+        g_uet_dma.sg = NULL;
+        return -1;
+    }
+    ionic_eth_emu_register_rx_filter(dev->ionic_emu, uet_wire_rx_filter,
+                                     dev->uet_engine);
+
+    uet_engine_cfg_describe(cfg, desc, sizeof(desc));
+    ernic_startup_report("rocm-ernic: UET engine %s%s", desc,
+                         have_wire ? ""
+                                   : " (no --tap: the engine has no wire)");
+    return 0;
+}
+
+static void uet_engine_stop(rocm_ernic_dev_t *dev)
+{
+    struct uet_engine_stats st;
+
+    if (!dev->uet_engine)
+        return;
+
+    uet_engine_get_stats(dev->uet_engine, &st);
+    ernic_startup_report(
+        "rocm-ernic: UET engine stats: rx %" PRIu64 " (dropped %" PRIu64
+        ") tx %" PRIu64 " (dropped %" PRIu64 ") arp req %" PRIu64
+        " rep %" PRIu64 " ops %" PRIu64 " ok %" PRIu64 " failed %" PRIu64,
+        st.rx_frames, st.rx_dropped, st.tx_frames, st.tx_dropped,
+        st.arp_requests, st.arp_replies, st.ops_posted, st.ops_completed,
+        st.ops_failed);
+
+    ionic_eth_emu_register_rx_filter(dev->ionic_emu, NULL, NULL);
+    uet_engine_destroy(dev->uet_engine);
+    dev->uet_engine = NULL;
+    free(g_uet_dma.sg);
+    g_uet_dma.sg = NULL;
+}
+#endif /* ERNIC_HAVE_UET */
+
+/* Run the UET engine, if there is one: wire frames, timers, ARP. */
+static void uet_engine_service(rocm_ernic_dev_t *dev)
+{
+#ifdef ERNIC_HAVE_UET
+    if (dev->uet_engine)
+        uet_engine_poll(dev->uet_engine);
+#else
+    (void)dev;
+#endif
+}
+
+static bool uet_engine_busy(rocm_ernic_dev_t *dev)
+{
+#ifdef ERNIC_HAVE_UET
+    return dev->uet_engine && uet_engine_has_work(dev->uet_engine);
+#else
+    (void)dev;
+    return false;
+#endif
+}
+
 /**
  * Print usage information
  */
@@ -640,6 +780,19 @@ static void usage(const char *progname)
     fprintf(stderr, "                       Pre-create it with: ip tuntap add "
                     "dev IFNAME\n");
     fprintf(stderr, "                       mode tap user $USER\n");
+    fprintf(stderr,
+            "  -U, --uet OPTIONS    Run a UET engine on the wire at its "
+            "own address,\n");
+    fprintf(stderr, "                       e.g. --uet ip=192.168.200.101 "
+                    "(options: ip, mac,\n");
+    fprintf(stderr, "                       job, pid, index, initiator, "
+                    "pds=pds|sng,\n");
+    fprintf(stderr, "                       sec=none|direct|cluster, ssi, rto, "
+                    "retries, mtu)\n");
+#ifndef ERNIC_HAVE_UET
+    fprintf(stderr, "                       (not in this build: configure with "
+                    "-DERNIC_UET=ON)\n");
+#endif
     fprintf(stderr, "  -h, --help           Show this help message\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Backend Types:\n");
@@ -999,9 +1152,14 @@ int main(int argc, char *argv[])
     const char *socket_path = DEFAULT_SOCKET_PATH;
     const char *log_file_path = NULL;
     const char *tap_ifname = NULL;
+    const char *uet_opts = NULL;
+#ifdef ERNIC_HAVE_UET
+    struct uet_engine_cfg uet_cfg;
+#endif
     ErnicLogLevel log_level = ERNIC_LOG_WARN;
     bool log_level_set = false;
     int ret, opt;
+    bool ok_to_start = true;
 
     /* Command-line option definitions */
     static struct option long_options[] = {
@@ -1015,6 +1173,7 @@ int main(int argc, char *argv[])
         {"mac", required_argument, NULL, 'm'},
         {"help", no_argument, NULL, 'h'},
         {"tap", required_argument, NULL, 'T'},
+        {"uet", required_argument, NULL, 'U'},
         /* Backend-specific options (verbs only) */
         {"device", required_argument, NULL, 'd'},
         {"ethdev", required_argument, NULL, 'e'},
@@ -1045,7 +1204,7 @@ int main(int argc, char *argv[])
     dev->mac_addr[5] = 0x6e;
 
     /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "s:b:vL:S:m:l:hT:", long_options,
+    while ((opt = getopt_long(argc, argv, "s:b:vL:S:m:l:hT:U:", long_options,
                               NULL)) != -1) {
         switch (opt) {
         /* Common options */
@@ -1112,6 +1271,9 @@ int main(int argc, char *argv[])
         case 'T':
             tap_ifname = optarg;
             break;
+        case 'U':
+            uet_opts = optarg;
+            break;
         case 'h':
             usage(argv[0]);
             exit(EXIT_SUCCESS);
@@ -1136,6 +1298,35 @@ int main(int argc, char *argv[])
         free(dev->backend_eth_device);
         free(dev);
         exit(EXIT_FAILURE);
+    }
+
+    /* Refuse a bad --uet now, before a guest attaches to a device whose
+     * firmware cannot start. */
+    if (uet_opts) {
+#ifdef ERNIC_HAVE_UET
+        char uet_err[256] = "";
+
+        uet_engine_cfg_defaults(&uet_cfg);
+        if (!uet_engine_cfg_parse(&uet_cfg, uet_opts, uet_err,
+                                  sizeof(uet_err))) {
+            fprintf(stderr, "Error: uet engine: %s\n", uet_err);
+            fprintf(stderr, "  Use: --uet ip=ADDR[,mac=MAC][,job=N][,pid=N]"
+                            "[,index=N][,pds=pds|sng]"
+                            "[,sec=none|direct|cluster][,ssi=N]\n");
+            ok_to_start = false;
+        }
+#else
+        fprintf(stderr, "Error: uet engine: this build has no UET engine "
+                        "(configure with -DERNIC_UET=ON)\n");
+        ok_to_start = false;
+#endif
+        if (!ok_to_start) {
+            free(dev->backend_type_str);
+            free(dev->backend_device_name);
+            free(dev->backend_eth_device);
+            free(dev);
+            exit(EXIT_FAILURE);
+        }
     }
 
     /* Redirect stdout and stderr to log file if requested */
@@ -1308,6 +1499,13 @@ int main(int argc, char *argv[])
                              assigned);
     }
 
+#ifdef ERNIC_HAVE_UET
+    /* The engine comes up after the device and its wire, so its first ARP
+     * reply already has somewhere to go. */
+    if (uet_opts && uet_engine_start(dev, &uet_cfg, tap_ifname != NULL) < 0)
+        exit(EXIT_FAILURE);
+#endif
+
     ernic_startup_report("rocm-ernic: Device realized, waiting for client "
                          "connection...");
 
@@ -1317,7 +1515,14 @@ int main(int argc, char *argv[])
         ret = vfu_attach_ctx(vfu_ctx);
         if (ret < 0) {
             if (errno == EAGAIN) {
-                /* No client yet, sleep and retry */
+                /* No client yet.  The UET engine is firmware and answers
+                 * on the wire without a guest; there is no guest memory to
+                 * touch, so this is safe before attach. */
+                if (dev->uet_engine) {
+                    ionic_eth_emu_poll_wire(dev->ionic_emu);
+                    uet_engine_service(dev);
+                }
+                /* Sleep and retry */
                 usleep(100000); /* 100ms */
                 continue;
             } else if (errno == EINTR) {
@@ -1367,6 +1572,10 @@ int main(int argc, char *argv[])
              * This has to happen on this thread: only it may DMA. */
             if (dev->ionic_emu)
                 ionic_eth_emu_poll_rx(dev->ionic_emu);
+
+            /* UET engine: the frames the Rx filter just took, retransmit
+             * timers and ARP.  Same thread, so it may DMA too. */
+            uet_engine_service(dev);
 
             /* ionic: poll admin queue rings for new WQEs */
             if (dev->ionic_rdma) {
@@ -1426,7 +1635,8 @@ int main(int argc, char *argv[])
              * still avoiding 100 % CPU in the idle case.
              */
             if (ret == 0 && !had_events &&
-                !ionic_datapath_has_work(dev->ionic_dp)) {
+                !ionic_datapath_has_work(dev->ionic_dp) &&
+                !uet_engine_busy(dev)) {
                 usleep(100);
             }
         }
@@ -1449,6 +1659,12 @@ int main(int argc, char *argv[])
     /* Disable signal handlers during cleanup */
     set_signal_handler(SIGINT, SIG_IGN);
     set_signal_handler(SIGTERM, SIG_IGN);
+
+    /* The engine maps guest memory through the vfio-user context, so it
+     * goes first. */
+#ifdef ERNIC_HAVE_UET
+    uet_engine_stop(dev);
+#endif
 
     /* Cleanup */
     vfu_destroy_ctx(vfu_ctx);
