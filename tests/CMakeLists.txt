@@ -539,6 +539,32 @@ if(ERNIC_UET)
     target_compile_options(test_uet_engine PRIVATE ${ERNIC_UNIT_TEST_SAN})
     target_link_options(test_uet_engine PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
     ernic_uet_link(test_uet_engine)
+
+    # The command channel end to end: it #includes ionic_datapath.c, as
+    # test_ionic_cq_arm does, and stands a byte array in for guest memory
+    # behind fake vfio-user DMA calls, so the capsules really travel
+    # through ionic SQ/RQ/CQ rings. Two processes, as above.
+    add_executable(test_uet_datapath
+        test_uet_datapath.c
+        ${CMAKE_SOURCE_DIR}/src/uet_engine.c
+        ${CMAKE_SOURCE_DIR}/src/uet_nic_ernic.c
+        ${CMAKE_SOURCE_DIR}/src/uet_svc.c
+    )
+    target_include_directories(test_uet_datapath PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/shared
+    )
+    target_include_directories(test_uet_datapath SYSTEM PRIVATE
+        ${VFIO_USER_INCLUDE_DIRS}
+        ${GLIB2_INCLUDE_DIRS}
+        ${ERNIC_IBVERBS_INCLUDE_DIRS}
+    )
+    target_compile_definitions(test_uet_datapath PRIVATE _GNU_SOURCE)
+    target_compile_options(test_uet_datapath PRIVATE ${ERNIC_UNIT_TEST_SAN})
+    target_link_options(test_uet_datapath PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
+    target_link_directories(test_uet_datapath PRIVATE ${GLIB2_LIBRARY_DIRS})
+    target_link_libraries(test_uet_datapath PRIVATE ${GLIB2_LIBRARIES})
+    ernic_uet_link(test_uet_datapath)
 endif()
 
 # ---------------------------------------------------------------
@@ -571,7 +597,7 @@ set(ERNIC_TEST_TARGETS
     test_qemu_stubs
 )
 if(ERNIC_UET)
-    list(APPEND ERNIC_TEST_TARGETS test_uet_engine)
+    list(APPEND ERNIC_TEST_TARGETS test_uet_engine test_uet_datapath)
 endif()
 
 foreach(ernic_test_target IN LISTS ERNIC_TEST_TARGETS)
@@ -832,6 +858,15 @@ if(ERNIC_UET)
         COMMAND $<TARGET_FILE:test_uet_engine>
     )
     set_tests_properties(uet-engine-unit PROPERTIES TIMEOUT 600)
+
+    # UET engine, phase 2: the guest command channel through ionic rings,
+    # MR and QP destruction with transfers in flight, and a remote window
+    # withdrawn.
+    add_test(
+        NAME uet-datapath-unit
+        COMMAND $<TARGET_FILE:test_uet_datapath>
+    )
+    set_tests_properties(uet-datapath-unit PROPERTIES TIMEOUT 120)
 
     # UET engine CI suite: the server starts with --uet and announces the
     # engine's address, and refuses a bad --uet before startup.
