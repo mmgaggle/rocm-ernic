@@ -115,13 +115,20 @@ self-hosted lane. See :doc:`s3`.
 UET engine tests
 ^^^^^^^^^^^^^^^^
 
-With ``-DERNIC_UET=ON`` two more tests are registered.
+With ``-DERNIC_UET=ON`` more tests are registered.
 ``uet-engine-unit`` runs two engines in two processes joined
 by a socketpair and moves 1 MiB between them over RUDI, RUD,
 RUD with forced drops and TSS, comparing every byte.
-``uet-ci`` is a shell test that starts the real server with
-``--uet`` and checks that bad options are refused. Neither
-needs a VM, a TAP or root.
+``uet-datapath-unit`` drives the guest command channel through
+real ionic SQ, RQ and CQ rings in fake guest memory, including
+MRs and service QPs destroyed while transfers are in flight.
+``uet-guest-lib-unit`` runs the guest library, ``libuet_ernic``,
+over a fake libibverbs against two device processes that run
+the real channel and engines. It is registered only when
+libfabric's headers are installed. ``uet-ci`` is a shell test
+that starts the real server with ``--uet`` and checks that bad
+options are refused. None of them needs a VM, a TAP or root.
+See :doc:`uet`.
 
 .. code-block:: bash
 
