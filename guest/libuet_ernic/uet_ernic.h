@@ -38,7 +38,8 @@
  *
  * Environment:
  *  UET_ERNIC_DEVICE     ibverbs device to use (default: the first ionic
- *                       one; there is no fallback to other devices)
+ *                       one, see uet_ernic_device_match(); there is no
+ *                       fallback to other devices)
  *  UET_ERNIC_GID_INDEX  GID index for the service QP's address (default 0)
  *  UET_ERNIC_MR_CACHE   0 to drop on-demand registrations after use
  *  UET_FORCE_RUDI       new endpoints use RUDI for idempotent RMA, as in the
@@ -120,6 +121,11 @@ int uet_ep_bind_cq(uet_ep_handle_t ep_handle, struct fi_cq_attr *attr,
 int uet_ep_enable(uet_ep_handle_t ep_handle);
 int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
                   const void *optval, size_t optlen);
+/*
+ * Discard what the endpoint has outstanding, ahead of uet_ep_close(), as in
+ * the reference library (the libfabric provider calls it from fi_close).
+ */
+int uet_ep_abort(uet_ep_handle_t ep_handle);
 int uet_ep_close(uet_ep_handle_t ep_handle);
 int uet_ep_progress(uet_ep_handle_t ep_handle);
 
@@ -139,5 +145,18 @@ ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
                  size_t len, uet_mr_handle_t mr_handle,
                  uet_addr_handle_t uet_addr_handle, uint64_t remote_mem_addr,
                  uint64_t remote_key, void *context);
+
+/* ---- not in uet_api.h ------------------------------------------------- */
+
+/* The PCI vendor ID of an ionic function, which an ernic device has too. */
+#define UET_ERNIC_PCI_VENDOR 0x1dd8u
+
+/*
+ * Whether the ibverbs device @name can have an engine behind it: an ionic
+ * device, by its name or, once udev has renamed it, by its PCI vendor ID.
+ * This is how uet_initialize() picks a device when UET_ERNIC_DEVICE is not
+ * set.
+ */
+bool uet_ernic_device_match(const char *name);
 
 #endif /* UET_ERNIC_H */

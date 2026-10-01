@@ -549,6 +549,30 @@ static void auto_mr_release(struct uet_ernic_dev *d)
 /* Instance                                                           */
 /* ------------------------------------------------------------------ */
 
+bool uet_ernic_device_match(const char *name)
+{
+    char path[256], vendor[16] = "";
+    FILE *f;
+
+    if (name == NULL)
+        return false;
+    if (strncmp(name, "ionic", 5) == 0)
+        return true;
+    /* Renamed by udev (rocm-ernic's rule calls it rocm-rdma-ernic0):
+     * recognise it by the PCI function behind it. */
+    if (strchr(name, '/') != NULL ||
+        snprintf(path, sizeof(path), "/sys/class/infiniband/%s/device/vendor",
+                 name) >= (int)sizeof(path))
+        return false;
+    f = fopen(path, "r");
+    if (f == NULL)
+        return false;
+    if (fgets(vendor, sizeof(vendor), f) == NULL)
+        vendor[0] = '\0';
+    fclose(f);
+    return strtoul(vendor, NULL, 16) == UET_ERNIC_PCI_VENDOR;
+}
+
 /* The named device, or else the first ionic one: no other kind of device
  * has an engine behind it. */
 static struct ibv_device *pick_device(struct ibv_device **list, int n)
@@ -559,7 +583,7 @@ static struct ibv_device *pick_device(struct ibv_device **list, int n)
         const char *name = ibv_get_device_name(list[i]);
 
         if (want != NULL ? strcmp(name, want) == 0
-                         : strncmp(name, "ionic", 5) == 0)
+                         : uet_ernic_device_match(name))
             return list[i];
     }
     return NULL;
@@ -1110,6 +1134,17 @@ static void cq_free(struct uet_ernic_cq *cq)
     free(cq->err);
     free(cq->is_err);
     free(cq);
+}
+
+/*
+ * The command channel has no way yet to take back a WRITE or READ the
+ * device has accepted: one that waits in the device is posted when it can
+ * be, and one in the engine runs to its end.  Say so, as the reference's
+ * stop-and-go PDS does, so a caller waits for them instead.
+ */
+int uet_ep_abort(uet_ep_handle_t ep_handle)
+{
+    return ep_handle != NULL ? -FI_ENOSYS : -FI_EINVAL;
 }
 
 int uet_ep_close(uet_ep_handle_t ep_handle)
