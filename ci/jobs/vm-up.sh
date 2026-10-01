@@ -92,6 +92,9 @@ wait_for_ssh() {
         if vm_ssh "${n}" true 2>/dev/null; then
             return 0
         fi
+        # vm-launch returns before the run-vm wrapper has
+        # started qemu, so look for qemu only after a wait.
+        sleep 10
         # A dead qemu will never come back; fail fast
         # instead of burning the whole timeout.
         if ! pgrep -f "qemu-system.*${CI_VM_NAME_BASE}-${n}" >/dev/null; then
@@ -99,7 +102,6 @@ wait_for_ssh() {
             tail -20 "${CI_LOG_DIR}/vm-${n}.log" >&2 || true
             return 1
         fi
-        sleep 10
     done
     log_error "VM ${n} did not reach SSH within ${boot_timeout}s"
     tail -20 "${CI_LOG_DIR}/vm-${n}.log" >&2 || true
