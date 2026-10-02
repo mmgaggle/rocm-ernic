@@ -137,6 +137,11 @@ The argument of ``--uet`` is a comma-separated list of
    * - ``proto=``
      - ``253``
      - The IP protocol without UDP; not 6 or 17.
+   * - ``wire=``
+     - ``tap``
+     - ``tap`` sends on the TAP of ``--tap``. ``dpdk`` sends on
+       a DPDK port, with the ``dpdk-*`` options (see `DPDK
+       Wire`_).
 
 A bad option stops the server before the guest attaches:
 
@@ -932,6 +937,382 @@ MTU over IP protocol 253:
    UET_HOST_PROV_DIR=/path/to/uet-ref-prov/prov \
    UET_CHECKS="rma prov interop" bash ci/jobs/vm-uet.sh
 
+DPDK Wire
+---------
+
+With ``wire=dpdk``, the engine sends and receives on a DPDK port
+instead of the TAP. The TAP stays the guest's Ethernet. The server
+polls the port from its main loop, in bursts of up to 64 frames. A
+received frame stays in its mbuf until the provider reads it. The
+backend is ``src/uet_wire_dpdk.c``.
+
+Each offload has a capability check and a software fallback. The
+startup line names the path that each offload took:
+
+.. code-block:: console
+
+   rocm-ernic: UET wire dpdk net_af_packet0 (vdev): flow sw filter \
+       (UDP rule: Function not implemented); rss off, 1 queue; \
+       tx extbuf zero-copy; rx split off; dma memcpy; ts rx hw tx sw; \
+       ipv4 csum tx sw rx sw; udp csum none (UET sends 0); \
+       mac promisc; guest mem by VA, no device needs it mapped
+
+Building the DPDK Wire
+^^^^^^^^^^^^^^^^^^^^^^
+
+The default build does not need DPDK. To build the DPDK wire,
+install DPDK 24.11 and turn on ``ERNIC_UET_DPDK``:
+
+.. code-block:: bash
+
+   sudo dnf install dpdk-devel dpdk-tools
+   cmake -B build-dpdk -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+     -DERNIC_UET=ON -DERNIC_UET_DPDK=ON \
+     -DERNIC_UET_SOURCE_DIR=/path/to/uet-ref-prov
+   cmake --build build-dpdk
+   ctest --test-dir build-dpdk -R uet-dpdk
+
+The two tests need no privileges and no hugepages.
+``uet-dpdk-unit`` runs two engines in two processes, joined by
+``net_memif``. ``uet-dpdk-map-unit`` checks the guest memory
+mapping on ``net_ring`` loopback ports (see `Guest Memory on PCI`_).
+
+DPDK Options
+^^^^^^^^^^^^
+
+In ``--uet``, a ``;`` stands for a ``,`` in ``dpdk-dev=`` and
+``dpdk-dma=``. In ``dpdk-eal=``, a ``;`` separates the arguments.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 14 68
+
+   * - Option
+     - Default
+     - Meaning
+   * - ``dpdk-dev=``
+     - (required)
+     - The port: the devargs of a vdev, for example
+       ``net_tap0;iface=uet1``, or a PCI address, for example
+       ``0000:c1:00.0``.
+   * - ``dpdk-dma=``
+     - none
+     - A dmadev that places received payload in guest memory:
+       ``dma_skeleton``, or a PCI address.
+   * - ``dpdk-eal=``
+     - none
+     - More EAL arguments.
+   * - ``dpdk-queues=``
+     - ``1``
+     - Receive and transmit queue pairs, 1..16.
+   * - ``dpdk-map=``
+     - ``auto``
+     - Map guest memory for the devices on a bus (``auto``), for
+       every device (``on``), or for none (``off``). See
+       `Guest Memory on PCI`_.
+   * - ``dpdk-split=``
+     - ``off``
+     - ``on`` asks for receive buffer split.
+
+The backend starts the EAL with one lcore, the server's thread. If
+every device is a vdev, it adds ``--no-huge -m 512 --no-shconf
+--no-pci``. If a device is on PCI, it adds ``--in-memory``. Then the
+devices DMA from hugepages, and a second engine can run beside the
+first without a ``--file-prefix``.
+
+Offloads
+^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 18 32 32
+
+   * - Offload
+     - Fallback
+     - On the virtual devices
+     - Hardware that runs it
+   * - Flow steering. ``rte_flow`` rules send UDP to port 4793,
+       IP protocol 253 and ARP to the engine's queues. If all
+       three rules validate, the port is isolated, and other
+       frames stay with the kernel.
+     - The engine's filter sees every frame and gives the
+       frames that are not UET to the guest.
+     - ``net_tap``: rules as TC filters, isolated. ``af_packet``,
+       ``memif`` and ``ring``: the fallback.
+     - ConnectX-6 and ConnectX-7 (mlx5, isolated). E810 (ice):
+       rules without isolation.
+   * - RSS over the UDP source port, which carries the entropy.
+     - One queue.
+     - ``net_tap``: RSS, but its flow rules cannot carry an RSS
+       action, so UET goes to queue 0. The others: the fallback.
+     - ConnectX-6 and ConnectX-7, E810.
+   * - Zero-copy transmit. The payload goes out as an external
+       buffer in guest memory.
+     - One mbuf, copied.
+     - ``net_tap``, ``af_packet``, ``memif`` and ``ring``. The
+       PMD copies the payload in software.
+     - Any NIC with multi-segment transmit. On PCI, only from
+       DMA-mapped guest memory.
+   * - Receive buffer split, off by default. The engine gathers
+       a split frame into one buffer, and that costs a copy.
+     - One buffer per frame.
+     - None of the virtual PMDs.
+     - ConnectX-6 and ConnectX-7 (by length), E810 (by protocol,
+       after the UDP header).
+   * - Payload placement in guest memory by a dmadev.
+     - ``memcpy()``.
+     - ``dma_skeleton``, a thread that calls ``memcpy()``.
+     - Intel DSA (``dma_idxd``). See `Guest Memory on PCI`_.
+   * - Receive timestamps.
+     - The host clock, once per burst.
+     - ``af_packet``, from the kernel.
+     - ConnectX-6 and ConnectX-7, E810.
+   * - Transmit timestamps.
+     - The host clock.
+     - None.
+     - IEEE 1588 timesync only.
+   * - IPv4 header checksum.
+     - Computed in software.
+     - ``net_tap``. The PMD computes it in software.
+     - All.
+
+UET sends a zero UDP checksum, and receivers ignore it (UEC 1.0.1,
+3.5.10.1). So there is no UDP checksum to offload. The PDS does not
+use the timestamps yet. The stats count them, and each received
+frame carries one: ``ts_ns`` and ``hw_ts`` in ``struct
+uet_wire_dpdk_frame``. Congestion control can take them from there.
+
+Guest Memory on PCI
+^^^^^^^^^^^^^^^^^^^
+
+A port or a dmadev on PCI reaches memory through the IOMMU. The EAL
+maps its own memory in the VFIO container. The server maps guest
+memory from vfio-user, and the IOMMU does not know about it.
+Zero-copy transmit and dmadev placement use guest memory directly,
+so the backend maps it for the device.
+
+The server gives each vfio-user DMA region to the backend when
+vfio-user adds it, and again before vfio-user removes it. For each
+device on a bus, the backend does these steps:
+
+1. It registers the region with ``rte_extmem_register()``.
+2. It maps the region with ``rte_dev_dma_map()``. The IOVA is the
+   virtual address.
+3. At removal, it waits until the port gives back every frame
+   attached to guest memory. It flushes, calls
+   ``rte_eth_tx_done_cleanup()``, and after 100 ms stops and starts
+   the transmit queue.
+4. It unmaps and unregisters the region.
+
+A port and a dmadev on PCI share one VFIO container, so one mapping
+serves both. If a mapping fails, the payload in that region goes out
+copied, and placement into it is a ``memcpy()``. Read-only regions
+and regions beyond 32 also take the copy path. Virtual devices reach
+memory by its virtual address, and need no mapping. With
+``dpdk-map=on``, the backend maps for virtual devices too. On a
+vdev, ``rte_dev_dma_map()`` does nothing, so this runs the path
+without hardware.
+
+Each region gets a log line, and the stats at exit count the
+mappings, the copies and the waits:
+
+.. code-block:: console
+
+   rocm-ernic: UET wire: guest memory iova 0x100000000+0x180000000 \
+       at 0x7fb3a00c0000: DMA-mapped for the port and the dmadev
+   rocm-ernic: UET wire: guest memory iova 0xc0000+0xb000 \
+       at 0x7fb5ae3e3000: not mapped (read-only): payload in it is copied
+   rocm-ernic: UET wire guest mem: 11 regions DMA-mapped, 4 not \
+       (4 mapping failures); copied as not mapped: tx 0 frames, \
+       2080 placements; removals waited 0 times (0 timed out, \
+       0 queue restarts)
+
+The 2080 placements in that line come from the provider. It copies
+each received frame into a buffer of its own, from ``calloc()``, in
+``uet_pds_sec_rx_pkt()``. Then it places the payload from that
+buffer. A dmadev on a bus cannot reach the buffer, so the backend
+uses ``memcpy()``. The dmadev becomes useful when the provider
+places the payload from the frame in its mbuf.
+
+Two VMs on Virtual Devices
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``net_tap`` and ``af_packet`` need ``CAP_NET_ADMIN`` and
+``CAP_NET_RAW``. The launcher wrapper ``ci/uet-dpdk-launcher`` runs
+each instance as your user with these two capabilities, through
+``sudo -n setpriv``. It also puts each ``net_tap`` interface on the
+CI bridge.
+
+To run the checks with ``net_tap``:
+
+.. code-block:: bash
+
+   export CI_BUILD_DIR=$PWD/build-dpdk
+   export UET_PROV_DIR=/path/to/uet-ref-prov
+   export ERNIC_LAUNCHER=$PWD/ci/uet-dpdk-launcher
+   export ERNIC_UET='ip=192.168.200.10%i,mtu=9000,wire=dpdk,dpdk-dev=net_tap0;iface=ernic-dtap%i'
+   bash ci/jobs/vm-up.sh && bash ci/jobs/vm-functional.sh
+   UET_HOST_PROV_DIR=/path/to/uet-ref-prov/prov \
+   UET_CHECKS="rma prov interop" bash ci/jobs/vm-uet.sh
+
+To run them with ``af_packet``, make a veth pair for each engine
+first, and put one end on the bridge:
+
+.. code-block:: bash
+
+   for i in 1 2; do
+       sudo ip link add ernic-dp$i type veth peer name ernic-dp${i}b
+       sudo ip link set ernic-dp$i mtu 9000 up
+       sudo ip link set ernic-dp${i}b mtu 9000 master ernic-ci-br0 up
+   done
+   export ERNIC_UET='ip=192.168.200.10%i,mtu=9000,wire=dpdk,dpdk-dev=net_af_packet0;iface=ernic-dp%i;framesz=10240;blocksz=40960;framecnt=1024'
+
+``framesz=10240`` holds a 9000-byte MTU and the TPACKET header. Add
+``dpdk-dma=dma_skeleton`` to place payload with the skeleton dmadev.
+Add ``dpdk-map=on`` to map guest memory as for PCI.
+
+The checks passed on each wire, one after the other on a quiet host
+(1-minute load in brackets). Rates are MiB/s for 4 MiB at MTU 9000
+over UDP, from VM 1 to VM 2 and back, as in `Packet Size and
+Encapsulation`_. Each write took 512 requests.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 13 13 13 12 12 12
+
+   * - Wire
+     - ``uet_ernic_rma`` RUDI
+     - ``uet_ernic_rma`` RUD
+     - ``test_rma`` RUDI
+     - ``test_rma`` RUD
+     - host to guest
+     - guest to host
+   * - TAP [4]
+     - 814, 979
+     - 1039, 1013
+     - 659, 484
+     - 790
+     - 557, 511
+     - 1013, 878
+   * - ``net_tap`` [2]
+     - 789, 761
+     - 777, 918
+     - 595, 777
+     - 377
+     - 1002, 901
+     - 970, 897
+   * - ``af_packet`` [2]
+     - 860, 1074
+     - 851, 874
+     - 671, 623
+     - 661
+     - 581, 546
+     - 948, 838
+   * - ``af_packet``, ``dpdk-map=on`` [4]
+     - 849, 989
+     - 956, 929
+     - 675, 646
+     - 623
+     - 552, 531
+     - 911, 810
+
+The virtual PMDs copy each frame in software and make a system call
+per frame or per burst, as the TAP does. So they run at about the
+TAP's rate. They run the DPDK paths, but they do not make them
+faster. The ``net_tap`` ``test_rma`` RUD write retransmitted 32
+requests, and that is its lower rate.
+
+An Intel E810
+^^^^^^^^^^^^^
+
+These steps run one engine on each port of an E810, with a cable
+between the two ports. Both ports go to ``vfio-pci``, so the host has
+no netdev on that wire. So run the ``rma`` and ``prov`` checks only.
+The commands use ``0000:c1:00.0`` and ``0000:c1:00.1``. Use the
+addresses that ``dpdk-devbind.py -s`` shows.
+
+1. Make sure that the IOMMU is on. The command must show groups.
+
+   .. code-block:: bash
+
+      ls /sys/kernel/iommu_groups
+
+2. Make sure that each port is in its own IOMMU group. Two engines
+   cannot share a group.
+
+   .. code-block:: bash
+
+      for d in 0000:c1:00.0 0000:c1:00.1; do
+          basename "$(readlink /sys/bus/pci/devices/$d/iommu_group)"
+      done
+
+3. Give DPDK the DDP package, uncompressed. DPDK 24.11 reads
+   ``ice.pkg``, and Fedora installs only ``ice.pkg.xz``. Without
+   the package, the port does not start. With the devarg
+   ``safe-mode-support=1``, it starts in Safe Mode, without RSS and
+   without flow rules.
+
+   .. code-block:: bash
+
+      sudo mkdir -p /lib/firmware/updates/intel/ice/ddp
+      xz -dc /lib/firmware/intel/ice/ddp/ice.pkg.xz |
+          sudo tee /lib/firmware/updates/intel/ice/ddp/ice.pkg >/dev/null
+
+4. Bind both ports to ``vfio-pci``, and give their group nodes to
+   your user.
+
+   .. code-block:: bash
+
+      sudo modprobe vfio-pci
+      sudo dpdk-devbind.py -b vfio-pci 0000:c1:00.0 0000:c1:00.1
+      for d in 0000:c1:00.0 0000:c1:00.1; do
+          g=$(basename "$(readlink /sys/bus/pci/devices/$d/iommu_group)")
+          sudo chown "$USER" "/dev/vfio/$g"
+      done
+
+5. Reserve hugepages. An engine uses about 100 MiB of them, so
+   1 GiB is enough for two.
+
+   .. code-block:: bash
+
+      sudo dpdk-hugepages.py -p 2M --setup 1G
+
+6. Start the VMs with one engine on each port, and run the checks.
+   In ``ERNIC_UET``, ``%j`` is the instance id less one.
+
+   .. code-block:: bash
+
+      export CI_BUILD_DIR=$PWD/build-dpdk
+      export UET_PROV_DIR=/path/to/uet-ref-prov
+      export ERNIC_LAUNCHER=$PWD/ci/uet-dpdk-launcher
+      export ERNIC_UET='ip=192.168.200.10%i,mtu=9000,wire=dpdk,dpdk-dev=0000:c1:00.%j'
+      bash ci/jobs/vm-up.sh && bash ci/jobs/vm-functional.sh
+      UET_CHECKS="rma prov" bash ci/jobs/vm-uet.sh
+
+7. Make sure that the startup line shows ``(pci)``, ``flow hw``,
+   ``tx extbuf zero-copy`` and ``guest mem dma-mapped``. Make sure
+   that each region line shows ``DMA-mapped``, except the
+   read-only ones. At exit, the stats line must count no transmit
+   frames copied as not mapped.
+
+   .. code-block:: bash
+
+      grep 'UET wire' /var/tmp/ernic-ci-work/log/1.log
+
+The wrapper raises ``RLIMIT_MEMLOCK`` to unlimited for a port on
+PCI, because VFIO pins the hugepages and each guest region. To see
+the DDP package that ice loaded, add
+``dpdk-eal=--log-level=pmd.net.ice.init:info`` to ``ERNIC_UET``,
+and look for ``Active package is`` in the log.
+
+To give the ports back to the kernel and free the hugepages:
+
+.. code-block:: bash
+
+   bash ci/jobs/vm-down.sh
+   sudo dpdk-devbind.py -b ice 0000:c1:00.0 0000:c1:00.1
+   sudo dpdk-hugepages.py --clear
+
 Known Limits and Findings
 -------------------------
 
@@ -967,6 +1348,24 @@ Known Limits and Findings
 - ``fi_close()`` on that provider cannot discard writes already
   in the device (see the guest library's differences). A late
   write cut off by closing the endpoint can still land.
+- The DPDK wire ran on virtual devices only: ``net_tap``,
+  ``af_packet``, ``memif``, ``ring`` and ``dma_skeleton``. None of
+  them does DMA. So the guest memory mapping ran with test hooks,
+  and with ``rte_dev_dma_map()`` as a no-op. RSS through a flow
+  rule, buffer split and transmit timestamps did not run.
+- ``net_memif`` in DPDK 24.11 crashes when a memif buffer is larger
+  than an mbuf, and when a peer disconnects while the other side
+  polls. ``uet-dpdk-unit`` uses 8 KiB buffers, and its memif server
+  closes first.
+- The provider copies each received frame before it reads it:
+  ``calloc()`` of the largest packet, which clears it, then a copy
+  (``uet_pds_sec_rx_pkt()``). That is two passes over each byte
+  before the placement copy. It also keeps a dmadev on a bus out of
+  the placement.
+- After a VM quits, its instance does not exit within the 2 s that
+  the launcher gives it after ``SIGTERM``, and the launcher kills
+  it. Phase 3 shows the same. The stats lines at exit can then be
+  missing from the log.
 
 Next Phases
 -----------
