@@ -369,6 +369,28 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
         }
         for (size_t i = 0; i <= n; i++)
             dst[i] = val[i] == ';' ? sub : val[i];
+    } else if (strcmp(key, "dpdk-map") == 0) {
+        if (strcmp(val, "auto") == 0) {
+            cfg->dpdk_map = UET_ENGINE_DPDK_MAP_AUTO;
+        } else if (strcmp(val, "on") == 0) {
+            cfg->dpdk_map = UET_ENGINE_DPDK_MAP_ON;
+        } else if (strcmp(val, "off") == 0) {
+            cfg->dpdk_map = UET_ENGINE_DPDK_MAP_OFF;
+        } else {
+            set_err(err, errlen, "dpdk-map must be auto, on or off (got '%s')",
+                    val);
+            return false;
+        }
+    } else if (strcmp(key, "dpdk-split") == 0) {
+        if (strcmp(val, "on") == 0) {
+            cfg->dpdk_split = true;
+        } else if (strcmp(val, "off") == 0) {
+            cfg->dpdk_split = false;
+        } else {
+            set_err(err, errlen, "dpdk-split must be on or off (got '%s')",
+                    val);
+            return false;
+        }
     } else if (strcmp(key, "dpdk-queues") == 0) {
         if (!parse_u32_range(val, 1, 16, &v)) {
             set_err(err, errlen, "dpdk-queues must be 1..16 (got '%s')", val);

@@ -288,8 +288,16 @@ static int device_reset_cb(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
     return 0;
 }
 
+#ifdef ERNIC_HAVE_UET_DPDK
+static struct uet_wire_dpdk *g_uet_dpdk;
+#endif
+
 /**
  * DMA region registration callback
+ *
+ * With the UET engine on a DPDK port, the region is also DMA-mapped for
+ * the port and the dmadev where they need it (uet_wire_dpdk.h, "Guest
+ * memory"); what came of that goes to the log.
  */
 static void dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
@@ -297,16 +305,41 @@ static void dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
             "DMA region registered: iova=%p len=%zu vaddr=%p prot=%#x",
             info->iova.iov_base, info->iova.iov_len, info->vaddr, info->prot);
 
-    /* DMA regions are now available for mapping guest memory */
+#ifdef ERNIC_HAVE_UET_DPDK
+    if (g_uet_dpdk && info->vaddr) {
+        char why[192] = "";
+
+        (void)uet_wire_dpdk_region_add(
+            g_uet_dpdk, info->mapping.iov_base, info->mapping.iov_len,
+            info->page_size, (info->prot & PROT_WRITE) != 0, why, sizeof(why));
+        ernic_startup_report("rocm-ernic: UET wire: guest memory iova %p+%#zx "
+                             "at %p: %s",
+                             info->iova.iov_base, info->iova.iov_len,
+                             info->mapping.iov_base, why);
+    }
+#endif
 }
 
 /**
  * DMA region unregistration callback
+ *
+ * libvfio-user unmaps the region when this returns, so the DPDK port must
+ * have given back every frame attached to guest memory by then.
  */
 static void dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     vfu_log(vfu_ctx, LOG_DEBUG, "DMA region unregistered: iova=%p len=%zu",
             info->iova.iov_base, info->iova.iov_len);
+
+#ifdef ERNIC_HAVE_UET_DPDK
+    if (g_uet_dpdk && info->vaddr &&
+        !uet_wire_dpdk_region_remove(g_uet_dpdk, info->mapping.iov_base,
+                                     info->mapping.iov_len))
+        ernic_startup_report("rocm-ernic: UET wire: the port still held "
+                             "frames of guest memory iova %p+%#zx when it "
+                             "went",
+                             info->iova.iov_base, info->iova.iov_len);
+#endif
 }
 
 
@@ -684,8 +717,6 @@ static bool uet_wire_rx_filter(void *ctx, const void *frame, size_t len)
  * whole wire, and what is not UET goes to the guest.
  * ---------------------------------------------------------------------------
  */
-static struct uet_wire_dpdk *g_uet_dpdk;
-
 static int uet_dpdk_tx(void *ctx, const void *frame, size_t len)
 {
     return uet_wire_dpdk_tx(ctx, frame, len);
@@ -738,6 +769,10 @@ static int uet_dpdk_open(rocm_ernic_dev_t *dev, struct uet_engine_cfg *c,
     dc.udp_port = c->udp_port;
     dc.ipproto = c->ipproto;
     uet_engine_cfg_mac(c, dc.mac);
+    dc.map = c->dpdk_map == UET_ENGINE_DPDK_MAP_ON    ? UET_WIRE_DPDK_MAP_ON
+             : c->dpdk_map == UET_ENGINE_DPDK_MAP_OFF ? UET_WIRE_DPDK_MAP_OFF
+                                                      : UET_WIRE_DPDK_MAP_AUTO;
+    dc.rx_split = c->dpdk_split;
 
     g_uet_dpdk = uet_wire_dpdk_open(&dc, err, sizeof(err));
     if (!g_uet_dpdk) {
@@ -781,6 +816,15 @@ static void uet_dpdk_close(rocm_ernic_dev_t *dev)
                          st.rx_ts_hw, st.tx_frames, st.tx_extbuf_frames,
                          st.tx_copied_frames, st.tx_dropped, st.dma_copies,
                          st.dma_bytes, st.dma_fallbacks);
+    ernic_startup_report(
+        "rocm-ernic: UET wire guest mem: %" PRIu64
+        " regions DMA-mapped, %" PRIu64 " not (%" PRIu64
+        " mapping failures); copied as not mapped: tx %" PRIu64
+        " frames, %" PRIu64 " placements; removals waited %" PRIu64
+        " times (%" PRIu64 " timed out, %" PRIu64 " queue restarts)",
+        st.regions_mapped, st.regions_unmapped, st.map_failures,
+        st.tx_copied_unmapped, st.dma_unmapped, st.drain_waits,
+        st.drain_timeouts, st.tx_queue_restarts);
     ionic_eth_emu_set_wire_tx(dev->ionic_emu, NULL, NULL);
     uet_wire_dpdk_close(g_uet_dpdk);
     g_uet_dpdk = NULL;
@@ -977,7 +1021,11 @@ static void usage(const char *progname)
     fprintf(stderr, "                       sec=none|direct|cluster, ssi, rto, "
                     "retries, mtu,\n");
     fprintf(stderr, "                       payload, encap=udp|ip, port, "
-                    "proto)\n");
+                    "proto, wire=tap|dpdk,\n");
+    fprintf(stderr, "                       dpdk-dev, dpdk-dma, dpdk-eal, "
+                    "dpdk-queues,\n");
+    fprintf(stderr, "                       dpdk-map=auto|on|off, "
+                    "dpdk-split=on|off)\n");
 #ifndef ERNIC_HAVE_UET
     fprintf(stderr, "                       (not in this build: configure with "
                     "-DERNIC_UET=ON)\n");
@@ -1503,7 +1551,9 @@ int main(int argc, char *argv[])
                             "[,index=N][,pds=pds|sng]"
                             "[,sec=none|direct|cluster][,ssi=N][,mtu=N]"
                             "[,payload=N][,encap=udp|ip][,port=N]"
-                            "[,proto=N]\n");
+                            "[,proto=N][,wire=tap|dpdk][,dpdk-dev=DEVARGS]"
+                            "[,dpdk-dma=DEV][,dpdk-eal=ARGS][,dpdk-queues=N]"
+                            "[,dpdk-map=auto|on|off][,dpdk-split=on|off]\n");
             ok_to_start = false;
         }
 #else

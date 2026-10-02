@@ -563,6 +563,21 @@ if(ERNIC_UET)
         )
         target_compile_definitions(test_uet_dpdk PRIVATE _GNU_SOURCE)
         ernic_uet_link(test_uet_dpdk)
+
+        # Guest memory DMA mapping in the DPDK wire, on net_ring loopback
+        # ports: one process, no engine.
+        add_executable(test_uet_dpdk_map
+            test_uet_dpdk_map.c
+            ${CMAKE_SOURCE_DIR}/src/uet_wire_dpdk.c
+        )
+        target_include_directories(test_uet_dpdk_map PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+        )
+        target_include_directories(test_uet_dpdk_map SYSTEM PRIVATE
+            ${DPDK_INCLUDE_DIRS})
+        target_compile_definitions(test_uet_dpdk_map PRIVATE _GNU_SOURCE)
+        target_link_libraries(test_uet_dpdk_map PRIVATE PkgConfig::DPDK
+            pthread)
     endif()
 
     # The command channel end to end: it #includes ionic_datapath.c, as
@@ -671,7 +686,7 @@ if(ERNIC_UET)
     list(APPEND ERNIC_TEST_TARGETS
         test_uet_engine test_uet_datapath uet_fake_device)
     if(ERNIC_UET_DPDK)
-        list(APPEND ERNIC_TEST_TARGETS test_uet_dpdk)
+        list(APPEND ERNIC_TEST_TARGETS test_uet_dpdk test_uet_dpdk_map)
     endif()
     if(LIBFABRIC_FOUND)
         list(APPEND ERNIC_TEST_TARGETS test_libuet_ernic)
@@ -945,6 +960,13 @@ if(ERNIC_UET)
             COMMAND $<TARGET_FILE:test_uet_dpdk>
         )
         set_tests_properties(uet-dpdk-unit PROPERTIES TIMEOUT 900)
+        # Guest memory: mapped per region, copies where it is not, and
+        # removal after the port gave back what it held.
+        add_test(
+            NAME uet-dpdk-map-unit
+            COMMAND $<TARGET_FILE:test_uet_dpdk_map>
+        )
+        set_tests_properties(uet-dpdk-map-unit PROPERTIES TIMEOUT 120)
     endif()
 
     # UET engine, phase 2: the guest command channel through ionic rings,

@@ -37,9 +37,11 @@ ERNIC_VERBOSE="${ERNIC_VERBOSE:-false}"
 ERNIC_LOG_LEVEL="${ERNIC_LOG_LEVEL:-warn}"
 ERNIC_TAP_PREFIX="${ERNIC_TAP_PREFIX:-ernic-tap}"
 # Run a UET engine in every instance (--uet).  The value is the --uet
-# argument with %i replaced by the instance id, so one setting gives each
-# engine its own address, e.g. ERNIC_UET='ip=192.168.200.10%i'.  Needs a
-# rocm-ernic built with -DERNIC_UET=ON.
+# argument with %i replaced by the instance id and %j by the id less one,
+# so one setting gives each engine its own address and its own port, e.g.
+# ERNIC_UET='ip=192.168.200.10%i' or, for the two ports of one NIC,
+# ERNIC_UET='ip=192.168.200.10%i,wire=dpdk,dpdk-dev=0000:c1:00.%j'.
+# Needs a rocm-ernic built with -DERNIC_UET=ON.
 ERNIC_UET="${ERNIC_UET:-}"
 
 MANIFEST="${ERNIC_RUN_DIR}/instances.json"
@@ -202,7 +204,8 @@ start_instance() {
             "instance ${id} starts without Ethernet"
     fi
     if [ -n "${ERNIC_UET}" ]; then
-        mode_args+=(--uet "${ERNIC_UET//%i/${id}}")
+        local uet="${ERNIC_UET//%i/${id}}"
+        mode_args+=(--uet "${uet//%j/$((id - 1))}")
     fi
 
     ${ERNIC_BIN} \

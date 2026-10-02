@@ -24,6 +24,11 @@
 # bridge before the start.  The guest's own TAP stays the guest's
 # Ethernet.
 #
+# A port on PCI (dpdk-dev=0000:c1:00.0, bound to vfio-pci) has VFIO pin
+# the EAL's hugepages and each guest DMA region, which counts against
+# RLIMIT_MEMLOCK: for such a port the instances run with it unlimited.
+# The group node (/dev/vfio/N) must be the user's; see docs/uet.rst.
+#
 # Everything else, --stop included, goes straight to the launcher.
 
 set -euo pipefail
@@ -41,8 +46,17 @@ while IFS= read -r -d '' kv; do
     envs+=("${kv}")
 done < <(env -0 | grep -zE '^(ERNIC_|CI_|PATH=|HOME=|USER=|LOGNAME=|XDG_RUNTIME_DIR=)' || true)
 
-sudo -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-    --inh-caps=+net_admin,+net_raw --ambient-caps=+net_admin,+net_raw -- \
+# A dpdk-dev= that is not a vdev (net_..., eth_...) is a bus address.
+memlock=()
+port="$(sed -n 's/\(^\|.*,\)dpdk-dev=\([^,]*\).*/\2/p' <<<"${ERNIC_UET:-}")"
+case "${port}" in
+"" | net_* | eth_*) ;;
+*) memlock=(prlimit --memlock=unlimited:unlimited --) ;;
+esac
+
+sudo -n "${memlock[@]}" setpriv --reuid="$(id -u)" --regid="$(id -g)" \
+    --init-groups --inh-caps=+net_admin,+net_raw \
+    --ambient-caps=+net_admin,+net_raw -- \
     env -i "${envs[@]}" "${launcher}" "$@"
 
 case " $* " in
@@ -51,6 +65,7 @@ esac
 
 iface_of() {
     local spec="${ERNIC_UET//%i/$1}"
+    spec="${spec//%j/$(($1 - 1))}"
     sed -n 's/.*\bdpdk-dev=net_tap[^,]*;iface=\([A-Za-z0-9_.-]*\).*/\1/p' \
         <<<"${spec}"
 }

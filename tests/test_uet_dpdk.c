@@ -16,7 +16,13 @@
  * claims: RUDI payloads attached to mbufs as external buffers (memif takes
  * multi-segment frames), received frames kept in their mbufs until the
  * provider read them, and with "dma" the payload placed by the skeleton
- * dmadev.
+ * dmadev.  The "map" case runs with map=on, its memory registered as a
+ * guest region the way the server does for vfio-user (uet_wire_dpdk.h,
+ * "Guest memory"): payload still goes out attached, from the mapped
+ * region, but no placement uses the dmadev, because the reference
+ * provider copies each received frame into a calloc()ed buffer of its own
+ * (uet_pds_sec_rx_pkt()) before it places the payload, and a dmadev on a
+ * bus cannot reach that buffer.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -60,19 +66,23 @@ struct test_case {
      * own and the target waits for every copy, so on a busy host a whole
      * RUDI message (512 packets, no window) takes longer than 50 ms. */
     uint32_t rto_ms;
+    bool map; /* map=on, the memory added as a guest region */
 };
 
 static const struct test_case cases[] = {
     {"rudi-jumbo", "RUDI at mtu 9000 over UDP", true, 9000,
-     UET_ENGINE_ENCAP_UDP, false, 1, 50},
+     UET_ENGINE_ENCAP_UDP, false, 1, 50, false},
     {"rud-jumbo", "RUD at mtu 9000 over UDP", false, 9000, UET_ENGINE_ENCAP_UDP,
-     false, 1, 50},
+     false, 1, 50, false},
     {"rudi-jumbo-dma", "RUDI at mtu 9000, placed by dma_skeleton", true, 9000,
-     UET_ENGINE_ENCAP_UDP, true, 1, 2000},
+     UET_ENGINE_ENCAP_UDP, true, 1, 2000, false},
+    {"rudi-jumbo-dma-map",
+     "RUDI at mtu 9000, dma_skeleton, guest memory DMA-mapped", true, 9000,
+     UET_ENGINE_ENCAP_UDP, true, 1, 2000, true},
     {"rudi-1500-ip", "RUDI at mtu 1500 over IP protocol 253", true, 1500,
-     UET_ENGINE_ENCAP_IP, false, 1, 50},
+     UET_ENGINE_ENCAP_IP, false, 1, 50, false},
     {"rud-1500", "RUD at mtu 1500 over UDP", false, 1500, UET_ENGINE_ENCAP_UDP,
-     false, 1, 50},
+     false, 1, 50, false},
 };
 
 static size_t xfer_len = LEN_DEFAULT;
@@ -214,6 +224,7 @@ static bool node_start(struct node *n, uint32_t ip, const char *sock,
     dc.udp_port = cfg.udp_port;
     dc.ipproto = cfg.ipproto;
     uet_engine_cfg_mac(&cfg, dc.mac);
+    dc.map = n->tc->map ? UET_WIRE_DPDK_MAP_ON : UET_WIRE_DPDK_MAP_AUTO;
     n->w = uet_wire_dpdk_open(&dc, err, sizeof(err));
     if (n->w == NULL) {
         fail(rep, "uet_wire_dpdk_open: %s", err);
@@ -221,6 +232,15 @@ static bool node_start(struct node *n, uint32_t ip, const char *sock,
     }
     g_w = n->w;
     uet_wire_dpdk_describe(n->w, rep->wire, sizeof(rep->wire));
+    if (n->tc->map) {
+        /* What the server does when vfio-user adds a guest region. */
+        int rc = uet_wire_dpdk_region_add(n->w, n->mem, xfer_len, PAGE, true,
+                                          err, sizeof(err));
+        if (rc != 1) {
+            fail(rep, "region_add: %d %s", rc, err);
+            return false;
+        }
+    }
 
     /* The memif server's socket exists now: let the client connect. */
     if (server) {
@@ -269,6 +289,10 @@ static void node_finish(struct node *n, struct report *rep)
         n->e = NULL;
     }
     if (n->w != NULL) {
+        /* ... and when it removes it. */
+        if (n->tc->map && n->mem != NULL &&
+            !uet_wire_dpdk_region_remove(n->w, n->mem, xfer_len))
+            fail(rep, "the port still held guest memory at removal");
         uet_wire_dpdk_get_stats(n->w, &rep->ws);
         uet_wire_dpdk_close(n->w);
         n->w = NULL;
@@ -587,9 +611,26 @@ static bool run_case(const struct test_case *tc)
         printf("  FAIL: received frames were copied out of their mbufs\n");
         ok = false;
     }
-    if (tc->dma && tgt.ws.dma_copies == 0) {
+    if (tc->dma && !tc->map && tgt.ws.dma_copies == 0) {
         printf("  FAIL: the dmadev placed nothing\n");
         ok = false;
+    }
+    if (tc->map) {
+        printf("  guest mem: initiator %" PRIu64 " mapped, %" PRIu64
+               " tx copied as not mapped; target %" PRIu64 " mapped, %" PRIu64
+               " placements by memcpy() as not mapped\n",
+               ini.ws.regions_mapped, ini.ws.tx_copied_unmapped,
+               tgt.ws.regions_mapped, tgt.ws.dma_unmapped);
+        if (ini.ws.regions_mapped != 1 || tgt.ws.regions_mapped != 1 ||
+            ini.ws.tx_copied_unmapped != 0 || ini.ws.tx_extbuf_frames == 0) {
+            printf("  FAIL: mapped guest memory was not used as mapped\n");
+            ok = false;
+        }
+        if (tgt.ws.dma_copies != 0 || tgt.ws.dma_unmapped == 0) {
+            printf("  FAIL: the dmadev placed from memory not mapped for "
+                   "it\n");
+            ok = false;
+        }
     }
     if (ini.ws.tx_dropped != 0 || tgt.ws.tx_dropped != 0) {
         printf("  FAIL: the port dropped frames\n");

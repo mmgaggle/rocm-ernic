@@ -21,16 +21,39 @@
  *    mbufs whose payload segments are external buffers in guest memory, so
  *    nothing copies the payload before the port does.  Fallback: one mbuf,
  *    copied.
- *  - Receive buffer split, headers and payload in separate buffers.
+ *  - Receive buffer split, headers and payload in separate buffers, when
+ *    asked for (rx_split): after the UDP header where the port splits by
+ *    protocol, after 256 bytes where it splits by length.  The engine
+ *    takes a frame in one piece, so a split frame is gathered (copied)
+ *    first: this is the hook for an engine that takes them in two.
  *    Fallback: one buffer per frame.
  *  - Placement of received payload in guest memory by a dmadev
- *    (uet_wire_dpdk_dma_copy()).  Fallback: memcpy().
+ *    (uet_wire_dpdk_dma_copy()).  Fallback: memcpy().  A dmadev on a bus
+ *    copies only from memory it can reach (the EAL's, or a mapped guest
+ *    region); the reference provider copies each received frame into a
+ *    buffer of its own (uet_pds_sec_rx_pkt()) before it places the
+ *    payload, so with such a dmadev every placement is a memcpy() until
+ *    the provider places from the frame where it lies.
  *  - Receive and transmit timestamps from the port's clock.  Fallback: the
  *    host's clock, read once per burst.
  *  - IPv4 header checksums, filled in on transmit and checked on receive.
  *    Fallback: computed in software.  UET sends a zero UDP checksum and
  *    receivers ignore it (UEC 1.0.1, 3.5.10.1), so there is no UDP
  *    checksum to offload.
+ *
+ * Guest memory.  A port or a dmadev on a bus (PCI) reaches memory through
+ * the IOMMU, by IOVA.  The EAL maps its own memory there, but not the
+ * guest's, which the server maps in from vfio-user.  So the server passes
+ * each guest DMA region to uet_wire_dpdk_region_add() when vfio-user adds
+ * it, and to uet_wire_dpdk_region_remove() before it goes.  For each
+ * device that needs it, the backend registers the region with
+ * rte_extmem_register() and maps it with rte_dev_dma_map(), IOVA = virtual
+ * address; on removal it first waits until the port holds no frame that
+ * refers to guest memory, then unmaps and unregisters.  Payload in memory
+ * that is not mapped for the port goes out copied; payload placed in
+ * memory that is not mapped for the dmadev is copied with memcpy().
+ * Virtual devices reach memory by its virtual address and need none of
+ * this (rte_dev_dma_map() is a no-op for them).
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -44,14 +67,22 @@
 #include <stdint.h>
 #include <sys/uio.h>
 
+/* Whether guest memory is DMA-mapped for the port and the dmadev. */
+enum uet_wire_dpdk_map {
+    UET_WIRE_DPDK_MAP_AUTO = 0, /* for devices on a bus, not for vdevs */
+    UET_WIRE_DPDK_MAP_ON,       /* for every device: tests the path */
+    UET_WIRE_DPDK_MAP_OFF,      /* never: devices on a bus get copies */
+};
+
 struct uet_wire_dpdk_cfg {
     /* The port: a virtual device's devargs ("net_tap0,iface=uet0"), which
      * is probed as a vdev, or a bus address ("0000:c1:00.0"), which is
-     * allowed and probed (and then needs hugepages and a bound driver). */
+     * allowed and probed (and then needs hugepages and vfio-pci). */
     const char *dev;
-    /* More EAL arguments, separated by spaces, after the backend's own
-     * ("--no-huge -m 512 --no-shconf --no-telemetry", and "--no-pci" for a
-     * vdev).  NULL for none. */
+    /* More EAL arguments, separated by spaces, after the backend's own:
+     * "-l 0 --no-telemetry", then "--no-huge -m 512 --no-shconf --no-pci"
+     * when every device is virtual, else "--in-memory" (hugepages, no
+     * files, so two engines can run side by side).  NULL for none. */
     const char *eal;
     /* A dmadev to place received payload with: a vdev ("dma_skeleton") or
      * the name of a device the EAL probes ("0000:6a:01.0").  NULL: none. */
@@ -62,6 +93,9 @@ struct uet_wire_dpdk_cfg {
     uint16_t udp_port;
     uint8_t ipproto;
     uint8_t mac[6]; /* the engine's MAC */
+    enum uet_wire_dpdk_map map;
+    bool rx_split;     /* ask for receive buffer split */
+    uint32_t drain_ms; /* region removal waits this long; 0 means 100 */
 };
 
 struct uet_wire_dpdk;
@@ -147,6 +181,47 @@ int uet_wire_dpdk_dma_copy(void *ctx, void *dst, const void *src, size_t len);
  * installing. */
 bool uet_wire_dpdk_has_dma(const struct uet_wire_dpdk *w);
 
+/*
+ * A guest DMA region as vfio-user mapped it into this process: @va and
+ * @len, aligned to @page_size, @writable unless the guest mapped it
+ * read-only.  Returns 1 when it is now DMA-mapped for every device that
+ * needs it, 0 when no device needs it (virtual devices, map=off, IOVA as
+ * PA), and a negative errno when a mapping failed, in which case payload
+ * in it is copied (for the device whose mapping failed).  @why, if not
+ * NULL, says what happened, for the log.
+ */
+int uet_wire_dpdk_region_add(struct uet_wire_dpdk *w, void *va, size_t len,
+                             size_t page_size, bool writable, char *why,
+                             size_t whylen);
+
+/*
+ * The region at @va (@len bytes) is going away.  First every frame that
+ * refers to guest memory, in any region, is sent and given back by the
+ * port, waiting up to drain_ms; after that the frames still queued here
+ * are dropped and the transmit queue is stopped and started, which makes
+ * the port give back the rest.  Then the region is unmapped and
+ * unregistered.  Returns false when the port still held such frames after
+ * all that (unmapped anyway: the region is going).
+ */
+bool uet_wire_dpdk_region_remove(struct uet_wire_dpdk *w, void *va, size_t len);
+
+/* Frames attached to guest memory that the port, or the queue here, still
+ * holds. */
+unsigned uet_wire_dpdk_tx_inflight(const struct uet_wire_dpdk *w);
+
+/*
+ * For tests: the device-level map and unmap, in place of rte_dev_dma_map()
+ * and rte_dev_dma_unmap() (rte_extmem_register() still runs).  @dev is 0
+ * for the port and 1 for the dmadev.  Return 0 or a negative errno.
+ */
+struct uet_wire_dpdk_map_ops {
+    int (*map)(void *ctx, int dev, void *va, size_t len);
+    int (*unmap)(void *ctx, int dev, void *va, size_t len);
+    void *ctx;
+};
+void uet_wire_dpdk_set_map_ops(struct uet_wire_dpdk *w,
+                               const struct uet_wire_dpdk_map_ops *ops);
+
 struct uet_wire_dpdk_stats {
     uint64_t rx_frames;
     uint64_t rx_multiseg; /* gathered from more than one mbuf */
@@ -162,6 +237,15 @@ struct uet_wire_dpdk_stats {
     uint64_t dma_fallbacks; /* memcpy() after the dmadev failed */
     uint64_t last_rx_ts_ns;
     uint64_t last_tx_ts_ns;
+    /* guest memory */
+    uint64_t regions_mapped;     /* added and mapped for some device */
+    uint64_t regions_unmapped;   /* added, and mapped for none */
+    uint64_t map_failures;       /* regions with a mapping that failed */
+    uint64_t tx_copied_unmapped; /* copied: payload not mapped */
+    uint64_t dma_unmapped;       /* memcpy(): memory not mapped */
+    uint64_t drain_waits;        /* removals that waited for frames */
+    uint64_t drain_timeouts;     /* ... and still had some after */
+    uint64_t tx_queue_restarts;  /* ... and stopped the queue */
 };
 
 void uet_wire_dpdk_get_stats(const struct uet_wire_dpdk *w,

@@ -65,6 +65,12 @@ enum uet_engine_wire_kind {
     UET_ENGINE_WIRE_DPDK,    /* a DPDK port (uet_wire_dpdk.h) */
 };
 
+enum uet_engine_dpdk_map {
+    UET_ENGINE_DPDK_MAP_AUTO = 0,
+    UET_ENGINE_DPDK_MAP_ON,
+    UET_ENGINE_DPDK_MAP_OFF,
+};
+
 #define UET_ENGINE_DPDK_ARG_MAX 256u
 
 #define UET_ENGINE_UDP_PORT 4793u /* IANA, UEC 1.0.1 Table 3-28 */
@@ -100,6 +106,10 @@ struct uet_engine_cfg {
     char dpdk_eal[UET_ENGINE_DPDK_ARG_MAX]; /* more EAL arguments */
     char dpdk_dma[UET_ENGINE_DPDK_ARG_MAX]; /* dmadev, or "" */
     uint16_t dpdk_queues;                   /* queue pairs, 0: 1 */
+    /* Guest memory DMA-mapped for the port and the dmadev: for devices on
+     * a bus (auto), for every device (on), or never (off: copies). */
+    enum uet_engine_dpdk_map dpdk_map;
+    bool dpdk_split; /* receive buffer split, where the port has it */
     /*
      * How long a deregistered region's provider descriptor is kept, disabled
      * and unreachable, before it is closed and may be reused.  A partially
