@@ -37,16 +37,23 @@
  * the engine across all transfers.  RUD has the PDS's own window and goes
  * as one message.
  *
- * What overflows is a queue of frames (a TAP's is 1000), and what the
- * receiver has to work through before the retransmit timeout is mostly a
- * cost per packet, so both are counted in packets of the engine's Payload
- * MTU: 256 KiB and 512 KiB with 1 KiB payloads, 2 MiB and 4 MiB with
- * 8 KiB ones.
+ * Both are bounded twice.  What overflows is a queue of frames (a TAP's
+ * is 1000), so they are at most 256 and 512 packets of the engine's
+ * Payload MTU.  And the receiver has to work through a burst within the
+ * retransmit timeout (5 ms by default), so they are at most 512 KiB and
+ * 1 MiB.  With 1 KiB payloads that is 256 KiB and 512 KiB, as before;
+ * with 8 KiB payloads 64 and 128 packets.  In two VMs, 4 MiB RUDI writes
+ * with 8 KiB payloads and the packet bounds alone (2 MiB segments, a
+ * 4 MiB window) retransmitted 190 to 300 packets each; with the byte
+ * bounds none, and went faster.
  */
-#define SVC_RUDI_SEG_PKTS    256u /* packets per RUDI segment */
-#define SVC_RUDI_WINDOW_PKTS 512u /* RUDI packets in the engine, at most */
-#define SVC_MAX_SEGS         4u   /* segments of one transfer in flight */
-_Static_assert(SVC_RUDI_WINDOW_PKTS / SVC_RUDI_SEG_PKTS <= SVC_MAX_SEGS,
+#define SVC_RUDI_SEG_PKTS    256u           /* packets per RUDI segment */
+#define SVC_RUDI_WINDOW_PKTS 512u           /* RUDI packets in the engine */
+#define SVC_RUDI_SEG_MAX     (512u * 1024u) /* and bytes */
+#define SVC_RUDI_WINDOW_MAX  (1024u * 1024u)
+#define SVC_MAX_SEGS         4u /* segments of one transfer in flight */
+_Static_assert(SVC_RUDI_WINDOW_PKTS / SVC_RUDI_SEG_PKTS <= SVC_MAX_SEGS &&
+                   SVC_RUDI_WINDOW_MAX / SVC_RUDI_SEG_MAX <= SVC_MAX_SEGS,
                "a transfer can have the whole window in flight");
 
 /* A region the engine cannot address is refused rather than registered:
@@ -736,6 +743,10 @@ struct uet_svc *uet_svc_create(struct uet_engine *engine,
     uint64_t payload = id.payload != 0 ? id.payload : 1024u;
     s->rudi_seg = SVC_RUDI_SEG_PKTS * payload;
     s->rudi_window = SVC_RUDI_WINDOW_PKTS * payload;
+    if (s->rudi_seg > SVC_RUDI_SEG_MAX)
+        s->rudi_seg = SVC_RUDI_SEG_MAX;
+    if (s->rudi_window > SVC_RUDI_WINDOW_MAX)
+        s->rudi_window = SVC_RUDI_WINDOW_MAX;
     return s;
 }
 
