@@ -45,6 +45,9 @@ SKIP_TAPS=false
 CI_TAP_PREFIX="${CI_TAP_PREFIX:-ernic-ci-tap}"
 CI_TAP_BRIDGE="${CI_TAP_BRIDGE:-ernic-ci-br0}"
 CI_TAP_COUNT="${CI_TAP_COUNT:-${ERNIC_INSTANCES:-2}}"
+# 9000 gives the UET engines 8 KiB payloads; CI_TAP_MTU=1500 keeps the
+# standard MTU.  Must agree with ci/lib/common.sh.
+CI_TAP_MTU="${CI_TAP_MTU:-9000}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -159,8 +162,10 @@ setup_taps() {
             sudo ip tuntap add dev "${tap}" mode tap user "$(id -un)"
         fi
         sudo ip link set "${tap}" master "${CI_TAP_BRIDGE}"
-        sudo ip link set "${tap}" up
+        sudo ip link set "${tap}" mtu "${CI_TAP_MTU}" up
     done
+    # After the ports: a bridge cannot take an MTU above its ports'.
+    sudo ip link set "${CI_TAP_BRIDGE}" mtu "${CI_TAP_MTU}"
 }
 
 if [ "${SKIP_TAPS}" = "true" ]; then

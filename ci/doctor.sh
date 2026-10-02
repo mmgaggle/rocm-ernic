@@ -117,6 +117,19 @@ for i in $(seq 1 "${ERNIC_INSTANCES}"); do
     fi
 done
 
+# A UET engine sizes its packets to its TAP's MTU, and the bridge
+# drops frames bigger than the port they leave by.
+for dev in "${CI_TAP_BRIDGE}" $(seq -f "${CI_TAP_PREFIX}%g" 1 "${ERNIC_INSTANCES}"); do
+    [ -d "/sys/class/net/${dev}" ] || continue
+    mtu="$(cat "/sys/class/net/${dev}/mtu")"
+    if [ "${mtu}" = "${CI_TAP_MTU}" ]; then
+        ok "${dev} MTU ${mtu}"
+    else
+        warn "${dev} MTU ${mtu}, not CI_TAP_MTU=${CI_TAP_MTU} (UET payloads follow the TAP's MTU)"
+        echo "         fix: sudo ip link set ${dev} mtu ${CI_TAP_MTU}, or export CI_TAP_MTU=${mtu}"
+    fi
+done
+
 # The tools scripts/fetch-guest-image.sh needs.  vm-up.sh hard-requires
 # them now, so a missing one should surface here rather than as a failed
 # check three minutes into a job.

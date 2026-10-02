@@ -41,9 +41,13 @@
 #    "sudo -n setpriv"; with sec=, it runs the same TSS mode.
 # With UET_PCAP=1, or UET_PCAP=auto (the default) and
 # "sudo -n tcpdump" allowed, every transfer is captured on the
-# bridge (ip proto 253 or arp) and the capture must show the
-# expected PDS requests between the two engines, all wrapped
-# in TSS when ERNIC_UET has sec=.
+# bridge (UDP to the UET port, the UET IP protocol, and ARP) and
+# the capture must show the expected PDS requests between the two
+# engines, in the encapsulation ERNIC_UET asks for (encap=, UDP to
+# port 4793 by default), all wrapped in TSS when ERNIC_UET has
+# sec=, and otherwise requests that carry a full Payload MTU: the
+# largest of 1024, 2048, 4096 and 8192 that fits the TAPs' MTU
+# (CI_TAP_MTU, 9000 by default), or ERNIC_UET's payload=.
 #
 # Emits: $CI_RESULTS/vm-uet.jsonl, and logs and captures in
 # $CI_RESULTS/vm-uet/<label>/.
@@ -69,6 +73,29 @@ UET_HOST_IF="${UET_HOST_IF:-${CI_TAP_BRIDGE}}"
 UET_GUEST_DIR="${UET_GUEST_DIR:-phase3}" # under the guest user's home
 UET_SEC="$(sed -n 's/.*\bsec=\([a-z]*\).*/\1/p' <<<"${ERNIC_UET:-}")"
 UET_SEC="${UET_SEC:-none}"
+# How the engines put UET on the wire, from ERNIC_UET.
+uet_opt() { sed -n "s/.*\b$1=\([0-9a-z]*\).*/\1/p" <<<"${ERNIC_UET:-}"; }
+UET_ENCAP="$(uet_opt encap)"
+UET_ENCAP="${UET_ENCAP:-udp}"
+UET_UDP_PORT="$(uet_opt port)"
+UET_UDP_PORT="${UET_UDP_PORT:-4793}"
+UET_IPPROTO="$(uet_opt proto)"
+UET_IPPROTO="${UET_IPPROTO:-253}"
+UET_WIRE_MTU="$(uet_opt mtu)"
+UET_WIRE_MTU="${UET_WIRE_MTU:-$(cat "/sys/class/net/${CI_TAP_PREFIX}1/mtu" \
+    2>/dev/null || echo 1500)}"
+# The Payload MTU the engines run with (docs/uet.rst): payload=, else
+# the largest that leaves 160 bytes of headers within the MTU.
+UET_PAYLOAD="$(uet_opt payload)"
+if [ -z "${UET_PAYLOAD}" ]; then
+    UET_PAYLOAD=1024
+    for p in 8192 4096 2048; do
+        if [ $((p + 160)) -le "${UET_WIRE_MTU}" ]; then
+            UET_PAYLOAD="${p}"
+            break
+        fi
+    done
+fi
 UET_LABEL="${UET_LABEL:-sec-${UET_SEC}}"
 UET_SUITE="${UET_SUITE:-vm-uet}"
 OUT="${CI_RESULTS}/vm-uet/${UET_LABEL}"
@@ -112,7 +139,8 @@ pcap_start() {
     [ "${PCAP_ON}" = 1 ] || return 0
     rm -f "${f}" "${f}.log"
     sudo -n timeout -s INT 600 tcpdump -i "${CI_TAP_BRIDGE}" -U -n \
-        -w "${f}" 'ip proto 253 or arp' 2>"${f}.log" &
+        -w "${f}" "ip proto ${UET_IPPROTO} or udp port ${UET_UDP_PORT} or arp" \
+        2>"${f}.log" &
     for i in $(seq 50); do
         grep -q 'listening on' "${f}.log" 2>/dev/null && return 0
         sleep 0.2
@@ -133,23 +161,28 @@ pcap_stop() {
     done
     sudo -n chown "$(id -u):$(id -g)" "${f}" 2>/dev/null || true
     python3 "${PCAP_SUMMARY}" "${f}" ${2:+--probe "$2"} \
+        --udp-port "${UET_UDP_PORT}" --ipproto "${UET_IPPROTO}" \
         >"${f%.pcap}.summary" 2>&1 || true
     python3 "${PCAP_SUMMARY}" --json "${f}" ${2:+--probe "$2"} \
+        --udp-port "${UET_UDP_PORT}" --ipproto "${UET_IPPROTO}" \
         >"${f%.pcap}.json" 2>/dev/null || true
     cat "${f%.pcap}.summary"
 }
 
 # The capture of a transfer from engine $2 to engine $3 must
-# carry requests of kind $4 (RUDI_REQ or RUD_REQ) that way,
-# and with sec= every UET frame must start with TSS and the
-# payload probe must not be in the clear.
+# carry requests of kind $4 (RUDI_REQ or RUD_REQ) that way, all
+# in the configured encapsulation; with sec= every UET frame must
+# start with TSS and the payload probe must not be in the clear,
+# and without it the requests must carry full UET_PAYLOAD packets.
 pcap_verify() {
-    local f="$1" from="$2" to="$3" kind="$4"
+    local f="$1" from="$2" to="$3" kind="$4" encap=UDP
     [ "${PCAP_ON}" = 1 ] || return 0
+    [ "${UET_ENCAP}" = ip ] && encap=IP
     python3 - "${f%.pcap}.json" "$(engine_ip "${from}")" \
-        "$(engine_ip "${to}")" "${kind}" "${UET_SEC}" <<'PY'
+        "$(engine_ip "${to}")" "${kind}" "${UET_SEC}" "${encap}" \
+        "${UET_PAYLOAD}" <<'PY'
 import json, sys
-path, src, dst, kind, sec = sys.argv[1:6]
+path, src, dst, kind, sec, encap, payload = sys.argv[1:8]
 s = json.load(open(path))
 fl = s["flows"]
 fwd = fl.get(f"{src} -> {dst}", {})
@@ -160,11 +193,18 @@ if stray:
     print(f"UET frames between other addresses: {stray}"); ok = False
 if not fwd.get("frames") or not back.get("frames"):
     print(f"no UET frames both ways between {src} and {dst}"); ok = False
+for name, c in ((f"{src}->{dst}", fwd), (f"{dst}->{src}", back)):
+    if c.get(encap, 0) != c.get("frames", 0):
+        print(f"{name}: {c.get('frames')} frames, only {c.get(encap, 0)} "
+              f"in {encap}"); ok = False
 if sec == "none":
     if not fwd.get(kind):
         print(f"no {kind} from {src} to {dst}: {dict(fwd)}"); ok = False
     if not fwd.get("probe_in_clear"):
         print("the payload probe is not in the clear without TSS"); ok = False
+    if fwd.get("req_payload_max") != int(payload):
+        print(f"the largest request payload is {fwd.get('req_payload_max')}, "
+              f"not {payload}"); ok = False
 else:
     for name, c in ((f"{src}->{dst}", fwd), (f"{dst}->{src}", back)):
         if c.get("TSS", 0) != c.get("frames", 0):
@@ -329,6 +369,13 @@ host_run() {
     rto="$(sed -n 's/.*\brto=\([0-9]*\).*/\1/p' <<<"${ERNIC_UET:-}")"
     [ "${UET_SEC}" != none ] && sec_env+=("UET_SEC_MODE=${UET_SEC}")
     [ -n "${rto}" ] && sec_env+=("FI_UET_TX_TIMEOUT=${rto}")
+    # The engines' wire format; the Payload MTU follows the bridge's
+    # MTU, which is the TAPs'.
+    sec_env+=("UET_ENCAP=${UET_ENCAP}" "UET_UDP_PORT=${UET_UDP_PORT}"
+        "UET_IPPROTO=${UET_IPPROTO}")
+    if [ -n "$(uet_opt payload)" ]; then
+        sec_env+=("UET_MAX_PAYLOAD=${UET_PAYLOAD}")
+    fi
     sudo -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
         --inh-caps=+net_raw --ambient-caps=+net_raw -- \
         env FI_PROVIDER_PATH="${UET_HOST_PROV_DIR}" \
@@ -393,7 +440,9 @@ interop_guest_to_host() {
 
 log_info "label ${UET_LABEL}, sec ${UET_SEC}, ${UET_LEN} bytes," \
     "captures $([ "${PCAP_ON}" = 1 ] && echo on || echo off)," \
-    "engines $(engine_ip 1) and $(engine_ip 2)"
+    "engines $(engine_ip 1) and $(engine_ip 2)," \
+    "encap ${UET_ENCAP} (port ${UET_UDP_PORT}, proto ${UET_IPPROTO})," \
+    "MTU ${UET_WIRE_MTU}, payload ${UET_PAYLOAD}"
 
 group_start "Preflight"
 run_check "${UET_SUITE}" "instances-alive" require_instances_alive

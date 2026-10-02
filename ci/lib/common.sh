@@ -45,6 +45,10 @@ ERNIC_TCP_PORT="${ERNIC_TCP_PORT:-6420}"
 # reason the VM names are.
 CI_TAP_PREFIX="${CI_TAP_PREFIX:-ernic-ci-tap}"
 CI_TAP_BRIDGE="${CI_TAP_BRIDGE:-ernic-ci-br0}"
+# The MTU of the bridge and the TAPs.  9000 gives the UET engines
+# (which take their MTU from the TAP) 8 KiB payloads; 1500 keeps them
+# at 1 KiB.  The guests' own interfaces keep their MTU either way.
+CI_TAP_MTU="${CI_TAP_MTU:-9000}"
 # Prefer the checked-out copies over whatever is
 # installed system-wide: CI must test the tree it was
 # handed, and /usr/local is root-owned so a CI run can
@@ -430,15 +434,36 @@ require_taps() {
     if [ "${ok}" -ne 0 ]; then
         log_error "Create them once as root with:"
         log_error "  sudo ip link add ${CI_TAP_BRIDGE} type bridge"
-        log_error "  sudo ip link set ${CI_TAP_BRIDGE} up"
+        log_error "  sudo ip link set ${CI_TAP_BRIDGE} mtu ${CI_TAP_MTU} up"
         for i in $(seq 1 "${ERNIC_INSTANCES}"); do
             tap="${CI_TAP_PREFIX}${i}"
             log_error "  sudo ip tuntap add dev ${tap} mode tap user $(id -un)"
-            log_error "  sudo ip link set ${tap} master ${CI_TAP_BRIDGE} up"
+            log_error "  sudo ip link set ${tap} master ${CI_TAP_BRIDGE} mtu ${CI_TAP_MTU} up"
         done
         log_error "or re-run ci/runner/install-runner.sh."
+    else
+        check_tap_mtu
     fi
     return "${ok}"
+}
+
+# The bridge and the TAPs should all have CI_TAP_MTU: the bridge
+# drops a frame bigger than the port it leaves by, and a UET engine
+# sizes its packets to its TAP.  A mismatch is only a warning, since
+# everything but the UET payload size works at any MTU.
+check_tap_mtu() {
+    local dev mtu bad=0
+    for dev in "${CI_TAP_BRIDGE}" $(seq -f "${CI_TAP_PREFIX}%g" 1 \
+            "${ERNIC_INSTANCES}"); do
+        mtu="$(cat "/sys/class/net/${dev}/mtu" 2>/dev/null || echo '?')"
+        if [ "${mtu}" != "${CI_TAP_MTU}" ]; then
+            log_warn "${dev} has MTU ${mtu}, not CI_TAP_MTU=${CI_TAP_MTU}:" \
+                "sudo ip link set ${dev} mtu ${CI_TAP_MTU}," \
+                "or set CI_TAP_MTU=${mtu}"
+            bad=1
+        fi
+    done
+    return "${bad}"
 }
 
 require_kvm() {
