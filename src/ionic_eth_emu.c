@@ -488,6 +488,13 @@ void ionic_eth_emu_register_rx_filter(struct ionic_eth_emu *emu,
     emu->rx_filter_ctx = ctx;
 }
 
+int ionic_eth_emu_wire_mtu(const struct ionic_eth_emu *emu)
+{
+    if (!emu || !emu->net)
+        return -ENETDOWN;
+    return ionic_eth_net_mtu(emu->net);
+}
+
 int ionic_eth_emu_wire_send(struct ionic_eth_emu *emu, const void *frame,
                             size_t len)
 {

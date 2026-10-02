@@ -5,8 +5,8 @@
  * and transport security sublayers (SES, PDS and TSS) inside the server,
  * the way a real UET NIC runs them in firmware.  It has an IPv4 and MAC
  * address of its own on the emulated wire and speaks real UET frames
- * (Ethernet, IPv4 protocol 253, PDS and SES headers, and a TSS header
- * when security is on) to its peers.
+ * (Ethernet, IPv4, UDP to port 4793 or IP protocol 253, PDS and SES
+ * headers, and a TSS header when security is on) to its peers.
  *
  * The owner supplies two things: a wire to transmit frames on, and a way to
  * reach the memory that regions describe (guest memory, in the server).  It
@@ -50,6 +50,16 @@ enum uet_engine_sec {
     UET_ENGINE_SEC_CLUSTER,
 };
 
+/* How UET frames are put on the wire (UEC 1.0.1, 3.2.5).  Received frames
+ * are taken in either form, whichever this says. */
+enum uet_engine_encap {
+    UET_ENGINE_ENCAP_UDP = 0, /* UDP to udp_port, entropy in the source port */
+    UET_ENGINE_ENCAP_IP, /* IP protocol ipproto, behind an entropy header */
+};
+
+#define UET_ENGINE_UDP_PORT 4793u /* IANA, UEC 1.0.1 Table 3-28 */
+#define UET_ENGINE_IPPROTO  253u  /* experimental (RFC 3692) */
+
 struct uet_engine_cfg {
     uint32_t ip;             /* engine's IPv4 address, host order */
     uint8_t mac[6];          /* engine's MAC, see mac_set */
@@ -65,7 +75,13 @@ struct uet_engine_cfg {
     uint32_t max_retries; /* PDS retransmit limit, 0: provider's */
     uint32_t drop_thresh; /* test only: drop this many 1/100 % of PDS
                            * transmits (UET_PKT_DROP_THRESH), 0: none */
-    uint16_t mtu;         /* IP MTU of the wire */
+    uint16_t mtu;         /* IP MTU of the wire; 0: the wire's own, which
+                           * the owner fills in, else 1500 */
+    enum uet_engine_encap encap;
+    uint16_t udp_port; /* UDP destination port */
+    uint8_t ipproto;   /* IP protocol without UDP */
+    uint32_t payload;  /* Payload MTU (1024, 2048, 4096, 8192); 0: the
+                        * largest whose packets fit the MTU */
     /*
      * How long a deregistered region's provider descriptor is kept, disabled
      * and unreachable, before it is closed and may be reused.  A partially
@@ -117,9 +133,14 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
                                      char *err, size_t errlen);
 void uet_engine_destroy(struct uet_engine *e);
 
-/* The configuration the engine runs with, its MAC filled in. */
+/* The configuration the engine runs with: its MAC, MTU and Payload MTU
+ * filled in. */
 void uet_engine_identity(const struct uet_engine *e,
                          struct uet_engine_cfg *out);
+
+/* What the transport settled on, for the startup report: the identity's
+ * description plus the ACK coalescing that follows from the payload. */
+void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len);
 
 /*
  * Wire-side receive filter.  Returns true when the frame was the engine's

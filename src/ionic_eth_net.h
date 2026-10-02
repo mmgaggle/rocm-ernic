@@ -40,4 +40,7 @@ int ionic_eth_net_send(struct ionic_eth_net *net, const void *frame,
  */
 ssize_t ionic_eth_net_recv(struct ionic_eth_net *net, void *buf, size_t cap);
 
+/* The interface's MTU, or a negative errno. */
+int ionic_eth_net_mtu(const struct ionic_eth_net *net);
+
 #endif /* IONIC_ETH_NET_H */

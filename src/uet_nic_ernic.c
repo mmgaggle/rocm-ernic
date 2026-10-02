@@ -30,6 +30,8 @@
 #define ETHERTYPE_ARP_     0x0806u
 #define ETH_MIN_FRAME      60u /* without the FCS */
 #define IPV4_MIN_HLEN      20u
+#define UDP_HLEN           8u
+#define IPPROTO_UDP_       17u
 #define ARP_LEN            28u
 #define ARP_OP_REQUEST_    1u
 #define ARP_OP_REPLY_      2u
@@ -71,6 +73,8 @@ struct uet_nic_ernic {
     uint32_t ip;
     uint8_t mac[6];
     uint16_t mtu;
+    uint16_t udp_port;
+    uint8_t ipproto;
     char name[IFNAMSIZ];
     uet_nic_ernic_tx_fn tx;
     void *tx_ctx;
@@ -464,6 +468,8 @@ struct uet_nic_ernic *uet_nic_ernic_create(const struct uet_nic_ernic_cfg *cfg)
     n->ip = cfg->ip;
     memcpy(n->mac, cfg->mac, 6);
     n->mtu = cfg->mtu;
+    n->udp_port = cfg->udp_port != 0 ? cfg->udp_port : UET_NIC_ERNIC_UDP_PORT;
+    n->ipproto = cfg->ipproto != 0 ? cfg->ipproto : UET_NIC_ERNIC_IPPROTO;
     snprintf(n->name, sizeof(n->name), "%s",
              cfg->name != NULL ? cfg->name : "ernic-uet");
     n->tx = cfg->tx;
@@ -519,8 +525,19 @@ bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
     size_t ihl = (size_t)(ip[0] & 0x0fu) * 4u;
     if ((ip[0] >> 4) != 4 || ihl < IPV4_MIN_HLEN || len < ETH_HLEN_ + ihl)
         return false;
-    if (ip[9] != UET_NIC_ERNIC_IPPROTO || rd32(ip + 16) != n->ip)
+    if (rd32(ip + 16) != n->ip)
         return false;
+    /* UET over IP, or UET over UDP to the UET port.  Other UDP to the
+     * engine's address is not UET, and not the guest's either, but it is
+     * left alone like any other stray frame. */
+    bool udp = ip[9] == IPPROTO_UDP_;
+    if (udp) {
+        if (len < ETH_HLEN_ + ihl + UDP_HLEN ||
+            rd16(ip + ihl + 2) != n->udp_port)
+            return false;
+    } else if (ip[9] != n->ipproto) {
+        return false;
+    }
 
     /* Sent to the engine's address but not to its MAC: somebody else's
      * stale neighbor entry.  Not ours to take. */
@@ -535,8 +552,9 @@ bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
      * IP datagram is not handed on. */
     size_t tot_len = rd16(ip + 2);
     if (ihl != IPV4_MIN_HLEN || (rd16(ip + 6) & 0x3fffu) != 0 ||
-        tot_len < IPV4_MIN_HLEN || ETH_HLEN_ + tot_len > len ||
-        !ipv4_csum_ok(ip, ihl)) {
+        tot_len < IPV4_MIN_HLEN + (udp ? UDP_HLEN : 0u) ||
+        ETH_HLEN_ + tot_len > len || !ipv4_csum_ok(ip, ihl) ||
+        (udp && rd16(ip + ihl + 4) != tot_len - ihl)) {
         n->stats.rx_dropped++;
         return true;
     }

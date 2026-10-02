@@ -26,8 +26,10 @@
  *
  * Every frame either side transmits is also dissected here, independently
  * of the provider, so each case can check what actually crossed the wire:
- * ARP, RUD or RUDI requests, retransmissions, ACKs, and whether security
- * headers wrap every UET frame and the payload is no longer readable.
+ * ARP, the encapsulation (UDP to port 4793, or IP protocol 253), RUD or
+ * RUDI requests and how much payload they carry, retransmissions, ACKs,
+ * and whether security headers wrap every UET frame and the payload is no
+ * longer readable.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -65,6 +67,9 @@
 #define PEER_PID     0u
 #define PEER_INDEX   15u
 
+#define UET_UDP_PORT 4793u
+#define UET_IPPROTO  253u
+
 #define CASE_TIMEOUT_S 90
 #define PROBE_LEN      32u
 
@@ -90,6 +95,7 @@ static uint32_t rto_override_ms;
 #define PDS_RUD_CC    0x0du
 #define PDS_ROD_CC    0x0eu
 #define PDS_FLAG_RETX 0x10u
+#define PDS_FLAG_AR   0x08u
 
 struct test_case {
     const char *name;
@@ -104,6 +110,10 @@ struct test_case {
     bool want_rudi;
     bool want_retx;
     bool want_tss;
+    /* the wire: encapsulation, and the IP MTU (0: the engine's 1500) */
+    enum uet_engine_encap encap;
+    uint16_t mtu;
+    enum uet_engine_pds pds;
 };
 
 static const struct test_case cases[] = {
@@ -117,16 +127,46 @@ static const struct test_case cases[] = {
      UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true},
     /* RUDI has no window: the whole megabyte (1024 packets) is encrypted
      * and sent when the write is posted.  The provider's AES-GCM and
-     * per-packet CMAC KDF run in software (at -O0, as its Makefile builds
-     * them), about a quarter of a millisecond a packet, so the timeout has
-     * to outlast a full window or the initiator re-encrypts everything
-     * before it ever reads a response. */
+     * per-packet CMAC KDF run in software, so the timeout has to outlast a
+     * full window or the initiator re-encrypts everything before it ever
+     * reads a response. */
     {"tss-cluster-rudi", "RUDI with UET_SEC_MODE=cluster", true,
      UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true},
     {"rudi-wireloss2pct",
      "RUDI with 2% loss on the wire (UET_PKT_DROP_THRESH does not reach "
      "RUDI)",
      true, UET_ENGINE_SEC_NONE, 0, 20, 20, 30, true, true, false},
+    /* UET directly over IP, as before UDP became the default. */
+    {"rudi-1MiB-ip", "RUDI with encap=ip (IP protocol 253)", true,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_IP,
+     0},
+    {"rud-1MiB-ip", "RUD with encap=ip", false, UET_ENGINE_SEC_NONE, 0, 0, 20,
+     10, false, false, false, UET_ENGINE_ENCAP_IP, 0},
+    {"tss-cluster-rud-ip", "RUD with UET_SEC_MODE=cluster and encap=ip", false,
+     UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true,
+     UET_ENGINE_ENCAP_IP, 0},
+    /* Jumbo frames: an MTU of 9000 gives a Payload MTU of 8192, so the
+     * megabyte is 128 packets. */
+    {"rudi-jumbo", "RUDI at mtu=9000 (8 KiB payloads)", true,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 9000},
+    {"rud-jumbo", "RUD at mtu=9000", false, UET_ENGINE_SEC_NONE, 0, 0, 20, 10,
+     false, false, false, UET_ENGINE_ENCAP_UDP, 9000},
+    {"rud-jumbo-ip", "RUD at mtu=9000 with encap=ip", false,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
+     UET_ENGINE_ENCAP_IP, 9000},
+    {"tss-cluster-rudi-jumbo", "RUDI with UET_SEC_MODE=cluster at mtu=9000",
+     true, UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true,
+     UET_ENGINE_ENCAP_UDP, 9000},
+    {"rud-drop500-jumbo", "RUD with 5% of PDS transmits dropped at mtu=9000",
+     false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false,
+     UET_ENGINE_ENCAP_UDP, 9000},
+    /* The provider's stop-and-go PDS (pds=sng) builds its own frames. */
+    {"sng-1MiB", "the write over the stop-and-go PDS", false,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_SNG},
+    {"sng-1MiB-ip", "the same with encap=ip", false, UET_ENGINE_SEC_NONE, 0, 0,
+     20, 10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_SNG},
 };
 
 /* ------------------------------------------------------------------ */
@@ -223,7 +263,10 @@ struct wire_count {
     uint64_t frames;
     uint64_t arp;
     uint64_t uet;
-    uint64_t secured; /* UET frames whose first header is TSS */
+    uint64_t udp;       /* UET frames in UDP */
+    uint64_t ipenc;     /* UET frames directly in IP */
+    uint64_t max_frame; /* the longest UET frame, Ethernet header included */
+    uint64_t secured;   /* UET frames whose first header is TSS */
     uint64_t rud_req;
     uint64_t rod_req;
     uint64_t rudi_req;
@@ -232,6 +275,7 @@ struct wire_count {
     uint64_t nack;
     uint64_t ctrl;
     uint64_t retx; /* requests flagged as retransmissions */
+    uint64_t ar;   /* requests asking for an ACK at once */
     uint64_t other;
 };
 
@@ -281,14 +325,27 @@ static void classify(struct node *n, const uint8_t *f, size_t len)
         c->arp++;
         return;
     }
-    if (rd16(f + 12) != 0x0800 || len < 34 || f[14 + 9] != 253) {
+    if (rd16(f + 12) != 0x0800 || len < 34) {
+        c->other++;
+        return;
+    }
+    size_t ihl = (size_t)(f[14] & 0x0fu) * 4u;
+    size_t o; /* past the UDP or entropy header */
+    if (f[14 + 9] == 17 && len >= 14 + ihl + 8 &&
+        rd16(f + 14 + ihl + 2) == UET_UDP_PORT) {
+        c->udp++;
+        o = 14 + ihl + 8;
+    } else if (f[14 + 9] == UET_IPPROTO) {
+        c->ipenc++;
+        o = 14 + ihl + 4;
+    } else {
         c->other++;
         return;
     }
 
     c->uet++;
-    size_t ihl = (size_t)(f[14] & 0x0fu) * 4u;
-    size_t o = 14 + ihl + 4; /* past the entropy header */
+    if (len > c->max_frame)
+        c->max_frame = len;
     if (len < o + 2) {
         c->other++;
         return;
@@ -304,6 +361,7 @@ static void classify(struct node *n, const uint8_t *f, size_t len)
     case PDS_RUD_CC:
         c->rud_req++;
         c->retx += (flags & PDS_FLAG_RETX) ? 1u : 0u;
+        c->ar += (flags & PDS_FLAG_AR) ? 1u : 0u;
         break;
     case PDS_ROD_REQ:
     case PDS_ROD_CC:
@@ -431,6 +489,8 @@ struct report {
     uint64_t probe_hits;
     uint64_t maps_read;
     uint64_t maps_write;
+    uint32_t mtu;     /* the engine's, as it ran */
+    uint32_t payload; /* its Payload MTU */
     uint64_t compared;
     uint64_t mismatches;
     uint64_t guard_bad;
@@ -482,6 +542,9 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
     cfg.rto_ms = rto_override_ms != 0 ? rto_override_ms : n->tc->rto_ms;
     cfg.max_retries = n->tc->retries;
     cfg.drop_thresh = n->tc->drop_thresh;
+    cfg.encap = n->tc->encap;
+    cfg.mtu = n->tc->mtu;
+    cfg.pds = n->tc->pds;
 
     struct uet_engine_wire wire = {.tx = wire_tx, .ctx = n};
     struct uet_engine_dma dma = {.map = guest_map, .ctx = &n->g};
@@ -497,6 +560,11 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
 static void node_finish(struct node *n, struct report *rep)
 {
     if (n->e != NULL) {
+        struct uet_engine_cfg id;
+
+        uet_engine_identity(n->e, &id);
+        rep->mtu = id.mtu;
+        rep->payload = id.payload;
         uet_engine_get_stats(n->e, &rep->st);
         uet_engine_destroy(n->e);
         n->e = NULL;
@@ -801,14 +869,16 @@ static void print_side(const char *role, const struct report *r)
     const struct wire_count *t = &r->tx;
 
     printf("  %-9s tx %" PRIu64 " frames: %" PRIu64 " ARP, %" PRIu64
-           " UET (%" PRIu64 " TSS-wrapped)",
-           role, t->frames, t->arp, t->uet, t->secured);
+           " UET (%" PRIu64 " UDP, %" PRIu64 " IP; %" PRIu64
+           " TSS-wrapped; longest %" PRIu64 " bytes)",
+           role, t->frames, t->arp, t->uet, t->udp, t->ipenc, t->secured,
+           t->max_frame);
     if (t->secured < t->uet)
         printf(", %" PRIu64 " RUD req, %" PRIu64 " RUDI req, %" PRIu64
                " RUDI resp, %" PRIu64 " ACK, %" PRIu64 " NACK, %" PRIu64
-               " CTRL, %" PRIu64 " flagged RETX",
+               " CTRL, %" PRIu64 " flagged RETX, %" PRIu64 " AR",
                t->rud_req, t->rudi_req, t->rudi_resp, t->ack, t->nack, t->ctrl,
-               t->retx);
+               t->retx, t->ar);
     printf("\n");
     printf("            engine rx %" PRIu64 " tx %" PRIu64
            " (wire full %" PRIu64 ", test loss %" PRIu64 "), ARP req %" PRIu64
@@ -825,7 +895,27 @@ static void check_wire(const struct test_case *tc, const struct report *ini,
 {
     const struct wire_count *i = &ini->tx;
     const struct wire_count *t = &tgt->tx;
-    uint64_t data_pkts = (xfer_len + 1023u) / 1024u;
+    uint32_t want_mtu = tc->mtu != 0 ? tc->mtu : 1500u;
+    uint32_t want_payload = want_mtu >= 9000u ? 8192u : 1024u;
+    uint64_t data_pkts = (xfer_len + want_payload - 1u) / want_payload;
+
+    if (ini->mtu != want_mtu || tgt->mtu != want_mtu ||
+        ini->payload != want_payload || tgt->payload != want_payload)
+        fail(verdict,
+             "engines run at mtu %u and %u, payload %u and %u, not %u and %u",
+             ini->mtu, tgt->mtu, ini->payload, tgt->payload, want_mtu,
+             want_payload);
+    if (tc->encap == UET_ENGINE_ENCAP_IP ? (i->udp != 0 || t->udp != 0)
+                                         : (i->ipenc != 0 || t->ipenc != 0))
+        fail(verdict,
+             "UET frames in the wrong encapsulation (%" PRIu64 " and %" PRIu64
+             " UDP, %" PRIu64 " and %" PRIu64 " IP)",
+             i->udp, t->udp, i->ipenc, t->ipenc);
+    /* A full packet carries the whole payload: the frame is at least that
+     * plus the Ethernet, IPv4, UDP or entropy, PDS and SES headers. */
+    if (i->max_frame < want_payload + 14u + 20u + 4u + 8u + 44u ||
+        i->max_frame > want_mtu + 14u)
+        fail(verdict, "the longest frame is %" PRIu64 " bytes", i->max_frame);
 
     if (i->arp == 0 || tgt->st.arp_replies == 0)
         fail(verdict, "the target's MAC was not resolved by ARP");
@@ -940,15 +1030,18 @@ static bool run_case(const struct test_case *tc)
                                  (ini.xfer_ms / 1000.0)
                            : 0.0;
         uint64_t sent = ini.tx.rud_req + ini.tx.rudi_req;
+        uint64_t payload = ini.payload != 0 ? ini.payload : 1024u;
         printf("  %zu bytes in %.1f ms (%.1f MiB/s) after %.0f us of ARP; "
                "target compared %" PRIu64 " bytes, %" PRIu64 " wrong, %" PRIu64
                " guard bytes changed\n",
                xfer_len, ini.xfer_ms, mib_s, ini.resolve_ms * 1000.0,
                tgt.compared, tgt.mismatches, tgt.guard_bad);
         if (ini.tx.secured < ini.tx.uet)
-            printf("  %" PRIu64 " requests on the wire for %zu data packets, "
-                   "%" PRIu64 " flagged RETX\n",
-                   sent, (xfer_len + 1023u) / 1024u, ini.tx.retx);
+            printf("  %" PRIu64 " requests on the wire for %" PRIu64
+                   " data packets of %" PRIu64 " bytes (mtu %u), %" PRIu64
+                   " flagged RETX\n",
+                   sent, (xfer_len + payload - 1u) / payload, payload, ini.mtu,
+                   ini.tx.retx);
         print_side("initiator", &ini);
         print_side("target", &tgt);
     }
@@ -1045,6 +1138,18 @@ static size_t build_ipv4(uint8_t *f, uint8_t proto, uint32_t dst_ip,
     return 14 + tot + pad;
 }
 
+/* The same, as UDP to @dport with @payload bytes after the UDP header. */
+static size_t build_udp4(uint8_t *f, uint16_t dport, uint32_t dst_ip,
+                         const uint8_t *dst_mac, size_t payload, size_t pad)
+{
+    size_t len = build_ipv4(f, 17, dst_ip, dst_mac, 8 + payload, pad);
+
+    put16(f + 34, 0x4242); /* the entropy */
+    put16(f + 36, dport);
+    put16(f + 38, (uint16_t)(8 + payload));
+    return len;
+}
+
 static bool test_wire_filter(void)
 {
     struct filter_tx tx;
@@ -1091,10 +1196,17 @@ static bool test_wire_filter(void)
     EXPECT(!uet_nic_ernic_rx_frame(n, f, len), "ARP for another host taken");
     EXPECT(tx.count == 1, "ARP for another host answered");
 
-    /* A UET datagram for the engine is queued without its padding. */
+    /* A UET datagram for the engine is queued without its padding, in
+     * either encapsulation. */
     len = build_ipv4(f, 253, IP_INITIATOR, filter_mac, 30, 10);
     EXPECT(uet_nic_ernic_rx_frame(n, f, len), "UET frame not taken");
     EXPECT(uet_nic_ernic_rx_pending(n), "UET frame not queued");
+    len = build_udp4(f, UET_UDP_PORT, IP_INITIATOR, filter_mac, 30, 0);
+    EXPECT(uet_nic_ernic_rx_frame(n, f, len), "UET in UDP not taken");
+
+    /* UDP to another port is not UET. */
+    len = build_udp4(f, 4791, IP_INITIATOR, filter_mac, 30, 0);
+    EXPECT(!uet_nic_ernic_rx_frame(n, f, len), "UDP to port 4791 taken");
 
     /* Not UET, or not the engine's: left for the guest. */
     len = build_ipv4(f, 6, IP_INITIATOR, filter_mac, 30, 0);
@@ -1126,14 +1238,17 @@ static bool test_wire_filter(void)
     len = build_ipv4(f, 253, IP_INITIATOR, filter_mac, 30, 0);
     f[14] = 0x46; /* options */
     EXPECT(uet_nic_ernic_rx_frame(n, f, len), "IP options not taken");
+    len = build_udp4(f, UET_UDP_PORT, IP_INITIATOR, filter_mac, 30, 0);
+    put16(f + 38, 20); /* a UDP length that is not the IP payload's */
+    EXPECT(uet_nic_ernic_rx_frame(n, f, len), "bad UDP length not taken");
     len = build_ipv4(f, 253, IP_INITIATOR, filter_mac, 30, 0);
     /* Too short to hold the IP header: not recognisably the engine's. */
     EXPECT(!uet_nic_ernic_rx_frame(n, f, 30), "truncated frame taken");
 
     uet_nic_ernic_get_stats(n, &st);
-    EXPECT(st.rx_dropped == dropped + 3,
+    EXPECT(st.rx_dropped == dropped + 4,
            "malformed datagrams were not dropped");
-    EXPECT(st.rx_frames == 1, "a malformed datagram was queued");
+    EXPECT(st.rx_frames == 2, "a malformed datagram was queued");
 #undef EXPECT
 
     uet_nic_ernic_destroy(n);

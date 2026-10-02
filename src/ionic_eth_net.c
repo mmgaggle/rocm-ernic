@@ -24,6 +24,7 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 
 #include "ionic_eth_net.h"
 
@@ -107,6 +108,25 @@ int ionic_eth_net_send(struct ionic_eth_net *net, const void *frame, size_t len)
          * real hardware does with an oversubscribed link. */
         return -errno;
     }
+}
+
+int ionic_eth_net_mtu(const struct ionic_eth_net *net)
+{
+    struct ifreq ifr;
+    int fd, rc = 0;
+
+    if (!net)
+        return -EBADF;
+    /* SIOCGIFMTU needs a socket, not the tun fd, and no privilege. */
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -errno;
+    memset(&ifr, 0, sizeof(ifr));
+    memcpy(ifr.ifr_name, net->ifname, sizeof(ifr.ifr_name));
+    if (ioctl(fd, SIOCGIFMTU, &ifr) < 0)
+        rc = -errno;
+    close(fd);
+    return rc < 0 ? rc : ifr.ifr_mtu;
 }
 
 ssize_t ionic_eth_net_recv(struct ionic_eth_net *net, void *buf, size_t cap)

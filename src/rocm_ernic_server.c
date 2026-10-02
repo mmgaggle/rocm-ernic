@@ -665,15 +665,31 @@ static bool uet_wire_rx_filter(void *ctx, const void *frame, size_t len)
 }
 
 static int uet_engine_start(rocm_ernic_dev_t *dev,
-                            const struct uet_engine_cfg *cfg, bool have_wire)
+                            const struct uet_engine_cfg *opts, bool have_wire)
 {
     char err[256] = "";
-    char desc[192];
+    char desc[256];
+    struct uet_engine_cfg c = *opts;
+    const struct uet_engine_cfg *cfg = &c;
 
     if (!dev->ionic_emu) {
         fprintf(stderr, "Error: uet engine: Ethernet emulation is not "
                         "initialized\n");
         return -1;
+    }
+
+    /* Without mtu= the engine's MTU is its wire's: the TAP's. */
+    if (c.mtu == 0 && have_wire) {
+        int mtu = ionic_eth_emu_wire_mtu(dev->ionic_emu);
+
+        if (mtu < 576) {
+            fprintf(stderr,
+                    "Error: uet engine: cannot read the TAP's MTU "
+                    "(%s); give mtu=\n",
+                    mtu < 0 ? strerror(-mtu) : "below 576");
+            return -1;
+        }
+        c.mtu = (uint16_t)(mtu > 9000 ? 9000 : mtu);
     }
 
     g_uet_dma.vfu_ctx = dev->vfu_ctx;
@@ -708,7 +724,7 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         return -1;
     }
 
-    uet_engine_cfg_describe(cfg, desc, sizeof(desc));
+    uet_engine_describe(dev->uet_engine, desc, sizeof(desc));
     ernic_startup_report("rocm-ernic: UET engine %s%s", desc,
                          have_wire ? ""
                                    : " (no --tap: the engine has no wire)");
@@ -802,7 +818,9 @@ static void usage(const char *progname)
     fprintf(stderr, "                       job, pid, index, initiator, "
                     "pds=pds|sng,\n");
     fprintf(stderr, "                       sec=none|direct|cluster, ssi, rto, "
-                    "retries, mtu)\n");
+                    "retries, mtu,\n");
+    fprintf(stderr, "                       payload, encap=udp|ip, port, "
+                    "proto)\n");
 #ifndef ERNIC_HAVE_UET
     fprintf(stderr, "                       (not in this build: configure with "
                     "-DERNIC_UET=ON)\n");
@@ -1326,7 +1344,9 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Error: uet engine: %s\n", uet_err);
             fprintf(stderr, "  Use: --uet ip=ADDR[,mac=MAC][,job=N][,pid=N]"
                             "[,index=N][,pds=pds|sng]"
-                            "[,sec=none|direct|cluster][,ssi=N]\n");
+                            "[,sec=none|direct|cluster][,ssi=N][,mtu=N]"
+                            "[,payload=N][,encap=udp|ip][,port=N]"
+                            "[,proto=N]\n");
             ok_to_start = false;
         }
 #else

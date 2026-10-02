@@ -22,6 +22,7 @@
 /* The provider, built with ENABLE_VERBS=1. */
 #include "uet_api.h"
 #include "uet_addr.h"
+#include "uet_payload.h"
 
 #include "parse_int.h"
 #include "uet_engine.h"
@@ -38,7 +39,9 @@
 #define DEFAULT_PID_ON_FEP   0u
 #define DEFAULT_RES_INDEX    15u /* the reference test program's */
 #define DEFAULT_INITIATOR_ID 16u
-#define DEFAULT_MTU          1500u
+#define DEFAULT_MTU          1500u /* when neither mtu= nor the wire says */
+#define MIN_MTU              576u
+#define MAX_MTU              9000u
 
 #define MAX_JOB_ID 0xffffffu /* 24-bit SES field */
 
@@ -103,6 +106,7 @@ struct uet_engine {
     uet_cq_handle_t rx_cq;
     struct fi_cq_attr cq_attr;
     bool rudi; /* what UET_OPT_FORCE_RUDI is set to on the endpoint */
+    struct uet_wire_info wire_info; /* what the provider settled on */
 
     struct engine_mr mrs[UET_ENGINE_MAX_MRS];
     struct engine_peer peers[UET_ENGINE_MAX_PEERS];
@@ -207,7 +211,11 @@ void uet_engine_cfg_defaults(struct uet_engine_cfg *cfg)
     cfg->initiator_id = DEFAULT_INITIATOR_ID;
     cfg->pds = UET_ENGINE_PDS_FULL;
     cfg->sec = UET_ENGINE_SEC_NONE;
-    cfg->mtu = DEFAULT_MTU;
+    cfg->mtu = 0;
+    cfg->encap = UET_ENGINE_ENCAP_UDP;
+    cfg->udp_port = UET_ENGINE_UDP_PORT;
+    cfg->ipproto = UET_ENGINE_IPPROTO;
+    cfg->payload = 0;
     cfg->mr_quarantine_ms = DEFAULT_QUARANTINE_MS;
 }
 
@@ -305,11 +313,44 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
             return false;
         }
     } else if (strcmp(key, "mtu") == 0) {
-        if (!parse_u32_range(val, 576, 9000, &v)) {
-            set_err(err, errlen, "mtu must be 576..9000 (got '%s')", val);
+        if (!parse_u32_range(val, MIN_MTU, MAX_MTU, &v)) {
+            set_err(err, errlen, "mtu must be %u..%u (got '%s')", MIN_MTU,
+                    MAX_MTU, val);
             return false;
         }
         cfg->mtu = (uint16_t)v;
+    } else if (strcmp(key, "encap") == 0) {
+        if (strcmp(val, "udp") == 0) {
+            cfg->encap = UET_ENGINE_ENCAP_UDP;
+        } else if (strcmp(val, "ip") == 0) {
+            cfg->encap = UET_ENGINE_ENCAP_IP;
+        } else {
+            set_err(err, errlen, "encap must be udp or ip (got '%s')", val);
+            return false;
+        }
+    } else if (strcmp(key, "port") == 0) {
+        if (!parse_u32_range(val, 1, 65535, &v)) {
+            set_err(err, errlen, "port must be 1..65535 (got '%s')", val);
+            return false;
+        }
+        cfg->udp_port = (uint16_t)v;
+    } else if (strcmp(key, "proto") == 0) {
+        /* Not UDP or TCP: the filter would take the guest's traffic. */
+        if (!parse_u32_range(val, 1, 255, &v) || v == 6 || v == 17) {
+            set_err(err, errlen,
+                    "proto must be 1..255 and not TCP or UDP (got '%s')", val);
+            return false;
+        }
+        cfg->ipproto = (uint8_t)v;
+    } else if (strcmp(key, "payload") == 0) {
+        if (!parse_u32_range(val, UET_PAYLOAD_MTU_MIN, UET_PAYLOAD_MTU_MAX,
+                             &v) ||
+            !uet_payload_mtu_valid(v)) {
+            set_err(err, errlen,
+                    "payload must be 1024, 2048, 4096 or 8192 (got '%s')", val);
+            return false;
+        }
+        cfg->payload = v;
     } else {
         set_err(err, errlen, "unknown option '%s'", key);
         return false;
@@ -354,6 +395,16 @@ bool uet_engine_cfg_parse(struct uet_engine_cfg *cfg, const char *opts,
         set_err(err, errlen, "sec= needs pds=pds");
         return false;
     }
+    /* With an explicit mtu=, an explicit payload= has to fit it; the
+     * wire's own MTU is only known once the engine starts. */
+    if (cfg->mtu != 0 && cfg->payload != 0 &&
+        cfg->payload + UET_PAYLOAD_HDR_MAX > cfg->mtu) {
+        set_err(
+            err, errlen, "payload=%u needs an mtu of at least %u (mtu is %u)",
+            (unsigned)cfg->payload,
+            (unsigned)(cfg->payload + UET_PAYLOAD_HDR_MAX), (unsigned)cfg->mtu);
+        return false;
+    }
     return true;
 }
 
@@ -384,6 +435,11 @@ static const char *pds_name(enum uet_engine_pds pds)
     }
 }
 
+static const char *encap_name(enum uet_engine_encap encap)
+{
+    return encap == UET_ENGINE_ENCAP_IP ? "ip" : "udp";
+}
+
 static const char *sec_name(enum uet_engine_sec sec)
 {
     switch (sec) {
@@ -402,17 +458,31 @@ void uet_engine_cfg_describe(const struct uet_engine_cfg *cfg, char *buf,
 {
     uint8_t mac[6];
 
+    char wire[48];
+    char mtu[16] = "wire";
+    char payload[16] = "auto";
+
     engine_mac(cfg, mac);
+    if (cfg->encap == UET_ENGINE_ENCAP_IP)
+        snprintf(wire, sizeof(wire), "encap ip proto %u",
+                 (unsigned)cfg->ipproto);
+    else
+        snprintf(wire, sizeof(wire), "encap udp port %u",
+                 (unsigned)cfg->udp_port);
+    if (cfg->mtu != 0)
+        snprintf(mtu, sizeof(mtu), "%u", (unsigned)cfg->mtu);
+    if (cfg->payload != 0)
+        snprintf(payload, sizeof(payload), "%u", (unsigned)cfg->payload);
     snprintf(buf, len,
              "ip %u.%u.%u.%u mac %02x:%02x:%02x:%02x:%02x:%02x job %u pid %u "
-             "index %u pds %s sec %s mtu %u",
+             "index %u pds %s sec %s mtu %s payload %s %s",
              (unsigned)(cfg->ip >> 24), (unsigned)((cfg->ip >> 16) & 0xffu),
              (unsigned)((cfg->ip >> 8) & 0xffu), (unsigned)(cfg->ip & 0xffu),
              (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
              (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5],
              (unsigned)cfg->job_id, (unsigned)cfg->pid_on_fep,
              (unsigned)cfg->resource_index, pds_name(cfg->pds),
-             sec_name(cfg->sec), (unsigned)cfg->mtu);
+             sec_name(cfg->sec), mtu, payload, wire);
 }
 
 /*
@@ -479,6 +549,21 @@ static bool engine_set_env(const struct uet_engine_cfg *cfg, char *err,
     if (cfg->drop_thresh != 0 &&
         !set_env_u32("UET_PKT_DROP_THRESH", cfg->drop_thresh, err, errlen))
         return false;
+
+    /* The wire format is the engine's, so these are owned outright. */
+    if (setenv("UET_ENCAP", encap_name(cfg->encap), 1) != 0) {
+        set_err(err, errlen, "setenv: %s", strerror(errno));
+        return false;
+    }
+    if (!set_env_u32("UET_UDP_PORT", cfg->udp_port, err, errlen) ||
+        !set_env_u32("UET_IPPROTO", cfg->ipproto, err, errlen))
+        return false;
+    if (cfg->payload != 0) {
+        if (!set_env_u32("UET_MAX_PAYLOAD", cfg->payload, err, errlen))
+            return false;
+    } else {
+        unsetenv("UET_MAX_PAYLOAD");
+    }
     return true;
 }
 
@@ -581,6 +666,22 @@ void uet_engine_identity(const struct uet_engine *e, struct uet_engine_cfg *out)
     *out = e->cfg;
     engine_mac(&e->cfg, out->mac);
     out->mac_set = true;
+    out->payload = e->wire_info.payload_mtu;
+}
+
+void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len)
+{
+    struct uet_engine_cfg id;
+    size_t n;
+
+    if (e == NULL || buf == NULL || len == 0)
+        return;
+    uet_engine_identity(e, &id);
+    uet_engine_cfg_describe(&id, buf, len);
+    n = strlen(buf);
+    if (n < len)
+        snprintf(buf + n, len - n, " ack every %u bytes",
+                 (unsigned)e->wire_info.ack_gen_trigger);
 }
 
 struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
@@ -604,14 +705,26 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
         return NULL;
     }
     e->cfg = *cfg;
+    if (e->cfg.mtu == 0)
+        e->cfg.mtu = DEFAULT_MTU;
     e->wire = *wire;
     if (dma != NULL)
         e->dma = *dma;
+    cfg = &e->cfg;
+
+    if (cfg->payload != 0 && cfg->payload + UET_PAYLOAD_HDR_MAX > cfg->mtu) {
+        set_err(err, errlen, "payload=%u does not fit an mtu of %u",
+                (unsigned)cfg->payload, (unsigned)cfg->mtu);
+        free(e);
+        return NULL;
+    }
 
     memset(&ncfg, 0, sizeof(ncfg));
     ncfg.ip = cfg->ip;
     engine_mac(cfg, ncfg.mac);
     ncfg.mtu = cfg->mtu;
+    ncfg.udp_port = cfg->udp_port;
+    ncfg.ipproto = cfg->ipproto;
     ncfg.name = "ernic-uet";
     ncfg.tx = engine_wire_tx;
     ncfg.tx_ctx = e;
@@ -635,6 +748,12 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
     if (rc != 0) {
         set_err(err, errlen, "uet_initialize: %s", strerror(-rc));
         e->uet = NULL;
+        goto fail;
+    }
+
+    rc = uet_get_wire_info(e->uet, &e->wire_info);
+    if (rc != 0) {
+        set_err(err, errlen, "uet_get_wire_info: %s", strerror(-rc));
         goto fail;
     }
 

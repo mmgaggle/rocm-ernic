@@ -36,11 +36,17 @@
  * therefore go to the engine in segments, with a cap on the RUDI bytes in
  * the engine across all transfers.  RUD has the PDS's own window and goes
  * as one message.
+ *
+ * What overflows is a queue of frames (a TAP's is 1000), and what the
+ * receiver has to work through before the retransmit timeout is mostly a
+ * cost per packet, so both are counted in packets of the engine's Payload
+ * MTU: 256 KiB and 512 KiB with 1 KiB payloads, 2 MiB and 4 MiB with
+ * 8 KiB ones.
  */
-#define SVC_RUDI_SEG    (256u * 1024u) /* bytes per RUDI segment */
-#define SVC_RUDI_WINDOW (512u * 1024u) /* RUDI bytes in the engine, at most */
-#define SVC_MAX_SEGS    4u             /* segments of one transfer in flight */
-_Static_assert(SVC_RUDI_WINDOW / SVC_RUDI_SEG <= SVC_MAX_SEGS,
+#define SVC_RUDI_SEG_PKTS    256u /* packets per RUDI segment */
+#define SVC_RUDI_WINDOW_PKTS 512u /* RUDI packets in the engine, at most */
+#define SVC_MAX_SEGS         4u   /* segments of one transfer in flight */
+_Static_assert(SVC_RUDI_WINDOW_PKTS / SVC_RUDI_SEG_PKTS <= SVC_MAX_SEGS,
                "a transfer can have the whole window in flight");
 
 /* A region the engine cannot address is refused rather than registered:
@@ -100,7 +106,9 @@ struct uet_svc {
     struct svc_peer peers[SVC_MAX_PEERS];
     struct svc_op ops_tab[SVC_MAX_OPS];
     uint64_t next_seq;
-    uint64_t rudi_out; /* RUDI bytes in the engine */
+    uint64_t rudi_out;    /* RUDI bytes in the engine */
+    uint64_t rudi_seg;    /* bytes per RUDI segment */
+    uint64_t rudi_window; /* RUDI bytes in the engine, at most */
 
     struct svc_reply *replies; /* FIFO, oldest first */
     uint32_t nreplies;
@@ -256,8 +264,7 @@ static void op_finish(struct uet_svc *s, struct svc_op *op, int status)
 static uint64_t op_engine_cookie(const struct uet_svc *s,
                                  const struct svc_op *op, uint32_t k)
 {
-    return (op->seq << 16) | ((uint64_t)k << 8) |
-           (uint64_t)(op - s->ops_tab);
+    return (op->seq << 16) | ((uint64_t)k << 8) | (uint64_t)(op - s->ops_tab);
 }
 
 /*
@@ -266,17 +273,16 @@ static uint64_t op_engine_cookie(const struct uet_svc *s,
  */
 static void op_pump(struct uet_svc *s, struct svc_op *op, uint64_t now)
 {
-    while (!op->stop && op->sent < op->rma.len &&
-           op->segs_out < SVC_MAX_SEGS) {
+    while (!op->stop && op->sent < op->rma.len && op->segs_out < SVC_MAX_SEGS) {
         uint64_t seg = op->rma.len - op->sent;
         uint32_t k = 0;
 
         if (op->rma.rudi) {
-            if (seg > SVC_RUDI_SEG)
-                seg = SVC_RUDI_SEG;
+            if (seg > s->rudi_seg)
+                seg = s->rudi_seg;
             /* Wait for the window; completions open it, so this is
              * not a reason to time out. */
-            if (s->rudi_out != 0 && s->rudi_out + seg > SVC_RUDI_WINDOW)
+            if (s->rudi_out != 0 && s->rudi_out + seg > s->rudi_window)
                 break;
         }
         while (op->seg_busy & (1u << k))
@@ -321,11 +327,10 @@ static void op_seg_done(struct uet_svc *s, uint64_t cookie, int status,
     if (slot >= SVC_MAX_OPS || k >= SVC_MAX_SEGS)
         return;
     op = &s->ops_tab[slot];
-    if (!op->used || op->seq != cookie >> 16 ||
-        (op->seg_busy & (1u << k)) == 0)
+    if (!op->used || op->seq != cookie >> 16 || (op->seg_busy & (1u << k)) == 0)
         return;
 
-    op->seg_busy &= (uint8_t) ~(1u << k);
+    op->seg_busy &= (uint8_t)~(1u << k);
     op->segs_out--;
     if (op->rma.rudi)
         s->rudi_out -= op->seg_len[k];
@@ -725,6 +730,12 @@ struct uet_svc *uet_svc_create(struct uet_engine *engine,
     s->e = engine;
     s->ops = *ops;
     s->ctx = ctx;
+
+    struct uet_engine_cfg id;
+    uet_engine_identity(engine, &id);
+    uint64_t payload = id.payload != 0 ? id.payload : 1024u;
+    s->rudi_seg = SVC_RUDI_SEG_PKTS * payload;
+    s->rudi_window = SVC_RUDI_WINDOW_PKTS * payload;
     return s;
 }
 

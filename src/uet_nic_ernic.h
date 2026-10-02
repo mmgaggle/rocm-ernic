@@ -31,8 +31,10 @@
 /* Name the shim registers under, and the value of UET_NIC_SHIM for it. */
 #define UET_NIC_ERNIC_NAME "ernic"
 
-/* IP protocol number UET is carried in when it runs directly over IP. */
-#define UET_NIC_ERNIC_IPPROTO 253
+/* What a configuration of 0 means for the two encapsulations (UEC 1.0.1,
+ * 3.2.5): UDP to port 4793, or IP protocol 253. */
+#define UET_NIC_ERNIC_UDP_PORT 4793
+#define UET_NIC_ERNIC_IPPROTO  253
 
 struct uet_nic_ernic;
 
@@ -48,6 +50,8 @@ struct uet_nic_ernic_cfg {
     uint32_t ip;            /* the engine's IPv4 address, host order */
     uint8_t mac[6];         /* the engine's MAC address */
     uint16_t mtu;           /* IP MTU of the wire */
+    uint16_t udp_port;      /* UET over UDP: destination port, 0: 4793 */
+    uint8_t ipproto;        /* UET over IP: protocol, 0: 253 */
     const char *name;       /* interface name the provider reports */
     uet_nic_ernic_tx_fn tx; /* where transmitted frames go */
     void *tx_ctx;
@@ -84,10 +88,11 @@ void uet_nic_ernic_unregister(void);
 /*
  * Wire-side receive filter.  Offer it every frame taken off the wire.  It
  * returns true when the frame belonged to the engine and has been consumed:
- * a UET frame (IPv4 protocol 253) addressed to the engine's IP and MAC, or
- * an ARP packet whose target is the engine's IP.  Everything else, including
- * ARP for other addresses (which is only looked at to refresh neighbors the
- * engine already knows), is left for the guest.
+ * a UET frame addressed to the engine's IP and MAC, in either form (UDP to
+ * the UET port, or the UET IP protocol), or an ARP packet whose target is
+ * the engine's IP.  Everything else, including ARP for other addresses
+ * (which is only looked at to refresh neighbors the engine already knows),
+ * is left for the guest.
  */
 bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
                             size_t len);

@@ -116,6 +116,10 @@ typedef bool (*ionic_eth_rx_filter_fn)(void *ctx, const void *frame,
 void ionic_eth_emu_register_rx_filter(struct ionic_eth_emu *emu,
                                       ionic_eth_rx_filter_fn fn, void *ctx);
 
+/* The MTU of the LIF's host backend, or a negative errno (-ENETDOWN when
+ * it has none). */
+int ionic_eth_emu_wire_mtu(const struct ionic_eth_emu *emu);
+
 /*
  * Transmit a frame on the wire on behalf of an in-process endpoint, without
  * involving the guest's queues.  Returns 0, -ENETDOWN when the LIF has no
