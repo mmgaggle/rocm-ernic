@@ -58,6 +58,15 @@ enum uet_engine_encap {
     UET_ENGINE_ENCAP_IP, /* IP protocol ipproto, behind an entropy header */
 };
 
+/* What carries the engine's frames.  The engine itself only ever sees a
+ * struct uet_engine_wire; these are for its owner, from --uet. */
+enum uet_engine_wire_kind {
+    UET_ENGINE_WIRE_TAP = 0, /* the device's TAP (--tap) */
+    UET_ENGINE_WIRE_DPDK,    /* a DPDK port (uet_wire_dpdk.h) */
+};
+
+#define UET_ENGINE_DPDK_ARG_MAX 256u
+
 #define UET_ENGINE_UDP_PORT 4793u /* IANA, UEC 1.0.1 Table 3-28 */
 #define UET_ENGINE_IPPROTO  253u  /* experimental (RFC 3692) */
 
@@ -83,6 +92,14 @@ struct uet_engine_cfg {
     uint8_t ipproto;   /* IP protocol without UDP */
     uint32_t payload;  /* Payload MTU (1024, 2048, 4096, 8192); 0: the
                         * largest whose packets fit the MTU */
+    /* The wire, for the owner (see enum uet_engine_wire_kind).  In --uet,
+     * ';' stands for ',' in dpdk-dev= and dpdk-dma=, and separates the
+     * arguments of dpdk-eal=. */
+    enum uet_engine_wire_kind wire;
+    char dpdk_dev[UET_ENGINE_DPDK_ARG_MAX]; /* devargs of the port */
+    char dpdk_eal[UET_ENGINE_DPDK_ARG_MAX]; /* more EAL arguments */
+    char dpdk_dma[UET_ENGINE_DPDK_ARG_MAX]; /* dmadev, or "" */
+    uint16_t dpdk_queues;                   /* queue pairs, 0: 1 */
     /*
      * How long a deregistered region's provider descriptor is kept, disabled
      * and unreachable, before it is closed and may be reused.  A partially
@@ -103,6 +120,9 @@ void uet_engine_cfg_defaults(struct uet_engine_cfg *cfg);
  */
 bool uet_engine_cfg_parse(struct uet_engine_cfg *cfg, const char *opts,
                           char *err, size_t errlen);
+
+/* The MAC a configuration gives the engine (mac=, or 02:55 and the IP). */
+void uet_engine_cfg_mac(const struct uet_engine_cfg *cfg, uint8_t mac[6]);
 
 /* One-line description of a configuration, for the startup report. */
 void uet_engine_cfg_describe(const struct uet_engine_cfg *cfg, char *buf,
@@ -170,6 +190,16 @@ void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len);
  * anything else is left for the caller to deliver to the guest.
  */
 bool uet_engine_rx_frame(struct uet_engine *e, const void *frame, size_t len);
+
+/*
+ * The same for a frame the engine may keep in the wire's buffer until it
+ * has read it (see uet_nic_ernic_rx_frame_ext()): on true the engine owns
+ * the buffer and calls @release(@cookie) when done; on false the caller
+ * keeps it.  @csum_ok says the wire checked the IPv4 header checksum.
+ */
+bool uet_engine_rx_frame_ext(struct uet_engine *e, const void *frame,
+                             size_t len, bool csum_ok,
+                             void (*release)(void *cookie), void *cookie);
 
 /* Run the transport: received frames, retransmit timers, ARP retries. */
 void uet_engine_poll(struct uet_engine *e);
@@ -274,6 +304,7 @@ size_t uet_engine_poll_comp(struct uet_engine *e, struct uet_engine_comp *out,
 struct uet_engine_stats {
     /* wire */
     uint64_t rx_frames;
+    uint64_t rx_frames_ext; /* of which left in the wire's buffer */
     uint64_t rx_dropped;
     uint64_t tx_frames;
     uint64_t tx_frames_iov; /* of which with the payload left in place */

@@ -116,6 +116,24 @@ typedef bool (*ionic_eth_rx_filter_fn)(void *ctx, const void *frame,
 void ionic_eth_emu_register_rx_filter(struct ionic_eth_emu *emu,
                                       ionic_eth_rx_filter_fn fn, void *ctx);
 
+/*
+ * A wire other than the TAP, for a device whose whole wire it is (the UET
+ * engine's DPDK port, without --tap): the guest's frames go out through
+ * @fn, and ionic_eth_emu_wire_input() brings frames in from it.  Unused
+ * while a TAP is attached.
+ */
+typedef int (*ionic_eth_wire_tx_fn)(void *ctx, const void *frame, size_t len);
+void ionic_eth_emu_set_wire_tx(struct ionic_eth_emu *emu,
+                               ionic_eth_wire_tx_fn fn, void *ctx);
+
+/* Deliver one frame from such a wire to the guest's Rx ring.  Returns 0,
+ * or a negative errno (-ENOBUFS: no ring or no buffer posted). */
+int ionic_eth_emu_wire_input(struct ionic_eth_emu *emu, const void *frame,
+                             size_t len);
+
+/* True when the LIF has a TAP. */
+bool ionic_eth_emu_has_tap(const struct ionic_eth_emu *emu);
+
 /* The MTU of the LIF's host backend, or a negative errno (-ENETDOWN when
  * it has none). */
 int ionic_eth_emu_wire_mtu(const struct ionic_eth_emu *emu);

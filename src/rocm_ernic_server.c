@@ -48,6 +48,9 @@
 #ifdef ERNIC_HAVE_UET
 #include "uet_engine.h"
 #endif
+#ifdef ERNIC_HAVE_UET_DPDK
+#include "uet_wire_dpdk.h"
+#endif
 
 static const char *get_backend_type_base(const char *backend_str);
 
@@ -672,6 +675,118 @@ static bool uet_wire_rx_filter(void *ctx, const void *frame, size_t len)
     return uet_engine_rx_frame(ctx, frame, len);
 }
 
+#ifdef ERNIC_HAVE_UET_DPDK
+/* ---------------------------------------------------------------------------
+ * The engine on a DPDK port (--uet ...,wire=dpdk): the port is polled from
+ * this loop, in bursts, and frames for the engine stay in their mbufs until
+ * the provider reads them.  With --tap the TAP stays the guest's Ethernet
+ * and the port is the engine's alone; without it the port is the device's
+ * whole wire, and what is not UET goes to the guest.
+ * ---------------------------------------------------------------------------
+ */
+static struct uet_wire_dpdk *g_uet_dpdk;
+
+static int uet_dpdk_tx(void *ctx, const void *frame, size_t len)
+{
+    return uet_wire_dpdk_tx(ctx, frame, len);
+}
+
+static int uet_dpdk_tx_iov(void *ctx, const struct iovec *iov, unsigned n,
+                           size_t len)
+{
+    return uet_wire_dpdk_tx_iov(ctx, iov, n, len);
+}
+
+static void uet_dpdk_flush(void *ctx)
+{
+    uet_wire_dpdk_flush(ctx);
+}
+
+static int uet_dpdk_copy(void *ctx, void *dst, const void *src, size_t len)
+{
+    (void)ctx;
+    return uet_wire_dpdk_dma_copy(g_uet_dpdk, dst, src, len);
+}
+
+static bool uet_dpdk_rx(void *ctx, const struct uet_wire_dpdk_frame *f)
+{
+    rocm_ernic_dev_t *dev = ctx;
+
+    if (uet_engine_rx_frame_ext(dev->uet_engine, f->data, f->len, f->csum_ok,
+                                uet_wire_dpdk_release, f->cookie))
+        return true;
+    if (!ionic_eth_emu_has_tap(dev->ionic_emu))
+        (void)ionic_eth_emu_wire_input(dev->ionic_emu, f->data, f->len);
+    return false;
+}
+
+static int uet_dpdk_open(rocm_ernic_dev_t *dev, struct uet_engine_cfg *c,
+                         struct uet_engine_wire *wire,
+                         struct uet_engine_dma *dma)
+{
+    struct uet_wire_dpdk_cfg dc;
+    char err[256] = "";
+    char desc[512];
+
+    memset(&dc, 0, sizeof(dc));
+    dc.dev = c->dpdk_dev;
+    dc.eal = c->dpdk_eal[0] != '\0' ? c->dpdk_eal : NULL;
+    dc.dma = c->dpdk_dma[0] != '\0' ? c->dpdk_dma : NULL;
+    dc.queues = c->dpdk_queues;
+    dc.mtu = c->mtu != 0 ? c->mtu : 1500;
+    dc.ip = c->ip;
+    dc.udp_port = c->udp_port;
+    dc.ipproto = c->ipproto;
+    uet_engine_cfg_mac(c, dc.mac);
+
+    g_uet_dpdk = uet_wire_dpdk_open(&dc, err, sizeof(err));
+    if (!g_uet_dpdk) {
+        fprintf(stderr, "Error: uet engine: DPDK wire: %s\n", err);
+        return -1;
+    }
+    if (c->mtu == 0)
+        c->mtu = uet_wire_dpdk_mtu(g_uet_dpdk) >= 576
+                     ? uet_wire_dpdk_mtu(g_uet_dpdk)
+                     : 1500;
+
+    memset(wire, 0, sizeof(*wire));
+    wire->tx = uet_dpdk_tx;
+    wire->tx_iov = uet_dpdk_tx_iov;
+    wire->flush = uet_dpdk_flush;
+    wire->ctx = g_uet_dpdk;
+    wire->tx_ipv4_csum = true; /* the port, or the backend in software */
+    if (uet_wire_dpdk_has_dma(g_uet_dpdk))
+        dma->copy = uet_dpdk_copy;
+    if (!ionic_eth_emu_has_tap(dev->ionic_emu))
+        ionic_eth_emu_set_wire_tx(dev->ionic_emu, uet_dpdk_tx, g_uet_dpdk);
+
+    uet_wire_dpdk_describe(g_uet_dpdk, desc, sizeof(desc));
+    ernic_startup_report("rocm-ernic: UET wire %s", desc);
+    return 0;
+}
+
+static void uet_dpdk_close(rocm_ernic_dev_t *dev)
+{
+    struct uet_wire_dpdk_stats st;
+
+    if (!g_uet_dpdk)
+        return;
+    uet_wire_dpdk_get_stats(g_uet_dpdk, &st);
+    ernic_startup_report("rocm-ernic: UET wire stats: rx %" PRIu64 " (%" PRIu64
+                         " gathered, %" PRIu64 " csum hw, %" PRIu64
+                         " ts hw) tx %" PRIu64 " (%" PRIu64 " extbuf, %" PRIu64
+                         " copied, %" PRIu64 " dropped) dma %" PRIu64
+                         " copies %" PRIu64 " bytes %" PRIu64 " fallbacks",
+                         st.rx_frames, st.rx_multiseg, st.rx_csum_hw,
+                         st.rx_ts_hw, st.tx_frames, st.tx_extbuf_frames,
+                         st.tx_copied_frames, st.tx_dropped, st.dma_copies,
+                         st.dma_bytes, st.dma_fallbacks);
+    ionic_eth_emu_set_wire_tx(dev->ionic_emu, NULL, NULL);
+    uet_wire_dpdk_close(g_uet_dpdk);
+    g_uet_dpdk = NULL;
+}
+#endif /* ERNIC_HAVE_UET_DPDK */
+
 static int uet_engine_start(rocm_ernic_dev_t *dev,
                             const struct uet_engine_cfg *opts, bool have_wire)
 {
@@ -686,8 +801,25 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         return -1;
     }
 
+    struct uet_engine_wire wire = {
+        .tx = uet_wire_tx, .tx_iov = uet_wire_tx_iov, .ctx = dev->ionic_emu};
+    struct uet_engine_dma dma = {.map = uet_dma_vfu_map, .ctx = &g_uet_dma};
+    bool dpdk = c.wire == UET_ENGINE_WIRE_DPDK;
+
+    if (dpdk) {
+#ifdef ERNIC_HAVE_UET_DPDK
+        if (uet_dpdk_open(dev, &c, &wire, &dma) < 0)
+            return -1;
+        have_wire = true;
+#else
+        fprintf(stderr, "Error: uet engine: this build has no DPDK wire "
+                        "(configure with -DERNIC_UET_DPDK=ON)\n");
+        return -1;
+#endif
+    }
+
     /* Without mtu= the engine's MTU is its wire's: the TAP's. */
-    if (c.mtu == 0 && have_wire) {
+    if (c.mtu == 0 && have_wire && !dpdk) {
         int mtu = ionic_eth_emu_wire_mtu(dev->ionic_emu);
 
         if (mtu < 576) {
@@ -704,22 +836,27 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
     g_uet_dma.sg = malloc(dma_sg_size());
     if (!g_uet_dma.sg) {
         fprintf(stderr, "Error: uet engine: out of memory\n");
+#ifdef ERNIC_HAVE_UET_DPDK
+        uet_dpdk_close(dev);
+#endif
         return -1;
     }
-
-    struct uet_engine_wire wire = {
-        .tx = uet_wire_tx, .tx_iov = uet_wire_tx_iov, .ctx = dev->ionic_emu};
-    struct uet_engine_dma dma = {.map = uet_dma_vfu_map, .ctx = &g_uet_dma};
 
     dev->uet_engine = uet_engine_create(cfg, &wire, &dma, err, sizeof(err));
     if (!dev->uet_engine) {
         fprintf(stderr, "Error: uet engine: %s\n", err);
         free(g_uet_dma.sg);
         g_uet_dma.sg = NULL;
+#ifdef ERNIC_HAVE_UET_DPDK
+        uet_dpdk_close(dev);
+#endif
         return -1;
     }
-    ionic_eth_emu_register_rx_filter(dev->ionic_emu, uet_wire_rx_filter,
-                                     dev->uet_engine);
+    /* On a DPDK port the engine takes nothing from the TAP, which stays
+     * the guest's. */
+    if (!dpdk)
+        ionic_eth_emu_register_rx_filter(dev->ionic_emu, uet_wire_rx_filter,
+                                         dev->uet_engine);
 
     /* The guest reaches the engine through its service QP. */
     if (!ionic_datapath_attach_uet(dev->ionic_dp, dev->uet_engine, err,
@@ -728,6 +865,9 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         ionic_eth_emu_register_rx_filter(dev->ionic_emu, NULL, NULL);
         uet_engine_destroy(dev->uet_engine);
         dev->uet_engine = NULL;
+#ifdef ERNIC_HAVE_UET_DPDK
+        uet_dpdk_close(dev);
+#endif
         free(g_uet_dma.sg);
         g_uet_dma.sg = NULL;
         return -1;
@@ -761,6 +901,10 @@ static void uet_engine_stop(rocm_ernic_dev_t *dev)
     ionic_eth_emu_register_rx_filter(dev->ionic_emu, NULL, NULL);
     uet_engine_destroy(dev->uet_engine);
     dev->uet_engine = NULL;
+#ifdef ERNIC_HAVE_UET_DPDK
+    /* After the engine, which holds frames in the port's mbufs. */
+    uet_dpdk_close(dev);
+#endif
     free(g_uet_dma.sg);
     g_uet_dma.sg = NULL;
 }
@@ -770,6 +914,10 @@ static void uet_engine_stop(rocm_ernic_dev_t *dev)
 static void uet_engine_service(rocm_ernic_dev_t *dev)
 {
 #ifdef ERNIC_HAVE_UET
+#ifdef ERNIC_HAVE_UET_DPDK
+    if (dev->uet_engine && g_uet_dpdk)
+        (void)uet_wire_dpdk_poll(g_uet_dpdk, uet_dpdk_rx, dev, 64);
+#endif
     if (dev->uet_engine)
         uet_engine_poll(dev->uet_engine);
 #else

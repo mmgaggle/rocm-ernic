@@ -342,6 +342,39 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
             return false;
         }
         cfg->ipproto = (uint8_t)v;
+    } else if (strcmp(key, "wire") == 0) {
+        if (strcmp(val, "tap") == 0) {
+            cfg->wire = UET_ENGINE_WIRE_TAP;
+        } else if (strcmp(val, "dpdk") == 0) {
+            cfg->wire = UET_ENGINE_WIRE_DPDK;
+        } else {
+            set_err(err, errlen, "wire must be tap or dpdk (got '%s')", val);
+            return false;
+        }
+    } else if (strcmp(key, "dpdk-dev") == 0 || strcmp(key, "dpdk-dma") == 0 ||
+               strcmp(key, "dpdk-eal") == 0) {
+        bool eal = strcmp(key, "dpdk-eal") == 0;
+        char *dst = eal                            ? cfg->dpdk_eal
+                    : strcmp(key, "dpdk-dev") == 0 ? cfg->dpdk_dev
+                                                   : cfg->dpdk_dma;
+        /* ';' cannot be confused with the option separator: it stands for
+         * ',' in devargs and for ' ' between EAL arguments. */
+        char sub = eal ? ' ' : ',';
+        size_t n = strlen(val);
+
+        if (n == 0 || n >= UET_ENGINE_DPDK_ARG_MAX) {
+            set_err(err, errlen, "%s must be 1..%u characters", key,
+                    UET_ENGINE_DPDK_ARG_MAX - 1u);
+            return false;
+        }
+        for (size_t i = 0; i <= n; i++)
+            dst[i] = val[i] == ';' ? sub : val[i];
+    } else if (strcmp(key, "dpdk-queues") == 0) {
+        if (!parse_u32_range(val, 1, 16, &v)) {
+            set_err(err, errlen, "dpdk-queues must be 1..16 (got '%s')", val);
+            return false;
+        }
+        cfg->dpdk_queues = (uint16_t)v;
     } else if (strcmp(key, "payload") == 0) {
         if (!parse_u32_range(val, UET_PAYLOAD_MTU_MIN, UET_PAYLOAD_MTU_MAX,
                              &v) ||
@@ -395,6 +428,10 @@ bool uet_engine_cfg_parse(struct uet_engine_cfg *cfg, const char *opts,
         set_err(err, errlen, "sec= needs pds=pds");
         return false;
     }
+    if (cfg->wire == UET_ENGINE_WIRE_DPDK && cfg->dpdk_dev[0] == '\0') {
+        set_err(err, errlen, "wire=dpdk needs dpdk-dev=");
+        return false;
+    }
     /* With an explicit mtu=, an explicit payload= has to fit it; the
      * wire's own MTU is only known once the engine starts. */
     if (cfg->mtu != 0 && cfg->payload != 0 &&
@@ -422,6 +459,11 @@ static void engine_mac(const struct uet_engine_cfg *cfg, uint8_t mac[6])
     mac[3] = (uint8_t)(cfg->ip >> 16);
     mac[4] = (uint8_t)(cfg->ip >> 8);
     mac[5] = (uint8_t)cfg->ip;
+}
+
+void uet_engine_cfg_mac(const struct uet_engine_cfg *cfg, uint8_t mac[6])
+{
+    engine_mac(cfg, mac);
 }
 
 static const char *pds_name(enum uet_engine_pds pds)
@@ -687,17 +729,23 @@ void uet_engine_identity(const struct uet_engine *e, struct uet_engine_cfg *out)
 void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len)
 {
     struct uet_engine_cfg id;
-    size_t n;
+    char cfg[256];
 
     if (e == NULL || buf == NULL || len == 0)
         return;
     uet_engine_identity(e, &id);
-    uet_engine_cfg_describe(&id, buf, len);
-    n = strlen(buf);
-    if (n < len)
-        snprintf(buf + n, len - n, " ack every %u bytes%s",
-                 (unsigned)e->wire_info.ack_gen_trigger,
-                 e->wire_info.tx_zero_copy ? " zero-copy tx" : "");
+    uet_engine_cfg_describe(&id, cfg, sizeof(cfg));
+
+    /* Composed in a buffer that holds it all, then cut to fit. */
+    char out[sizeof(cfg) + 64];
+    snprintf(out, sizeof(out), "%s ack every %u bytes%s", cfg,
+             (unsigned)e->wire_info.ack_gen_trigger,
+             e->wire_info.tx_zero_copy ? " zero-copy tx" : "");
+    size_t n = strlen(out);
+    if (n >= len)
+        n = len - 1;
+    memcpy(buf, out, n);
+    buf[n] = '\0';
 }
 
 struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
@@ -909,6 +957,14 @@ void uet_engine_destroy(struct uet_engine *e)
 bool uet_engine_rx_frame(struct uet_engine *e, const void *frame, size_t len)
 {
     return e != NULL && uet_nic_ernic_rx_frame(e->nic, frame, len);
+}
+
+bool uet_engine_rx_frame_ext(struct uet_engine *e, const void *frame,
+                             size_t len, bool csum_ok,
+                             void (*release)(void *cookie), void *cookie)
+{
+    return e != NULL && uet_nic_ernic_rx_frame_ext(e->nic, frame, len, csum_ok,
+                                                   release, cookie);
 }
 
 /* Target-side completions carry nothing the engine reports (there are no
@@ -1318,6 +1374,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
     *out = e->stats;
     uet_nic_ernic_get_stats(e->nic, &ns);
     out->rx_frames = ns.rx_frames;
+    out->rx_frames_ext = ns.rx_frames_ext;
     out->rx_dropped = ns.rx_dropped;
     out->tx_frames = ns.tx_frames;
     out->tx_frames_iov = ns.tx_frames_iov;

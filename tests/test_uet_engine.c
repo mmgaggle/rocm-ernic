@@ -118,49 +118,54 @@ struct test_case {
 
 static const struct test_case cases[] = {
     {"rudi-1MiB", "RUDI write into an IDEMPOTENT_SAFE window", true,
-     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false},
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     {"rud-1MiB", "the same write over RUD", false, UET_ENGINE_SEC_NONE, 0, 0,
-     20, 10, false, false, false},
+     20, 10, false, false, false, UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     {"rud-drop500", "RUD with UET_PKT_DROP_THRESH=500 (5% of PDS transmits)",
-     false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false},
+     false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     {"tss-cluster-rud", "RUD with UET_SEC_MODE=cluster", false,
-     UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true},
+     UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     /* RUDI has no window: the whole megabyte (1024 packets) is encrypted
      * and sent when the write is posted.  The provider's AES-GCM and
      * per-packet CMAC KDF run in software, so the timeout has to outlast a
      * full window or the initiator re-encrypts everything before it ever
      * reads a response. */
     {"tss-cluster-rudi", "RUDI with UET_SEC_MODE=cluster", true,
-     UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true},
+     UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     {"rudi-wireloss2pct",
      "RUDI with 2% loss on the wire (UET_PKT_DROP_THRESH does not reach "
      "RUDI)",
-     true, UET_ENGINE_SEC_NONE, 0, 20, 20, 30, true, true, false},
+     true, UET_ENGINE_SEC_NONE, 0, 20, 20, 30, true, true, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
     /* UET directly over IP, as before UDP became the default. */
     {"rudi-1MiB-ip", "RUDI with encap=ip (IP protocol 253)", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_IP,
-     0},
+     0, UET_ENGINE_PDS_FULL},
     {"rud-1MiB-ip", "RUD with encap=ip", false, UET_ENGINE_SEC_NONE, 0, 0, 20,
-     10, false, false, false, UET_ENGINE_ENCAP_IP, 0},
+     10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL},
     {"tss-cluster-rud-ip", "RUD with UET_SEC_MODE=cluster and encap=ip", false,
      UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true,
-     UET_ENGINE_ENCAP_IP, 0},
+     UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL},
     /* Jumbo frames: an MTU of 9000 gives a Payload MTU of 8192, so the
      * megabyte is 128 packets. */
     {"rudi-jumbo", "RUDI at mtu=9000 (8 KiB payloads)", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
-     UET_ENGINE_ENCAP_UDP, 9000},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
     {"rud-jumbo", "RUD at mtu=9000", false, UET_ENGINE_SEC_NONE, 0, 0, 20, 10,
-     false, false, false, UET_ENGINE_ENCAP_UDP, 9000},
+     false, false, false, UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
     {"rud-jumbo-ip", "RUD at mtu=9000 with encap=ip", false,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
-     UET_ENGINE_ENCAP_IP, 9000},
+     UET_ENGINE_ENCAP_IP, 9000, UET_ENGINE_PDS_FULL},
     {"tss-cluster-rudi-jumbo", "RUDI with UET_SEC_MODE=cluster at mtu=9000",
      true, UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true,
-     UET_ENGINE_ENCAP_UDP, 9000},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
     {"rud-drop500-jumbo", "RUD with 5% of PDS transmits dropped at mtu=9000",
      false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false,
-     UET_ENGINE_ENCAP_UDP, 9000},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
     /* The provider's stop-and-go PDS (pds=sng) builds its own frames. */
     {"sng-1MiB", "the write over the stop-and-go PDS", false,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
@@ -458,8 +463,12 @@ static int wire_tx_iov(void *ctx, const struct iovec *iov, unsigned cnt,
         return 0;
     }
 
+    struct iovec v[16];
+    if (cnt > sizeof(v) / sizeof(v[0]))
+        return -EINVAL;
+    memcpy(v, iov, cnt * sizeof(v[0]));
     memset(&msg, 0, sizeof(msg));
-    msg.msg_iov = (struct iovec *)iov;
+    msg.msg_iov = v;
     msg.msg_iovlen = cnt;
     if (sendmsg(n->wire_fd, &msg, MSG_DONTWAIT) < 0) {
         if (errno == EAGAIN || errno == ENOBUFS) {

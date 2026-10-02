@@ -66,7 +66,10 @@ struct neigh {
 
 struct rx_slot {
     size_t len;
-    uint8_t *data;
+    uint8_t *data;      /* the slot's own copy */
+    const uint8_t *ext; /* or the wire's buffer, released once read */
+    void (*release)(void *cookie);
+    void *cookie;
 };
 
 struct uet_nic_ernic {
@@ -396,6 +399,16 @@ static int shim_rx_poll(struct uet_nic *nic)
     return (n != NULL && n->rx_count > 0) ? 1 : 0;
 }
 
+/* Give a wire's buffer back once the frame in it has been read. */
+static void slot_release(struct rx_slot *s)
+{
+    if (s->ext != NULL && s->release != NULL)
+        s->release(s->cookie);
+    s->ext = NULL;
+    s->release = NULL;
+    s->cookie = NULL;
+}
+
 static int shim_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
                        size_t *rx_pkt_size)
 {
@@ -412,11 +425,13 @@ static int shim_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
      * was queued, so this only trips if it ever stops doing that. */
     if (s->len > pkt_buf_size || s->len < nic->min_pkt_size) {
         n->stats.rx_dropped++;
+        slot_release(s);
         return 0;
     }
 
-    memcpy(pkt, s->data, s->len);
+    memcpy(pkt, s->ext != NULL ? s->ext : s->data, s->len);
     *rx_pkt_size = s->len;
+    slot_release(s);
     return 1;
 }
 
@@ -529,6 +544,8 @@ void uet_nic_ernic_destroy(struct uet_nic_ernic *n)
 {
     if (n == NULL)
         return;
+    for (unsigned i = 0; i < n->rx_count; i++)
+        slot_release(&n->slots[(n->rx_head + i) % RX_SLOTS]);
     free(n->slot_mem);
     free(n);
 }
@@ -545,17 +562,27 @@ void uet_nic_ernic_unregister(void)
     (void)uet_nic_register_shim(NULL, NULL);
 }
 
-bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
-                            size_t len)
+/*
+ * The filter.  @ext is NULL for a frame to copy into a slot; otherwise the
+ * slot keeps the wire's buffer, and @release(@cookie) gives it back once
+ * the frame has been read or dropped.  @csum_ok: the wire has checked the
+ * IPv4 header checksum.
+ */
+static bool rx_frame(struct uet_nic_ernic *n, const uint8_t *f, size_t len,
+                     bool ext, bool csum_ok, void (*release)(void *),
+                     void *cookie)
 {
-    const uint8_t *f = frame;
-
     if (n == NULL || f == NULL || len < ETH_HLEN_)
         return false;
 
     uint16_t ethertype = rd16(f + 12);
-    if (ethertype == ETHERTYPE_ARP_)
-        return handle_arp(n, f, len);
+    if (ethertype == ETHERTYPE_ARP_) {
+        bool mine = handle_arp(n, f, len);
+
+        if (mine && ext && release != NULL)
+            release(cookie);
+        return mine;
+    }
     if (ethertype != ETHERTYPE_IPV4_ || len < ETH_HLEN_ + IPV4_MIN_HLEN)
         return false;
 
@@ -591,24 +618,48 @@ bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
     size_t tot_len = rd16(ip + 2);
     if (ihl != IPV4_MIN_HLEN || (rd16(ip + 6) & 0x3fffu) != 0 ||
         tot_len < IPV4_MIN_HLEN + (udp ? UDP_HLEN : 0u) ||
-        ETH_HLEN_ + tot_len > len || !ipv4_csum_ok(ip, ihl) ||
+        ETH_HLEN_ + tot_len > len || (!csum_ok && !ipv4_csum_ok(ip, ihl)) ||
         (udp && rd16(ip + ihl + 4) != tot_len - ihl)) {
         n->stats.rx_dropped++;
+        if (ext && release != NULL)
+            release(cookie);
         return true;
     }
     len = ETH_HLEN_ + tot_len;
 
     if (len > n->slot_size || n->rx_count == RX_SLOTS) {
         n->stats.rx_dropped++;
+        if (ext && release != NULL)
+            release(cookie);
         return true;
     }
 
     struct rx_slot *s = &n->slots[(n->rx_head + n->rx_count) % RX_SLOTS];
-    memcpy(s->data, f, len);
+    if (ext) {
+        s->ext = f;
+        s->release = release;
+        s->cookie = cookie;
+        n->stats.rx_frames_ext++;
+    } else {
+        memcpy(s->data, f, len);
+    }
     s->len = len;
     n->rx_count++;
     n->stats.rx_frames++;
     return true;
+}
+
+bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
+                            size_t len)
+{
+    return rx_frame(n, frame, len, false, false, NULL, NULL);
+}
+
+bool uet_nic_ernic_rx_frame_ext(struct uet_nic_ernic *n, const void *frame,
+                                size_t len, bool csum_ok,
+                                void (*release)(void *cookie), void *cookie)
+{
+    return rx_frame(n, frame, len, true, csum_ok, release, cookie);
 }
 
 bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n)

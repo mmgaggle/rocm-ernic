@@ -311,6 +311,10 @@ struct ionic_eth_emu {
     /* In-process endpoint offered every wire Rx frame before the guest. */
     ionic_eth_rx_filter_fn rx_filter;
     void *rx_filter_ctx;
+    /* A wire other than the TAP (the UET engine's DPDK port), for the
+     * guest's frames when there is no TAP. */
+    ionic_eth_wire_tx_fn wire_tx;
+    void *wire_tx_ctx;
     /* Staging buffer for one frame in either direction. */
     uint8_t frame[IONIC_ETH_NET_MTU_MAX];
 
@@ -1528,7 +1532,7 @@ static void eth_txq_service(struct ionic_eth_emu *emu, uint32_t qid,
     q->prod = prod;
 
     for (unsigned n = 0; q->head != prod && n < q->depth; n++) {
-        if (emu->net || emu->tx_filter) {
+        if (emu->net || emu->tx_filter || emu->wire_tx) {
             size_t len = eth_tx_gather(emu, q, q->head);
             if (len) {
                 bool taken =
@@ -1536,6 +1540,8 @@ static void eth_txq_service(struct ionic_eth_emu *emu, uint32_t qid,
                     emu->tx_filter(emu->tx_filter_ctx, emu->frame, len);
                 if (!taken && emu->net) {
                     ionic_eth_net_send(emu->net, emu->frame, len);
+                } else if (!taken && emu->wire_tx) {
+                    (void)emu->wire_tx(emu->wire_tx_ctx, emu->frame, len);
                 }
                 pvrdma_eth_bytes_count(emu->pvrdma_handle, len, true);
             }
@@ -1689,6 +1695,37 @@ static void eth_poll_rx(struct ionic_eth_emu *emu, bool guest_attached)
 
     if (delivered)
         ionic_eth_emu_trigger_irq(emu, q->intr_index);
+}
+
+void ionic_eth_emu_set_wire_tx(struct ionic_eth_emu *emu,
+                               ionic_eth_wire_tx_fn fn, void *ctx)
+{
+    emu->wire_tx = fn;
+    emu->wire_tx_ctx = ctx;
+}
+
+bool ionic_eth_emu_has_tap(const struct ionic_eth_emu *emu)
+{
+    return emu != NULL && emu->net != NULL;
+}
+
+int ionic_eth_emu_wire_input(struct ionic_eth_emu *emu, const void *frame,
+                             size_t len)
+{
+    if (!emu || !frame || len == 0 || len > sizeof(emu->frame))
+        return -EINVAL;
+
+    struct eth_queue *q = &emu->eth_q[IONIC_QTYPE_RXQ][0];
+    if (!q->valid)
+        return -ENOBUFS;
+
+    memcpy(emu->frame, frame, len);
+    int rc = eth_rx_deliver(emu, q, emu->frame, len);
+    if (rc == 0) {
+        pvrdma_eth_bytes_count(emu->pvrdma_handle, (uint64_t)len, false);
+        ionic_eth_emu_trigger_irq(emu, q->intr_index);
+    }
+    return rc;
 }
 
 void ionic_eth_emu_poll_rx(struct ionic_eth_emu *emu)

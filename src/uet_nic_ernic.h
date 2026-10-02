@@ -67,6 +67,7 @@ struct uet_nic_ernic_cfg {
 
 struct uet_nic_ernic_stats {
     uint64_t rx_frames;     /* UET frames queued for the provider */
+    uint64_t rx_frames_ext; /* of which left in the wire's buffer */
     uint64_t rx_dropped;    /* UET frames dropped: queue full or too big */
     uint64_t tx_frames;     /* frames the provider transmitted */
     uint64_t tx_frames_iov; /* of which in pieces, payload in place */
@@ -105,6 +106,18 @@ void uet_nic_ernic_unregister(void);
  */
 bool uet_nic_ernic_rx_frame(struct uet_nic_ernic *n, const void *frame,
                             size_t len);
+
+/*
+ * The same for a frame left in the wire's buffer: when it returns true the
+ * shim owns the buffer and calls @release(@cookie) once it is done with it
+ * (at once, for ARP or a frame it drops), so the frame is copied once, into
+ * the provider's buffer, instead of twice.  @csum_ok says the wire checked
+ * the IPv4 header checksum, which the filter then does not.  When it
+ * returns false the caller keeps the buffer.
+ */
+bool uet_nic_ernic_rx_frame_ext(struct uet_nic_ernic *n, const void *frame,
+                                size_t len, bool csum_ok,
+                                void (*release)(void *cookie), void *cookie);
 
 /* True while received frames are waiting for the provider to poll them. */
 bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n);

@@ -545,6 +545,26 @@ if(ERNIC_UET)
     target_link_options(test_uet_engine PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
     ernic_uet_link(test_uet_engine)
 
+    # The DPDK wire (-DERNIC_UET_DPDK=ON): two engines on net_memif ports,
+    # no privileges, no hugepages. Not sanitized: the EAL and its PMDs are
+    # not built for it.
+    if(ERNIC_UET_DPDK)
+        add_executable(test_uet_dpdk
+            test_uet_dpdk.c
+            ${CMAKE_SOURCE_DIR}/src/uet_engine.c
+            ${CMAKE_SOURCE_DIR}/src/uet_nic_ernic.c
+            ${CMAKE_SOURCE_DIR}/src/uet_wire_dpdk.c
+        )
+        set_source_files_properties(${CMAKE_SOURCE_DIR}/src/uet_wire_dpdk.c
+            PROPERTIES COMPILE_OPTIONS
+            "${DPDK_CFLAGS_OTHER};-DALLOW_EXPERIMENTAL_API")
+        target_include_directories(test_uet_dpdk PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+        )
+        target_compile_definitions(test_uet_dpdk PRIVATE _GNU_SOURCE)
+        ernic_uet_link(test_uet_dpdk)
+    endif()
+
     # The command channel end to end: it #includes ionic_datapath.c, as
     # test_ionic_cq_arm does, and stands a byte array in for guest memory
     # behind fake vfio-user DMA calls, so the capsules really travel
@@ -650,6 +670,9 @@ set(ERNIC_TEST_TARGETS
 if(ERNIC_UET)
     list(APPEND ERNIC_TEST_TARGETS
         test_uet_engine test_uet_datapath uet_fake_device)
+    if(ERNIC_UET_DPDK)
+        list(APPEND ERNIC_TEST_TARGETS test_uet_dpdk)
+    endif()
     if(LIBFABRIC_FOUND)
         list(APPEND ERNIC_TEST_TARGETS test_libuet_ernic)
     endif()
@@ -913,6 +936,16 @@ if(ERNIC_UET)
         COMMAND $<TARGET_FILE:test_uet_engine>
     )
     set_tests_properties(uet-engine-unit PROPERTIES TIMEOUT 600)
+
+    if(ERNIC_UET_DPDK)
+        # The DPDK wire: RUDI and RUD at mtu 9000 and 1500, in both
+        # encapsulations, one case placing payload with dma_skeleton.
+        add_test(
+            NAME uet-dpdk-unit
+            COMMAND $<TARGET_FILE:test_uet_dpdk>
+        )
+        set_tests_properties(uet-dpdk-unit PROPERTIES TIMEOUT 900)
+    endif()
 
     # UET engine, phase 2: the guest command channel through ionic rings,
     # MR and QP destruction with transfers in flight, and a remote window
