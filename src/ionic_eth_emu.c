@@ -505,6 +505,16 @@ int ionic_eth_emu_wire_send(struct ionic_eth_emu *emu, const void *frame,
     return ionic_eth_net_send(emu->net, frame, len);
 }
 
+int ionic_eth_emu_wire_sendv(struct ionic_eth_emu *emu, const struct iovec *iov,
+                             unsigned n, size_t len)
+{
+    if (!emu || !iov || len == 0 || len > IONIC_ETH_NET_MTU_MAX)
+        return -EINVAL;
+    if (!emu->net)
+        return -ENETDOWN;
+    return ionic_eth_net_sendv(emu->net, iov, n, len);
+}
+
 void ionic_eth_emu_register_adminq(struct ionic_eth_emu *emu,
                                    struct ionic_adminq_ctx *adminq)
 {

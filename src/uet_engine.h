@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/uio.h>
 
 #define UET_ENGINE_MAX_PEERS 32u
 #define UET_ENGINE_MAX_MRS   256u
@@ -107,10 +108,28 @@ bool uet_engine_cfg_parse(struct uet_engine_cfg *cfg, const char *opts,
 void uet_engine_cfg_describe(const struct uet_engine_cfg *cfg, char *buf,
                              size_t len);
 
-/* Where the engine's frames go.  Returns 0 or a negative errno. */
+/*
+ * Where the engine's frames go.  tx() returns 0 or a negative errno.
+ *
+ * tx_iov(), when there is one, takes a frame in pieces so a payload need
+ * not be copied into it: iov[0] is the headers and iov[n - 1] the CRC,
+ * valid only for the call; the pieces between are payload in region
+ * memory, which stays readable and unchanged until the operation
+ * completes, so a wire may transmit from them after it returns.  It
+ * returns -ENOTSUP for a frame it cannot take that way.
+ *
+ * flush(), when there is one, is called at the end of every
+ * uet_engine_poll() for a wire that batches what it is given.
+ *
+ * tx_ipv4_csum says the wire fills in the IPv4 header checksum of every
+ * frame, so the engine leaves it 0.
+ */
 struct uet_engine_wire {
     int (*tx)(void *ctx, const void *frame, size_t len);
+    int (*tx_iov)(void *ctx, const struct iovec *iov, unsigned n, size_t len);
+    void (*flush)(void *ctx);
     void *ctx;
+    bool tx_ipv4_csum;
 };
 
 /*
@@ -122,6 +141,9 @@ struct uet_engine_wire {
  */
 struct uet_engine_dma {
     void *(*map)(void *ctx, uint64_t addr, size_t len, bool write);
+    /* Optional: place received payload at @dst, a pointer map() returned,
+     * with a copy engine; 0 or a negative errno.  NULL: memcpy(). */
+    int (*copy)(void *ctx, void *dst, const void *src, size_t len);
     void *ctx;
 };
 
@@ -254,6 +276,7 @@ struct uet_engine_stats {
     uint64_t rx_frames;
     uint64_t rx_dropped;
     uint64_t tx_frames;
+    uint64_t tx_frames_iov; /* of which with the payload left in place */
     uint64_t tx_dropped;
     uint64_t arp_requests;
     uint64_t arp_replies;

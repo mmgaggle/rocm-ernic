@@ -287,8 +287,9 @@ struct node {
     int wire_fd;
     int ctl_fd;
     struct wire_count tx;
-    uint64_t wire_full; /* frames the socket would not take */
-    uint64_t wire_lost; /* frames this test dropped on purpose */
+    uint64_t wire_full;     /* frames the socket would not take */
+    uint64_t tx_iov_frames; /* frames sent in pieces, payload in place */
+    uint64_t wire_lost;     /* frames this test dropped on purpose */
     uint64_t rx_unclaimed;
     uint64_t rng;
     uint8_t probe[PROBE_LEN];
@@ -428,6 +429,48 @@ static int wire_tx(void *ctx, const void *frame, size_t len)
     return 0;
 }
 
+/* A frame in pieces, the payload still in guest memory: dissected from a
+ * gathered copy, and sent with one sendmsg() as a TAP takes one writev(). */
+static int wire_tx_iov(void *ctx, const struct iovec *iov, unsigned cnt,
+                       size_t len)
+{
+    struct node *n = ctx;
+    uint8_t f[9216];
+    size_t off = 0;
+    struct msghdr msg;
+
+    if (len > sizeof(f))
+        return -EMSGSIZE;
+    for (unsigned i = 0; i < cnt; i++) {
+        if (iov[i].iov_len > len - off)
+            return -EINVAL;
+        memcpy(f + off, iov[i].iov_base, iov[i].iov_len);
+        off += iov[i].iov_len;
+    }
+    if (off != len)
+        return -EINVAL;
+    classify(n, f, len);
+    n->tx_iov_frames++;
+
+    if (n->tc->wire_loss_pm != 0 &&
+        xorshift(&n->rng) % 1000u < n->tc->wire_loss_pm) {
+        n->wire_lost++;
+        return 0;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = (struct iovec *)iov;
+    msg.msg_iovlen = cnt;
+    if (sendmsg(n->wire_fd, &msg, MSG_DONTWAIT) < 0) {
+        if (errno == EAGAIN || errno == ENOBUFS) {
+            n->wire_full++;
+            return -EAGAIN;
+        }
+        return -errno;
+    }
+    return 0;
+}
+
 static double now_ms(void)
 {
     struct timespec ts;
@@ -546,7 +589,8 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
     cfg.mtu = n->tc->mtu;
     cfg.pds = n->tc->pds;
 
-    struct uet_engine_wire wire = {.tx = wire_tx, .ctx = n};
+    struct uet_engine_wire wire = {
+        .tx = wire_tx, .tx_iov = wire_tx_iov, .ctx = n};
     struct uet_engine_dma dma = {.map = guest_map, .ctx = &n->g};
 
     n->e = uet_engine_create(&cfg, &wire, &dma, err, sizeof(err));
@@ -880,13 +924,13 @@ static void print_side(const char *role, const struct report *r)
                t->rud_req, t->rudi_req, t->rudi_resp, t->ack, t->nack, t->ctrl,
                t->retx, t->ar);
     printf("\n");
-    printf("            engine rx %" PRIu64 " tx %" PRIu64
-           " (wire full %" PRIu64 ", test loss %" PRIu64 "), ARP req %" PRIu64
-           " rep %" PRIu64 "; DMA maps read %" PRIu64 " write %" PRIu64
-           " faults %" PRIu64 "\n",
-           r->st.rx_frames, r->st.tx_frames, r->wire_full, r->wire_lost,
-           r->st.arp_requests, r->st.arp_replies, r->st.dma_read_maps,
-           r->st.dma_write_maps, r->st.dma_faults);
+    printf("            engine rx %" PRIu64 " tx %" PRIu64 " (%" PRIu64
+           " with the payload in place; wire full %" PRIu64
+           ", test loss %" PRIu64 "), ARP req %" PRIu64 " rep %" PRIu64
+           "; DMA maps read %" PRIu64 " write %" PRIu64 " faults %" PRIu64 "\n",
+           r->st.rx_frames, r->st.tx_frames, r->st.tx_frames_iov, r->wire_full,
+           r->wire_lost, r->st.arp_requests, r->st.arp_replies,
+           r->st.dma_read_maps, r->st.dma_write_maps, r->st.dma_faults);
 }
 
 /* What the wire has to show for the case to count. */

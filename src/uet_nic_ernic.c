@@ -77,7 +77,9 @@ struct uet_nic_ernic {
     uint8_t ipproto;
     char name[IFNAMSIZ];
     uet_nic_ernic_tx_fn tx;
+    uet_nic_ernic_tx_iov_fn tx_iov;
     void *tx_ctx;
+    bool tx_ipv4_csum;
 
     size_t slot_size; /* largest frame the queue holds */
     uint8_t *slot_mem;
@@ -309,6 +311,11 @@ static int shim_initialize(struct uet_nic *nic)
     nic->max_pkt_size = (size_t)n->mtu + ETH_HLEN_;
     nic->sock_fd = -1;
 
+    /* The wire may fill in IPv4 header checksums; and the filter checks
+     * them on every frame it queues, so the provider need not. */
+    nic->tx_ipv4_csum = n->tx_ipv4_csum;
+    nic->rx_ipv4_csum = true;
+
     return 0;
 }
 
@@ -351,6 +358,34 @@ static int shim_tx_pkt(struct uet_nic *nic, void *pkt, void *iphdr,
     }
 
     n->stats.tx_frames++;
+    return 0;
+}
+
+static int shim_tx_pkt_iov(struct uet_nic *nic, const struct iovec *iov,
+                           int iovcnt, size_t pkt_size)
+{
+    struct uet_nic_ernic *n = shim_of(nic);
+
+    if (n == NULL)
+        return -ENODEV;
+    if (n->tx_iov == NULL || iovcnt < 2)
+        return -ENOTSUP;
+
+    if (pkt_size > (size_t)n->mtu + ETH_HLEN_) {
+        n->stats.tx_dropped++;
+        return -EMSGSIZE;
+    }
+
+    int rc = n->tx_iov(n->tx_ctx, iov, (unsigned)iovcnt, pkt_size);
+    if (rc == -ENOTSUP)
+        return rc;
+    if (rc < 0) {
+        n->stats.tx_dropped++;
+        return (rc == -EAGAIN || rc == -ENOBUFS) ? 0 : rc;
+    }
+
+    n->stats.tx_frames++;
+    n->stats.tx_frames_iov++;
     return 0;
 }
 
@@ -450,6 +485,7 @@ static const struct uet_nic_shim_ops shim_ops = {
     .nic_rx_pkt = shim_rx_pkt,
     .nic_rx_poll = shim_rx_poll,
     .nic_resolve_nh = shim_resolve_nh,
+    .nic_tx_pkt_iov = shim_tx_pkt_iov,
 };
 
 /* ------------------------------------------------------------------ */
@@ -473,7 +509,9 @@ struct uet_nic_ernic *uet_nic_ernic_create(const struct uet_nic_ernic_cfg *cfg)
     snprintf(n->name, sizeof(n->name), "%s",
              cfg->name != NULL ? cfg->name : "ernic-uet");
     n->tx = cfg->tx;
+    n->tx_iov = cfg->tx_iov;
     n->tx_ctx = cfg->tx_ctx;
+    n->tx_ipv4_csum = cfg->tx_ipv4_csum;
 
     n->slot_size = (size_t)cfg->mtu + ETH_HLEN_;
     n->slot_mem = calloc(RX_SLOTS, n->slot_size);

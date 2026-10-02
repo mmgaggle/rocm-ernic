@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 /* Largest frame we will move in either direction (jumbo + VLAN + slack). */
 #define IONIC_ETH_NET_MTU_MAX 9600
@@ -33,6 +34,11 @@ void ionic_eth_net_close(struct ionic_eth_net *net);
 /* Transmit one Ethernet frame.  Returns 0 on success, negative errno else. */
 int ionic_eth_net_send(struct ionic_eth_net *net, const void *frame,
                        size_t len);
+
+/* Transmit one Ethernet frame given as pieces (writev); @len is their sum.
+ * Returns 0 on success, negative errno else. */
+int ionic_eth_net_sendv(struct ionic_eth_net *net, const struct iovec *iov,
+                        unsigned n, size_t len);
 
 /*
  * Receive one Ethernet frame without blocking.  Returns the frame length,

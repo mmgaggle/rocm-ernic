@@ -110,6 +110,15 @@ ssize_t ionic_eth_net_recv(struct ionic_eth_net *net, void *buf, size_t cap)
     (void)cap;
     return 0;
 }
+int ionic_eth_net_sendv(struct ionic_eth_net *net, const struct iovec *iov,
+                        unsigned n, size_t len)
+{
+    (void)net;
+    (void)iov;
+    (void)n;
+    (void)len;
+    return 0;
+}
 int ionic_eth_net_mtu(const struct ionic_eth_net *net)
 {
     (void)net;

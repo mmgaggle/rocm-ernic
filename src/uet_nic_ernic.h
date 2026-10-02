@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/uio.h>
 
 /* Name the shim registers under, and the value of UET_NIC_SHIM for it. */
 #define UET_NIC_ERNIC_NAME "ernic"
@@ -46,6 +47,11 @@ struct uet_nic_ernic;
  */
 typedef int (*uet_nic_ernic_tx_fn)(void *ctx, const void *frame, size_t len);
 
+/* The same for a frame in pieces (see struct uet_engine_wire); NULL when
+ * the wire takes flat frames only. */
+typedef int (*uet_nic_ernic_tx_iov_fn)(void *ctx, const struct iovec *iov,
+                                       unsigned n, size_t len);
+
 struct uet_nic_ernic_cfg {
     uint32_t ip;            /* the engine's IPv4 address, host order */
     uint8_t mac[6];         /* the engine's MAC address */
@@ -54,18 +60,21 @@ struct uet_nic_ernic_cfg {
     uint8_t ipproto;        /* UET over IP: protocol, 0: 253 */
     const char *name;       /* interface name the provider reports */
     uet_nic_ernic_tx_fn tx; /* where transmitted frames go */
+    uet_nic_ernic_tx_iov_fn tx_iov;
     void *tx_ctx;
+    bool tx_ipv4_csum; /* the wire fills in IPv4 header checksums */
 };
 
 struct uet_nic_ernic_stats {
-    uint64_t rx_frames;    /* UET frames queued for the provider */
-    uint64_t rx_dropped;   /* UET frames dropped: queue full or too big */
-    uint64_t tx_frames;    /* frames the provider transmitted */
-    uint64_t tx_dropped;   /* frames the wire would not take */
-    uint64_t arp_requests; /* ARP requests sent to resolve a next hop */
-    uint64_t arp_replies;  /* ARP replies sent for the engine's address */
-    uint64_t arp_learned;  /* neighbors learned or refreshed from ARP */
-    uint64_t nh_pending;   /* resolutions answered with -EAGAIN */
+    uint64_t rx_frames;     /* UET frames queued for the provider */
+    uint64_t rx_dropped;    /* UET frames dropped: queue full or too big */
+    uint64_t tx_frames;     /* frames the provider transmitted */
+    uint64_t tx_frames_iov; /* of which in pieces, payload in place */
+    uint64_t tx_dropped;    /* frames the wire would not take */
+    uint64_t arp_requests;  /* ARP requests sent to resolve a next hop */
+    uint64_t arp_replies;   /* ARP replies sent for the engine's address */
+    uint64_t arp_learned;   /* neighbors learned or refreshed from ARP */
+    uint64_t nh_pending;    /* resolutions answered with -EAGAIN */
 };
 
 /*

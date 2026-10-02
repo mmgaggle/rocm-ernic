@@ -659,6 +659,14 @@ static int uet_wire_tx(void *ctx, const void *frame, size_t len)
     return ionic_eth_emu_wire_send(ctx, frame, len);
 }
 
+/* A frame in pieces goes to the TAP with one writev(): the kernel copies
+ * the payload straight out of guest memory. */
+static int uet_wire_tx_iov(void *ctx, const struct iovec *iov, unsigned n,
+                           size_t len)
+{
+    return ionic_eth_emu_wire_sendv(ctx, iov, n, len);
+}
+
 static bool uet_wire_rx_filter(void *ctx, const void *frame, size_t len)
 {
     return uet_engine_rx_frame(ctx, frame, len);
@@ -699,7 +707,8 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         return -1;
     }
 
-    struct uet_engine_wire wire = {.tx = uet_wire_tx, .ctx = dev->ionic_emu};
+    struct uet_engine_wire wire = {
+        .tx = uet_wire_tx, .tx_iov = uet_wire_tx_iov, .ctx = dev->ionic_emu};
     struct uet_engine_dma dma = {.map = uet_dma_vfu_map, .ctx = &g_uet_dma};
 
     dev->uet_engine = uet_engine_create(cfg, &wire, &dma, err, sizeof(err));

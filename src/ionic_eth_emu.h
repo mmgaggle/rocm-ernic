@@ -129,6 +129,10 @@ int ionic_eth_emu_wire_mtu(const struct ionic_eth_emu *emu);
 int ionic_eth_emu_wire_send(struct ionic_eth_emu *emu, const void *frame,
                             size_t len);
 
+/* The same for a frame in pieces (writev on the TAP). */
+int ionic_eth_emu_wire_sendv(struct ionic_eth_emu *emu, const struct iovec *iov,
+                             unsigned n, size_t len);
+
 /*
  * Hand a received frame to the emulated LIF from a thread that may not DMA
  * (the TCP mesh receive thread).  The frame is copied onto an internal queue

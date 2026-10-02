@@ -586,6 +586,21 @@ static int engine_wire_tx(void *ctx, const void *frame, size_t len)
     return e->wire.tx(e->wire.ctx, frame, len);
 }
 
+static int engine_wire_tx_iov(void *ctx, const struct iovec *iov, unsigned n,
+                              size_t len)
+{
+    struct uet_engine *e = ctx;
+
+    return e->wire.tx_iov(e->wire.ctx, iov, n, len);
+}
+
+static int engine_dma_copy(void *ctx, void *dst, const void *src, size_t len)
+{
+    struct uet_engine *e = ctx;
+
+    return e->dma.copy(e->dma.ctx, dst, src, len);
+}
+
 /* A read of an engine-owned page list.  Lists are never written through. */
 static void *window_map(struct uet_engine *e, uint64_t addr, size_t len,
                         bool write)
@@ -680,8 +695,9 @@ void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len)
     uet_engine_cfg_describe(&id, buf, len);
     n = strlen(buf);
     if (n < len)
-        snprintf(buf + n, len - n, " ack every %u bytes",
-                 (unsigned)e->wire_info.ack_gen_trigger);
+        snprintf(buf + n, len - n, " ack every %u bytes%s",
+                 (unsigned)e->wire_info.ack_gen_trigger,
+                 e->wire_info.tx_zero_copy ? " zero-copy tx" : "");
 }
 
 struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
@@ -727,7 +743,9 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
     ncfg.ipproto = cfg->ipproto;
     ncfg.name = "ernic-uet";
     ncfg.tx = engine_wire_tx;
+    ncfg.tx_iov = wire->tx_iov != NULL ? engine_wire_tx_iov : NULL;
     ncfg.tx_ctx = e;
+    ncfg.tx_ipv4_csum = wire->tx_ipv4_csum;
     e->nic = uet_nic_ernic_create(&ncfg);
     if (e->nic == NULL) {
         set_err(err, errlen, "cannot create the wire port");
@@ -749,6 +767,14 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
         set_err(err, errlen, "uet_initialize: %s", strerror(-rc));
         e->uet = NULL;
         goto fail;
+    }
+
+    if (e->dma.copy != NULL) {
+        rc = uet_set_dma_copy(e->uet, engine_dma_copy, e);
+        if (rc != 0) {
+            set_err(err, errlen, "uet_set_dma_copy: %s", strerror(-rc));
+            goto fail;
+        }
     }
 
     rc = uet_get_wire_info(e->uet, &e->wire_info);
@@ -940,6 +966,9 @@ void uet_engine_poll(struct uet_engine *e)
 
     drain_rx_cq(e);
     reap_closing(e);
+
+    if (e->wire.flush != NULL)
+        e->wire.flush(e->wire.ctx);
 }
 
 bool uet_engine_has_work(const struct uet_engine *e)
@@ -1186,6 +1215,10 @@ static int post_rma(struct uet_engine *e, const struct uet_engine_rma *w,
     if (rc != 0)
         return fi_to_errno(rc);
 
+    /* Posting sent the first packets; a batching wire sends them now. */
+    if (e->wire.flush != NULL)
+        e->wire.flush(e->wire.ctx);
+
     e->ops[slot].used = true;
     e->ops[slot].cookie = w->cookie;
     e->ops[slot].mr = w->mr;
@@ -1287,6 +1320,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->rx_frames = ns.rx_frames;
     out->rx_dropped = ns.rx_dropped;
     out->tx_frames = ns.tx_frames;
+    out->tx_frames_iov = ns.tx_frames_iov;
     out->tx_dropped = ns.tx_dropped;
     out->arp_requests = ns.arp_requests;
     out->arp_replies = ns.arp_replies;

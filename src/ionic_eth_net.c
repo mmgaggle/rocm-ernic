@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -127,6 +128,24 @@ int ionic_eth_net_mtu(const struct ionic_eth_net *net)
         rc = -errno;
     close(fd);
     return rc < 0 ? rc : ifr.ifr_mtu;
+}
+
+int ionic_eth_net_sendv(struct ionic_eth_net *net, const struct iovec *iov,
+                        unsigned n, size_t len)
+{
+    if (!net || net->fd < 0)
+        return -EBADF;
+    if (n == 0 || n > IOV_MAX)
+        return -EINVAL;
+
+    for (;;) {
+        ssize_t w = writev(net->fd, iov, (int)n);
+        if (w >= 0)
+            return (size_t)w == len ? 0 : -EIO;
+        if (errno == EINTR)
+            continue;
+        return -errno;
+    }
 }
 
 ssize_t ionic_eth_net_recv(struct ionic_eth_net *net, void *buf, size_t cap)
