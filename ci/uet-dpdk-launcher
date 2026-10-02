@@ -1,0 +1,72 @@
+#!/bin/bash
+# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+#
+# ci/uet-dpdk-launcher -- service/rocm-ernic-launcher for UET engines
+# on DPDK ports (docs/uet.rst, "DPDK Wire").
+#
+# Point ERNIC_LAUNCHER at this script and give ERNIC_UET a DPDK wire,
+# for example:
+#
+#   export ERNIC_LAUNCHER=$PWD/ci/uet-dpdk-launcher
+#   export ERNIC_UET='ip=192.168.200.10%i,mtu=9000,wire=dpdk,dpdk-dev=net_tap0;iface=ernic-dtap%i'
+#   bash ci/jobs/vm-up.sh
+#
+# It runs the launcher, and so every instance, as the calling user with
+# CAP_NET_ADMIN and CAP_NET_RAW, through "sudo -n setpriv": net_tap
+# creates its interface and installs its flow rules as TC filters, and
+# af_packet opens a raw socket and sets the interface's MAC.  After a
+# start it puts each instance's net_tap interface (the iface= of
+# dpdk-dev=net_tap..., with %i replaced) on the CI bridge at CI_TAP_MTU,
+# as install-runner.sh does for the TAPs.  An af_packet interface is
+# left alone: it is one end of a veth whose other end you put on the
+# bridge before the start.  The guest's own TAP stays the guest's
+# Ethernet.
+#
+# Everything else, --stop included, goes straight to the launcher.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+launcher="${here}/../service/rocm-ernic-launcher"
+bridge="${CI_TAP_BRIDGE:-ernic-ci-br0}"
+mtu="${CI_TAP_MTU:-9000}"
+instances="${ERNIC_INSTANCES:-2}"
+
+# The launcher reads its settings from the environment, which sudo does
+# not pass on; these go through env(1) instead.
+envs=()
+while IFS= read -r -d '' kv; do
+    envs+=("${kv}")
+done < <(env -0 | grep -zE '^(ERNIC_|CI_|PATH=|HOME=|USER=|LOGNAME=|XDG_RUNTIME_DIR=)' || true)
+
+sudo -n setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+    --inh-caps=+net_admin,+net_raw --ambient-caps=+net_admin,+net_raw -- \
+    env -i "${envs[@]}" "${launcher}" "$@"
+
+case " $* " in
+*" --stop "* | *" --status "*) exit 0 ;;
+esac
+
+iface_of() {
+    local spec="${ERNIC_UET//%i/$1}"
+    sed -n 's/.*\bdpdk-dev=net_tap[^,]*;iface=\([A-Za-z0-9_.-]*\).*/\1/p' \
+        <<<"${spec}"
+}
+
+for i in $(seq 1 "${instances}"); do
+    dev="$(iface_of "${i}")"
+    [ -n "${dev}" ] || continue
+    for _ in $(seq 150); do
+        [ -d "/sys/class/net/${dev}" ] && break
+        sleep 0.1
+    done
+    if [ ! -d "/sys/class/net/${dev}" ]; then
+        echo "uet-dpdk-launcher: ${dev} did not appear" >&2
+        exit 1
+    fi
+    # The MTU first: a bridge port below the bridge's MTU pulls it down.
+    sudo -n ip link set "${dev}" mtu "${mtu}"
+    sudo -n ip link set "${dev}" master "${bridge}" up
+done

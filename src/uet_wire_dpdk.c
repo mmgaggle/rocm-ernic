@@ -70,6 +70,7 @@ struct uet_wire_dpdk {
     /* what each offload ended up as, for describe() */
     bool flow_hw;
     bool flow_isolated;
+    bool flow_no_rss; /* the port has RSS, but not as a flow action */
     unsigned flow_rules;
     char flow_why[96];
     bool rss_hw;
@@ -331,7 +332,17 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
         {.type = RTE_FLOW_ACTION_TYPE_RSS, .conf = &rss},
         {.type = RTE_FLOW_ACTION_TYPE_END},
     };
-    const struct rte_flow_action *udp_act = w->rss_hw ? to_rss : to_q0;
+    /* RSS across the engine's queues when the port can do it in a flow
+     * rule; when it cannot, everything to queue 0. */
+    const struct rte_flow_action *udp_act =
+        (w->rss_hw && !w->flow_no_rss) ? to_rss : to_q0;
+    if (!create && udp_act == to_rss) {
+        memset(&fe, 0, sizeof(fe));
+        if (rte_flow_validate(w->port, &attr, udp_pat, to_rss, &fe) != 0) {
+            w->flow_no_rss = true;
+            udp_act = to_q0;
+        }
+    }
 
     struct {
         const char *what;
@@ -401,8 +412,10 @@ static int port_setup(struct uet_wire_dpdk *w, char *err, size_t errlen)
         uint64_t want = RTE_ETH_RSS_NONFRAG_IPV4_UDP | RTE_ETH_RSS_L4_SRC_ONLY;
 
         if (di.flow_type_rss_offloads & RTE_ETH_RSS_NONFRAG_IPV4_UDP) {
-            w->rss_hf =
-                want & (di.flow_type_rss_offloads | RTE_ETH_RSS_L4_SRC_ONLY);
+            /* The source port alone is the entropy; a port that cannot
+             * hash on it alone hashes the 4-tuple, which spreads the same
+             * flows. */
+            w->rss_hf = want & di.flow_type_rss_offloads;
             conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
             conf.rx_adv_conf.rss_conf.rss_hf = w->rss_hf;
             w->rss_hw = true;
@@ -451,8 +464,11 @@ static int port_setup(struct uet_wire_dpdk *w, char *err, size_t errlen)
     /* Buffers: a whole jumbo frame per mbuf.  Pool sizes: the rings, the
      * engine's receive queue (it holds frames until the provider reads
      * them) and a few bursts. */
-    room = frame < RTE_MBUF_DEFAULT_DATAROOM ? RTE_MBUF_DEFAULT_DATAROOM
-                                             : ((frame + 1023u) & ~1023u);
+    /* 1 KiB over the frame: some PMDs (af_packet) keep their own header
+     * in front of the frame in the same buffer size. */
+    room = frame < RTE_MBUF_DEFAULT_DATAROOM
+               ? RTE_MBUF_DEFAULT_DATAROOM
+               : ((frame + 1023u) & ~1023u) + 1024u;
     if (room > UINT16_MAX - RTE_PKTMBUF_HEADROOM)
         room = UINT16_MAX - RTE_PKTMBUF_HEADROOM;
     if (!w->rx_split && (di.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) &&
@@ -721,15 +737,20 @@ void uet_wire_dpdk_describe(const struct uet_wire_dpdk *w, char *buf,
                             size_t len)
 {
     char flow[160];
-    char rss[48];
+    char rss[80];
 
     if (w->flow_hw)
-        snprintf(flow, sizeof(flow), "flow hw (%u rules%s)", w->flow_rules,
-                 w->flow_isolated ? ", isolated" : "");
+        snprintf(flow, sizeof(flow), "flow hw (%u rules%s%s)", w->flow_rules,
+                 w->flow_isolated ? ", isolated" : "",
+                 w->flow_no_rss ? ", queue 0: no rss action" : "");
     else
         snprintf(flow, sizeof(flow), "flow sw filter (%s)", w->flow_why);
-    if (w->rss_hw)
-        snprintf(rss, sizeof(rss), "rss hw on udp sport, %u queues",
+    if (w->rss_hw && w->flow_isolated && w->flow_no_rss)
+        snprintf(rss, sizeof(rss), "rss unused (UET to queue 0), %u queues",
+                 (unsigned)w->nq);
+    else if (w->rss_hw)
+        snprintf(rss, sizeof(rss), "rss hw on udp %s, %u queues",
+                 (w->rss_hf & RTE_ETH_RSS_L4_SRC_ONLY) ? "sport" : "4-tuple",
                  (unsigned)w->nq);
     else
         snprintf(rss, sizeof(rss), "rss off, %u queue%s", (unsigned)w->nq,
