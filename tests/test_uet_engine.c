@@ -18,6 +18,12 @@
  * unaligned offset, and the target compares every byte of the region with
  * what should be there, including the untouched bytes on either side.
  *
+ * Two environment variables serve measurement rather than testing:
+ * UET_ENGINE_TEST_LEN sets the bytes written (default 1 MiB, at most
+ * 64 MiB), and UET_ENGINE_TEST_RTO_MS replaces every case's retransmit
+ * timeout, so the cases can run under a profiler such as callgrind, which
+ * slows them far past the timeouts they are written for.
+ *
  * Every frame either side transmits is also dissected here, independently
  * of the provider, so each case can check what actually crossed the wire:
  * ARP, RUD or RUDI requests, retransmissions, ACKs, and whether security
@@ -46,13 +52,13 @@
 #include "uet_engine.h"
 #include "uet_nic_ernic.h"
 
-#define PAGE      4096u
-#define GPA_BASE  UINT64_C(0x100000000)
-#define XFER_LEN  (1024u * 1024u) /* bytes written in every case */
-#define DST_OFF   1000u           /* where they land in the target region */
-#define DST_LEN   (XFER_LEN + 2u * PAGE)
-#define SRC_PGOFF 0u
-#define DST_PGOFF 100u /* the target region starts mid-page */
+#define PAGE             4096u
+#define GPA_BASE         UINT64_C(0x100000000)
+#define XFER_LEN_DEFAULT (1024u * 1024u) /* bytes written in every case */
+#define XFER_LEN_MAX     (64u * 1024u * 1024u)
+#define DST_OFF          1000u /* where they land in the target region */
+#define SRC_PGOFF        0u
+#define DST_PGOFF        100u /* the target region starts mid-page */
 
 #define IP_INITIATOR 0xc0a8c865u /* 192.168.200.101 */
 #define IP_TARGET    0xc0a8c866u /* 192.168.200.102 */
@@ -61,6 +67,13 @@
 
 #define CASE_TIMEOUT_S 90
 #define PROBE_LEN      32u
+
+/* Bytes written in every case, and the target region around them. */
+static size_t xfer_len = XFER_LEN_DEFAULT;
+#define DST_LEN (xfer_len + 2u * PAGE)
+
+/* Retransmit timeout for every case, or 0 for each case's own. */
+static uint32_t rto_override_ms;
 
 /* PDS types, from the UET specification, decoded here independently. */
 #define PDS_SECURITY  0x01u
@@ -130,6 +143,7 @@ struct guest {
 struct region {
     uint64_t root; /* GPA of the page directory */
     size_t npages;
+    size_t ndir; /* guest pages the directory takes */
     size_t len;
     uint32_t page_offset;
 };
@@ -152,17 +166,19 @@ static uint8_t *gpa_ptr(struct guest *g, uint64_t gpa)
     return g->mem + (gpa - GPA_BASE);
 }
 
-/* Page 0 holds the directory; region page i is guest page npages - i. */
+/*
+ * The first ndir pages hold the directory, which is one page for up to
+ * 2 MiB of region; region page i is guest page ndir + npages - 1 - i.
+ */
 static bool region_init(struct guest *g, struct region *r, size_t len,
                         uint32_t page_offset)
 {
     r->len = len;
     r->page_offset = page_offset;
     r->npages = (page_offset + len + PAGE - 1) / PAGE;
-    if (r->npages * sizeof(uint64_t) > PAGE)
-        return false;
+    r->ndir = (r->npages * sizeof(uint64_t) + PAGE - 1) / PAGE;
 
-    g->size = (r->npages + 1) * PAGE;
+    g->size = (r->ndir + r->npages) * PAGE;
     g->mem = aligned_alloc(PAGE, g->size);
     if (g->mem == NULL)
         return false;
@@ -170,7 +186,8 @@ static bool region_init(struct guest *g, struct region *r, size_t len,
 
     r->root = GPA_BASE;
     for (size_t i = 0; i < r->npages; i++) {
-        uint64_t page_gpa = GPA_BASE + (uint64_t)(r->npages - i) * PAGE;
+        uint64_t page_gpa =
+            GPA_BASE + (uint64_t)(r->ndir + r->npages - 1 - i) * PAGE;
         memcpy(gpa_ptr(g, r->root) + i * sizeof(uint64_t), &page_gpa,
                sizeof(page_gpa));
     }
@@ -462,7 +479,7 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
     uet_engine_cfg_defaults(&cfg);
     cfg.ip = ip;
     cfg.sec = n->tc->sec;
-    cfg.rto_ms = n->tc->rto_ms;
+    cfg.rto_ms = rto_override_ms != 0 ? rto_override_ms : n->tc->rto_ms;
     cfg.max_retries = n->tc->retries;
     cfg.drop_thresh = n->tc->drop_thresh;
 
@@ -544,7 +561,7 @@ static void run_target(struct node *n, struct report *rep)
     /* Every byte of the region: the write, and the untouched edges. */
     for (size_t off = 0; off < n->r.len; off++) {
         uint8_t got = *region_byte(&n->g, &n->r, off);
-        bool inside = off >= DST_OFF && off < DST_OFF + XFER_LEN;
+        bool inside = off >= DST_OFF && off < DST_OFF + xfer_len;
         uint8_t want = inside ? pattern(off - DST_OFF) : 0;
 
         if (got == want) {
@@ -588,10 +605,10 @@ static void run_initiator(struct node *n, struct report *rep)
     int rc;
     double t0, t1, deadline;
 
-    if (!node_start(n, IP_INITIATOR, XFER_LEN, SRC_PGOFF, rep))
+    if (!node_start(n, IP_INITIATOR, xfer_len, SRC_PGOFF, rep))
         return;
 
-    for (size_t off = 0; off < XFER_LEN; off++)
+    for (size_t off = 0; off < xfer_len; off++)
         *region_byte(&n->g, &n->r, off) = pattern(off);
     for (unsigned i = 0; i < PROBE_LEN; i++)
         n->probe[i] = pattern(i);
@@ -629,7 +646,7 @@ static void run_initiator(struct node *n, struct report *rep)
     w.peer = peer;
     w.mr = mr;
     w.local_addr = 0;
-    w.len = XFER_LEN;
+    w.len = xfer_len;
     w.remote_addr = DST_OFF;
     w.rkey = m.rkey;
     w.rudi = n->tc->rudi;
@@ -808,7 +825,7 @@ static void check_wire(const struct test_case *tc, const struct report *ini,
 {
     const struct wire_count *i = &ini->tx;
     const struct wire_count *t = &tgt->tx;
-    uint64_t data_pkts = XFER_LEN / 1024u;
+    uint64_t data_pkts = (xfer_len + 1023u) / 1024u;
 
     if (i->arp == 0 || tgt->st.arp_replies == 0)
         fail(verdict, "the target's MAC was not resolved by ARP");
@@ -919,19 +936,19 @@ static bool run_case(const struct test_case *tc)
 
     if (have_ini && have_tgt) {
         double mib_s = ini.xfer_ms > 0
-                           ? ((double)XFER_LEN / (1024.0 * 1024.0)) /
+                           ? ((double)xfer_len / (1024.0 * 1024.0)) /
                                  (ini.xfer_ms / 1000.0)
                            : 0.0;
         uint64_t sent = ini.tx.rud_req + ini.tx.rudi_req;
-        printf("  %u bytes in %.1f ms (%.1f MiB/s) after %.0f us of ARP; "
+        printf("  %zu bytes in %.1f ms (%.1f MiB/s) after %.0f us of ARP; "
                "target compared %" PRIu64 " bytes, %" PRIu64 " wrong, %" PRIu64
                " guard bytes changed\n",
-               XFER_LEN, ini.xfer_ms, mib_s, ini.resolve_ms * 1000.0,
+               xfer_len, ini.xfer_ms, mib_s, ini.resolve_ms * 1000.0,
                tgt.compared, tgt.mismatches, tgt.guard_bad);
         if (ini.tx.secured < ini.tx.uet)
-            printf("  %" PRIu64 " requests on the wire for %u data packets, "
+            printf("  %" PRIu64 " requests on the wire for %zu data packets, "
                    "%" PRIu64 " flagged RETX\n",
-                   sent, XFER_LEN / 1024u, ini.tx.retx);
+                   sent, (xfer_len + 1023u) / 1024u, ini.tx.retx);
         print_side("initiator", &ini);
         print_side("target", &tgt);
     }
@@ -1127,9 +1144,41 @@ static bool test_wire_filter(void)
     return ok;
 }
 
+/* An unsigned number from the environment, or @def when it is unset. */
+static bool env_u64(const char *name, uint64_t lo, uint64_t hi, uint64_t def,
+                    uint64_t *out)
+{
+    const char *s = getenv(name);
+    char *end = NULL;
+    unsigned long long v;
+
+    *out = def;
+    if (s == NULL || *s == '\0')
+        return true;
+    errno = 0;
+    v = strtoull(s, &end, 0);
+    if (errno != 0 || end == s || *end != '\0' || *s == '-' || v < lo ||
+        v > hi) {
+        fprintf(stderr, "%s must be %" PRIu64 "..%" PRIu64 " (got '%s')\n",
+                name, lo, hi, s);
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     unsigned passed = 0, run = 0;
+    uint64_t v;
+
+    if (!env_u64("UET_ENGINE_TEST_LEN", PROBE_LEN, XFER_LEN_MAX,
+                 XFER_LEN_DEFAULT, &v))
+        return 2;
+    xfer_len = (size_t)v;
+    if (!env_u64("UET_ENGINE_TEST_RTO_MS", 0, 60000, 0, &v))
+        return 2;
+    rto_override_ms = (uint32_t)v;
 
     /* A child that dies must not take the driver with it. */
     signal(SIGPIPE, SIG_IGN);

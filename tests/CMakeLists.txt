@@ -52,9 +52,14 @@ target_link_libraries(test_rdma_cm PRIVATE
 # deref, leak, or out-of-bounds read fails the test even when the rest of
 # the project is built without sanitizers. Flag set matches
 # cmake/ErnicSanitizers.cmake; -fno-omit-frame-pointer is compile-only.
+# ERNIC_UNIT_TEST_SANITIZERS=OFF builds them plain, for profiling and
+# for timing the datapath (test_uet_engine) without the instrumentation.
+option(ERNIC_UNIT_TEST_SANITIZERS
+  "Build the unit tests with ASan, LSan and UBSan"
+  ON)
 set(ERNIC_UNIT_TEST_SAN)
 set(ERNIC_UNIT_TEST_SAN_LINK)
-if(NOT ERNIC_USE_THREAD_SANITIZER)
+if(ERNIC_UNIT_TEST_SANITIZERS AND NOT ERNIC_USE_THREAD_SANITIZER)
     set(ERNIC_UNIT_TEST_SAN
         -fsanitize=address,undefined,leak -fno-omit-frame-pointer)
     set(ERNIC_UNIT_TEST_SAN_LINK -fsanitize=address,undefined,leak)
