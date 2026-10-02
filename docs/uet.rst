@@ -7,8 +7,12 @@ UEC reference provider's semantic, packet delivery and
 transport security sublayers (SES, PDS and TSS), running as
 the emulated NIC's firmware. It has its own IPv4 and MAC
 address on the emulated wire, and it sends and receives real
-UET frames: Ethernet, IPv4 protocol 253, the PDS and SES
-headers, and a TSS header when security is on.
+UET frames: Ethernet, IPv4, UDP to port 4793 (or, with
+``encap=ip``, IPv4 protocol 253 and an entropy header), the PDS
+and SES headers, and a TSS header when security is on. A full
+packet carries the largest Payload MTU that fits the wire's MTU:
+1 KiB at 1500, 8 KiB at 9000 (see `Packet Size and
+Encapsulation`_).
 
 Phases 1 to 4 of the work are done. The engine runs and
 moves data between two engines with every delivery mode Slice
@@ -116,8 +120,23 @@ The argument of ``--uet`` is a comma-separated list of
      - provider (5)
      - PDS retransmit limit.
    * - ``mtu=``
-     - ``1500``
-     - The wire's IP MTU, 576..9000.
+     - the TAP's
+     - The wire's IP MTU, 576..9000. Without ``--tap``, 1500.
+   * - ``payload=``
+     - from ``mtu=``
+     - The Payload MTU: 1024, 2048, 4096 or 8192. By default
+       the largest whose packets fit the MTU.
+   * - ``encap=``
+     - ``udp``
+     - ``udp`` puts UET in UDP to ``port=``; ``ip`` puts it
+       directly in IP protocol ``proto=``. Frames in either
+       form are received.
+   * - ``port=``
+     - ``4793``
+     - The UDP destination port.
+   * - ``proto=``
+     - ``253``
+     - The IP protocol without UDP; not 6 or 17.
 
 A bad option stops the server before the guest attaches:
 
@@ -132,7 +151,11 @@ will find by ARP:
 .. code-block:: console
 
    rocm-ernic: UET engine ip 192.168.200.101 mac 02:55:c0:a8:c8:65 \
-       job 1 pid 0 index 15 pds pds sec none mtu 1500
+       job 1 pid 0 index 15 pds pds sec none mtu 9000 payload 8192 \
+       encap udp port 4793 ack every 32768 bytes
+
+The MTU, Payload MTU and ACK coalescing in that line are what the
+provider settled on.
 
 Without ``--tap`` the engine starts, but it has nowhere to
 send, and the startup line says so.
@@ -167,8 +190,10 @@ own Ethernet traffic. They do not use the TCP mesh that the
 
 A wire-side receive filter in ``ionic_eth_emu_poll_rx()``
 sees every frame from the TAP before the guest does. It takes
-UET frames that are addressed to the engine's IP and MAC, and
-ARP packets for the engine's IP. Everything else goes to the
+UET frames that are addressed to the engine's IP and MAC, in
+either encapsulation (UDP to ``port=``, with a UDP length that
+matches the IP length, or IP protocol ``proto=``), and ARP
+packets for the engine's IP. Everything else goes to the
 guest as before. With the filter registered, the TAP is
 drained even when the guest has no receive ring, so the
 engine works before the driver loads. Frames for the guest
@@ -215,7 +240,10 @@ before ``uet_initialize()`` and leaves them set:
 provider's own default is stop-and-go, so this is always
 set), ``UET_SEC_MODE`` and ``UET_SEC_SSI`` from ``sec=`` and
 ``ssi=``, and the tuning variables for options that are
-given. It removes ``UET_IMPAIRMENT_SHIM``, because that shim
+given, and the wire format: ``UET_ENCAP``, ``UET_UDP_PORT``,
+``UET_IPPROTO`` and, with ``payload=``, ``UET_MAX_PAYLOAD``
+(removed otherwise, so the provider derives the payload from
+the MTU). It removes ``UET_IMPAIRMENT_SHIM``, because that shim
 transmits from a thread of its own. It also removes
 ``UET_FORCE_RUDI``, ``UET_FORCE_UUD``, ``UET_SEC_SERVER`` and
 ``UET_SEC_CLIENT_SSI``. It does not touch the other tuning
@@ -230,7 +258,9 @@ Provider Changes
 ^^^^^^^^^^^^^^^^
 
 The provider needed five small changes and one fix. Its own
-build and its ``uet`` test program work as before.
+build and its ``uet`` test program work as before. Its
+``wip-uet-perf`` branch adds the performance work of `Packet
+Size and Encapsulation`_.
 
 - ``uet_nic_register_shim()`` lets an application supply its
   own NIC shim. Before, the shim was chosen from a fixed list
@@ -330,8 +360,14 @@ waits in the device for up to 5 s. After that it fails with
 ``ETIMEDOUT``.
 
 A ``WRITE`` or ``READ`` that asks for RUDI goes to the engine
-in segments of 256 KiB, with at most 512 KiB of RUDI in the
-engine at a time across all transfers. RUDI has no window: the
+in segments of at most 256 packets and 512 KiB, with at most
+512 packets and 1 MiB of RUDI in the engine at a time across all
+transfers: 256 KiB and 512 KiB with 1 KiB payloads, 64 and 128
+packets with 8 KiB ones. The packet bounds keep a burst within
+a TAP's queue; the byte bounds keep it within what the receiver
+works through in a retransmit timeout. With the packet bounds
+alone, 4 MiB RUDI writes with 8 KiB payloads retransmitted 190
+to 300 of their 512 packets in two VMs. RUDI has no window: the
 provider sends every packet of a message at once and
 retransmits each unanswered one after the retransmit timeout.
 In two VMs, a 4 MiB RUDI write in one message overflowed the
@@ -497,6 +533,22 @@ case checks what really crossed the wire.
        ``UET_PKT_DROP_THRESH`` only acts on the RUD/ROD path,
        so it cannot force RUDI retransmissions. This case
        does that instead.
+   * - ``rudi-1MiB-ip``, ``rud-1MiB-ip``,
+       ``tss-cluster-rud-ip``
+     - The same with ``encap=ip``: every frame in IP protocol
+       253, none in UDP.
+   * - ``rudi-jumbo``, ``rud-jumbo``, ``rud-jumbo-ip``,
+       ``tss-cluster-rudi-jumbo``, ``rud-drop500-jumbo``
+     - At ``mtu=9000``: a Payload MTU of 8192, so 128 requests
+       for the megabyte, the longest frame within 9014 bytes.
+   * - ``sng-1MiB``, ``sng-1MiB-ip``
+     - The write over the stop-and-go PDS (``pds=sng``), in
+       both encapsulations.
+
+The cases without ``-ip`` run over UDP, and the cases without
+``-jumbo`` at an MTU of 1500 (1 KiB payloads). Every case checks
+both engines' MTU and Payload MTU, the encapsulation of every
+frame, and that the longest frame carries a full payload.
 
 Each case also checks that the target's MAC was found by
 ARP, that both sides reached their regions only through the
@@ -607,12 +659,15 @@ runs, each as its own result record:
   the software provider`_).
 
 With ``sudo -n tcpdump`` allowed, every transfer is captured on
-the bridge (``ip proto 253 or arp``) and summarised by
+the bridge (``ip proto 253 or udp port 4793 or arp``, with the
+``proto=`` and ``port=`` of ``ERNIC_UET``) and summarised by
 ``scripts/uet-pcap-summary.py``. A check fails unless the
 capture shows UET frames both ways between the two engines and
-nowhere else, with the expected requests (``RUDI_REQ`` or
-``RUD_REQ``) and the payload in the clear, or, with ``sec=``,
-every frame wrapped in TSS and the payload nowhere in the clear.
+nowhere else, all in the encapsulation ``ERNIC_UET`` asks for,
+with the expected requests (``RUDI_REQ`` or ``RUD_REQ``) and the
+payload in the clear, the largest of them carrying a full
+Payload MTU, or, with ``sec=``, every frame wrapped in TSS and
+the payload nowhere in the clear.
 
 To run it:
 
@@ -625,6 +680,19 @@ To run it:
    bash ci/jobs/vm-functional.sh   # guest setup
    bash ci/jobs/vm-uet.sh
 
+The engines take their MTU from the TAPs, which
+``ci/runner/install-runner.sh`` creates with ``CI_TAP_MTU``
+(9000 by default, so 8 KiB payloads); ``vm-up.sh`` and
+``ci/doctor.sh`` warn when the bridge or a TAP has another
+MTU. To run with the standard MTU instead:
+
+.. code-block:: bash
+
+   for d in ernic-ci-br0 ernic-ci-tap1 ernic-ci-tap2; do
+       sudo ip link set "$d" mtu 1500
+   done
+   export CI_TAP_MTU=1500
+
 For the TSS pass, restart the instances with
 ``ERNIC_UET='ip=192.168.200.10%i,sec=cluster,rto=1000'``:
 ``CI_KEEP_OVERLAYS=true bash ci/jobs/vm-down.sh``, then
@@ -633,6 +701,11 @@ overlays keep the guest setup, so it takes about 30 s.
 
 Results
 ^^^^^^^
+
+These are the phase 3 numbers: 1 KiB payloads directly over IP
+at an MTU of 1500, with the provider core built without
+optimization. `Packet Size and Encapsulation`_ has the numbers
+with 8 KiB payloads over UDP.
 
 One run, KVM, 4 vCPUs and 8 GiB per guest, Release build of
 the server, every check passed. Rates are the tools' own, for
@@ -697,6 +770,168 @@ guest takes about 10 s longer, because the reference provider
 resolves the next hop with ``ping``, and the engine answers ARP
 but not ICMP.
 
+Packet Size and Encapsulation
+-----------------------------
+
+UEC 1.0.1 runs UET over UDP, destination port 4793 with the
+entropy in the source port and a zero checksum, or
+experimentally directly over IP (3.2.5, 3.5.10.1, Table 3-28).
+Its Payload MTU, the payload of a full packet, is 1024, 2048,
+4096 or 8192 bytes, the same on every FEP, and must leave the
+packet within the path's MTU (3.4.1.11). Phase 3 sent IP
+protocol 253 with 1024-byte payloads whatever the wire, which on
+a jumbo frame link is eight times the packets the data needs.
+Every packet costs a TAP ``write()`` or ``read()``, a parse, a
+PDS lookup, timers and, on receive, a guest page translation.
+
+What changed, in the engine and in the provider (``uet-ref-prov``
+branch ``wip-uet-perf``):
+
+- UET goes in UDP to port 4793 by default (``encap=``,
+  ``port=``, ``proto=``). Both forms are received. The
+  provider's ``UET_UDP_PORT`` was 49150; it is 4793.
+- The Payload MTU follows the MTU: the largest of the four
+  that leaves 160 bytes of headers (IPv6, UDP, TSS with an SSI,
+  a RUD request, the SES standard header with its rendezvous
+  extension, the ICV) within it. That is 1024 at 1500 and 8192
+  at 9000. The engine's MTU is its TAP's unless ``mtu=`` says
+  otherwise. Every peer must use the same Payload MTU, so give
+  the TAPs, the bridge and the host's interfaces the same MTU.
+- ACK coalescing counts bytes, so the trigger is now four
+  payloads (16 KiB up to 4 KiB payloads, and 32 KiB, the most
+  the specification requires, at 8 KiB), and the minimum per
+  packet a sixteenth of it.
+- The command channel bounds RUDI in packets and in bytes (see
+  `Capsules`_).
+- The provider core is built at ``-O2 -g`` (its Makefile set
+  no ``-O``), and computes the CRC32C of every packet with the
+  CPU's CRC32 instruction, three streams at a time, instead of
+  a table lookup per byte.
+- The libfabric provider's write segments are 16 packets of the
+  Payload MTU (``FI_UET_ENCAP`` and ``FI_UET_MAX_PAYLOAD`` set
+  the core's encapsulation and Payload MTU).
+
+Work per byte, from callgrind: instructions the engine executes
+per byte of a 1 MiB RUD write, at the target and at the
+initiator, counting only the ``uet_engine_*`` calls the test
+makes. Unlike a rate, this does not move with the load on the
+host. The table CRC was 57 to 66 percent of it after ``-O2``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 60 40
+
+   * - Build
+     - Instructions per byte
+   * - Provider ``-O0``, server Debug, 1 KiB over IP
+     - 35.7 + 31.4
+   * - Provider ``-O2``, server RelWithDebInfo, 1 KiB over IP
+     - 15.1 + 13.1
+   * - and the CRC32 instruction
+     - 8.1 + 6.6
+   * - and UDP
+     - 7.7 + 6.1
+   * - and 8 KiB payloads (``mtu=9000``)
+     - 4.1 + 2.4
+
+To measure it:
+
+.. code-block:: bash
+
+   cmake -B build-perf -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+     -DERNIC_UET=ON -DERNIC_UET_SOURCE_DIR=/path/to/uet-ref-prov \
+     -DERNIC_UNIT_TEST_SANITIZERS=OFF
+   cmake --build build-perf
+   GLIBC_TUNABLES=glibc.cpu.x86_rep_stosb_threshold=100000000:glibc.cpu.x86_rep_movsb_threshold=100000000 \
+   UET_ENGINE_TEST_RTO_MS=10000 \
+     valgrind --tool=callgrind --trace-children=yes \
+     --collect-atstart=no --toggle-collect=uet_engine_poll \
+     --toggle-collect=uet_engine_rx_frame \
+     --toggle-collect=uet_engine_post_write \
+     --toggle-collect=uet_engine_poll_comp --toggle-collect=wire_tx \
+     build-perf/tests/test_uet_engine rud-jumbo
+   callgrind_annotate callgrind.out.<pid>
+
+The tunables make glibc copy and clear with vector loops rather
+than ``rep movsb`` and ``rep stosb``, which callgrind counts as
+one instruction per byte. ``UET_ENGINE_TEST_RTO_MS`` keeps the
+slowed-down engines from retransmitting, and
+``UET_ENGINE_TEST_LEN`` changes the 1 MiB.
+
+In two VMs, as in `Results`_ (KVM, 4 vCPUs and 8 GiB per guest),
+with ``vm-uet.sh`` and the interop checks, every check passed.
+Rates are MiB/s for 4 MiB, from VM 1 to VM 2 and back. The host
+is shared, and its load average (in brackets) moves the rates by
+a factor of two or more, so these are from the quietest runs:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 13 13 13 13 13 13
+
+   * - Build, payload, encapsulation
+     - ``uet_ernic_rma`` RUDI
+     - ``uet_ernic_rma`` RUD
+     - ``test_rma`` RUDI
+     - host to guest
+     - guest to host
+     - packets
+   * - ``-O0``, 1 KiB, IP [13]
+     - 142, 154
+     - 158, 170
+     - 130, 133
+     - 96, 95
+     - 162, 189
+     - 4096
+   * - ``-O2``, 1 KiB, IP [33]
+     - 147, 153
+     - 173, 182
+     - 144
+     - 103, 100
+     - 169, 183
+     - 4096
+   * - ``-O2``, CRC32, 1 KiB, IP [20-34]
+     - 183, 191
+     - 240, 244
+     - 205, 185
+     - 118, 125
+     - 236, 238
+     - 4096
+   * - ``-O2``, CRC32, 8 KiB, UDP [13]
+     - 515, 806
+     - 791, 722
+     - 540, 490
+     - 498, 443
+     - 737, 854
+     - 512
+
+"packets" is the requests that carry a 4 MiB write. With 8 KiB
+payloads no request was retransmitted; two writers into one
+window ran at 396 and 450 MiB/s, and ``test_rma`` over RUD at
+599. The software provider alone, between network namespaces
+(``prov/run_tests.sh`` with ``UETFI_TEST_MTU=9000``), writes
+1 MiB at about 900 MiB/s instead of 230.
+
+To run the two passes, jumbo frames over UDP and the standard
+MTU over IP protocol 253:
+
+.. code-block:: bash
+
+   # MTU 9000, UDP (the defaults)
+   export ERNIC_UET='ip=192.168.200.10%i'
+   bash ci/jobs/vm-up.sh && bash ci/jobs/vm-functional.sh
+   UET_HOST_PROV_DIR=/path/to/uet-ref-prov/prov \
+   UET_CHECKS="rma prov interop" bash ci/jobs/vm-uet.sh
+
+   # MTU 1500, IP protocol 253
+   CI_KEEP_OVERLAYS=true bash ci/jobs/vm-down.sh
+   for d in ernic-ci-br0 ernic-ci-tap1 ernic-ci-tap2; do
+       sudo ip link set "$d" mtu 1500
+   done
+   export CI_TAP_MTU=1500 ERNIC_UET='ip=192.168.200.10%i,encap=ip'
+   bash ci/jobs/vm-up.sh && bash ci/jobs/vm-functional.sh
+   UET_HOST_PROV_DIR=/path/to/uet-ref-prov/prov \
+   UET_CHECKS="rma prov interop" bash ci/jobs/vm-uet.sh
+
 Known Limits and Findings
 -------------------------
 
@@ -708,9 +943,8 @@ Known Limits and Findings
   requests beyond one per data packet.
 - RUDI has no window. The whole message is encrypted and sent
   when the write is posted. The provider's AES-GCM and its
-  per-packet key derivation run in software (its Makefile
-  builds without optimization), at about a quarter of a
-  millisecond per packet. With TSS, the retransmit timeout
+  per-packet key derivation run in software, at tens of
+  microseconds per packet even at ``-O2``. With TSS, the retransmit timeout
   must be longer than the time to send the whole message.
   Otherwise the initiator keeps encrypting retransmissions
   and never reads a response. ``tss-cluster-rudi`` uses
