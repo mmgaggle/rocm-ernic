@@ -94,6 +94,17 @@ static int chan_send(const struct fdev_msg *m)
     return send(g.chan, m, sizeof(*m), 0) == (ssize_t)sizeof(*m) ? 0 : EIO;
 }
 
+void fake_ibv_hold_reply(uint8_t opcode, uint64_t after)
+{
+    struct fdev_msg m;
+
+    memset(&m, 0, sizeof(m));
+    m.type = FDEV_HOLD;
+    m.lkey = opcode;
+    m.length = after;
+    (void)chan_send(&m);
+}
+
 void fake_ibv_wire_down(int down)
 {
     struct fdev_msg m;

@@ -15,7 +15,9 @@
  * initialize, domain, endpoint, completion queues, register, bind, enable,
  * getname, av_insert, then RMA, reaping completions with uet_cq_read().
  * The initiator WRITEs to the target's window over RUDI and RUD, READs
- * some of it back and checks the calls the library refuses. Then
+ * some of it back and checks the calls the library refuses. Then a
+ * command whose reply comes after the caller gave up: the reply must not
+ * be taken for a later command that reused the slot. Then
  * uet_ep_abort(): two endpoints each write while the wire loses every
  * frame, the first is aborted, and only the second's write may land. The
  * target compares its window byte for byte. Then both tear everything
@@ -46,8 +48,10 @@
 
 #include "fake_ibverbs.h"
 #include "uet_ernic.h"
+#include "uet_ernic_abi.h"
 
 #define MEM_LEN (8u * 1024u * 1024u)
+#define SYNC_MS "1000"      /* UET_ERNIC_SYNC_WAIT_MS for the guests */
 #define IP_A    0xc0a8c865u /* 192.168.200.101 */
 #define IP_B    0xc0a8c866u /* 192.168.200.102 */
 
@@ -359,6 +363,33 @@ static void run_initiator(struct guest *g)
     int err = reap(g, ep, txcq, &c);
     CHECK(g, err > 0 && c.op_context == &ctx[4]);
 
+    /* A late reply.  The device keeps its answer to an MR_REG until the
+     * 256th command after it, so the call gives up (SYNC_MS); then 256
+     * writes, one at a time, the last to a key the target never handed
+     * out.  With the slot freed on the time-out and an 8-bit generation,
+     * that last write would have had the MR_REG's slot and generation,
+     * and the late reply, sent just before it, would have completed it
+     * as a success.  It must fail. */
+    uet_mr_handle_t lost;
+    fake_ibv_hold_reply(UET_ERNIC_OP_MR_REG, 256);
+    CHECK(g, uet_mr_reg(dom, g->mem + 5u * 1024u * 1024u, 4096, 0,
+                        UET_MR_KEY_NONE, 0, NULL, &lost) == -FI_ETIMEDOUT);
+    for (int i = 0; i < 256; i++) {
+        bool last = i == 255;
+
+        CHECK(g, write_retry(ep, src, 4096, mrs[0], ah, W1,
+                             last ? peer.key ^ 1u : peer.key, &ctx[3]) == 0);
+        err = reap(g, ep, txcq, &c);
+        CHECK(g, c.op_context == &ctx[3]);
+        if (last)
+            CHECK(g, err > 0);
+        else
+            CHECK(g, err == 0);
+    }
+    /* and nothing more completes */
+    for (double end = now_ms() + 100.0; now_ms() < end;)
+        CHECK(g, uet_cq_read(txcq, &c, 1) == 0);
+
     /* uet_ep_abort(): a second endpoint, then one write each while the
      * wire loses every frame. The first endpoint is aborted: its write
      * reports nothing and never lands, even once the wire is back; the
@@ -502,6 +533,7 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    setenv("UET_ERNIC_SYNC_WAIT_MS", SYNC_MS, 1);
     for (int i = 0; i < 4; i++)
         snprintf(logs[i], sizeof(logs[i]), "%s/uet-guestlib-%d-%d.log",
                  tmp != NULL ? tmp : "/tmp", i, (int)getpid());

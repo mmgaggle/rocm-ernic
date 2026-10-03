@@ -57,6 +57,11 @@ struct dev {
     } mrs[MAX_MRS];
     bool bye;
     bool wire_down; /* lose every IP frame (FDEV_WIRE) */
+    /* FDEV_HOLD: a reply kept back, and when to let it go */
+    int hold_op;         /* opcode to keep, or -1 */
+    bool held;           /* one is kept */
+    uint64_t hold_after; /* commands after it, before it goes */
+    struct fdev_msg held_msg;
 };
 
 static bool parse_u64(const char *s, uint64_t *out)
@@ -126,6 +131,13 @@ static bool svc_reply(void *ctx, uint32_t qp_id, const void *capsule,
     m.qp = qp_id;
     m.len = (uint32_t)(len < sizeof(m.data) ? len : sizeof(m.data));
     memcpy(m.data, capsule, m.len);
+    /* A reply the test wants late: kept, as if the device were slow. */
+    if (d->hold_op >= 0 && !d->held && m.len > 6 &&
+        m.data[6] == (uint8_t)d->hold_op) {
+        d->held = true;
+        d->held_msg = m;
+        return true;
+    }
     /* The guest side queues replies until it has a receive posted. */
     (void)send(d->chan, &m, sizeof(m), 0);
     return true;
@@ -155,7 +167,17 @@ static void handle(struct dev *d, const struct fdev_msg *m)
         }
         break;
     case FDEV_CMD:
+        if (d->held && d->hold_after > 0 && --d->hold_after == 0) {
+            (void)send(d->chan, &d->held_msg, sizeof(d->held_msg), 0);
+            d->held = false;
+            d->hold_op = -1;
+        }
         uet_svc_command(d->svc, m->qp, m->data, m->len);
+        break;
+    case FDEV_HOLD:
+        d->hold_op = (int)m->lkey;
+        d->hold_after = m->length;
+        d->held = false;
         break;
     case FDEV_QP_GONE:
         uet_svc_qp_gone(d->svc, m->qp);
@@ -214,6 +236,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     memset(&d, 0, sizeof(d));
+    d.hold_op = -1;
     d.mem_len = (size_t)mem_len;
     d.chan = (int)chan;
     d.wire = (int)wire;

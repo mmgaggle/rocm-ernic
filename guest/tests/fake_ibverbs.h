@@ -32,4 +32,8 @@ void fake_ibv_get_stats(struct fake_ibv_stats *out);
 /* Have the device lose every IP frame its engine sends (true), or not. */
 void fake_ibv_wire_down(int down);
 
+/* Have the device keep its next reply to @opcode, and send it just before
+ * it handles the @after-th command after that one. */
+void fake_ibv_hold_reply(uint8_t opcode, uint64_t after);
+
 #endif /* FAKE_IBVERBS_H */

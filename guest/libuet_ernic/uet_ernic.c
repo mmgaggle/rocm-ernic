@@ -36,13 +36,24 @@
 #define AUTO_WINDOW  (2u * 1024u * 1024u)
 #define CQ_DEPTH     (2u * SLOTS)
 #define SEND_TAG     (UINT64_C(1) << 63)
-#define SYNC_WAIT_MS 10000u
+#define SYNC_WAIT_MS 10000u /* UET_ERNIC_SYNC_WAIT_MS overrides it */
 #define PENDING      (2u * SLOTS)
+
+/*
+ * A reply names its command by the cookie: the slot in the low 8 bits and
+ * the slot's generation, bumped on every use, in the 56 above, so a reply
+ * cannot be taken for a later use of its slot.  The reply's opcode must
+ * match the command's too.
+ */
+#define COOKIE_SLOT(c) ((unsigned)((c) & 0xffu))
+#define COOKIE_GEN(c)  ((c) >> 8)
 
 enum pend_kind {
     PEND_FREE = 0,
     PEND_SYNC, /* a caller is waiting for the reply */
     PEND_RMA,  /* the reply is a completion for an endpoint */
+    PEND_LATE, /* a caller gave up waiting; the slot stays out of use
+                * until the reply comes, or the service QP goes */
 };
 
 /*
@@ -63,7 +74,8 @@ struct auto_mr {
 
 struct pending {
     enum pend_kind kind;
-    uint8_t gen;
+    uint64_t gen;   /* 56 bits */
+    uint8_t opcode; /* of the command, which the reply echoes */
     bool done;
     struct uet_ernic_reply reply; /* PEND_SYNC */
     struct uet_ernic_ep *ep;      /* PEND_RMA */
@@ -100,7 +112,9 @@ struct uet_ernic_dev {
     uint32_t initiator_id;
     uint32_t caps;
 
-    bool broken; /* the service QP failed; nothing more will complete */
+    bool broken;   /* the service QP failed; nothing more will complete */
+    unsigned late; /* PEND_LATE slots */
+    uint64_t sync_wait_ms; /* how long call() waits for a reply */
 };
 
 struct uet_ernic_dom {
@@ -252,12 +266,20 @@ static void dispatch(struct uet_ernic_dev *d, const uint8_t *capsule)
         return;
 
     cookie = le64toh(r.hdr.cookie);
-    if ((cookie & 0xffu) >= PENDING)
+    if (COOKIE_SLOT(cookie) >= PENDING)
         return;
-    p = &d->pend[cookie & 0xffu];
-    if (p->kind == PEND_FREE || p->gen != (uint8_t)(cookie >> 8))
+    p = &d->pend[COOKIE_SLOT(cookie)];
+    if (p->kind == PEND_FREE || p->gen != COOKIE_GEN(cookie) ||
+        p->opcode != r.hdr.opcode)
         return;
 
+    if (p->kind == PEND_LATE) {
+        /* Nobody waits for it any more; the slot can be used again.  (A
+         * handle it hands out is released with the service QP.) */
+        d->late--;
+        p->kind = PEND_FREE;
+        return;
+    }
     if (p->kind == PEND_SYNC) {
         p->reply = r;
         p->done = true;
@@ -303,13 +325,15 @@ static void progress(struct uet_ernic_dev *d)
         d->broken = true;
 }
 
-static struct pending *pend_alloc(struct uet_ernic_dev *d, uint64_t *cookie)
+static struct pending *pend_alloc(struct uet_ernic_dev *d, uint8_t opcode,
+                                  uint64_t *cookie)
 {
     for (unsigned i = 0; i < PENDING; i++) {
         if (d->pend[i].kind == PEND_FREE) {
-            d->pend[i].gen++;
+            d->pend[i].gen = (d->pend[i].gen + 1u) & (UINT64_MAX >> 8);
+            d->pend[i].opcode = opcode;
             d->pend[i].done = false;
-            *cookie = ((uint64_t)d->pend[i].gen << 8) | i;
+            *cookie = (d->pend[i].gen << 8) | i;
             return &d->pend[i];
         }
     }
@@ -390,16 +414,16 @@ static int call(struct uet_ernic_dev *d, void *capsule, size_t len,
     uint64_t cookie, deadline;
     int rc;
 
-    p = pend_alloc(d, &cookie);
+    memcpy(&h, capsule, sizeof(h));
+    p = pend_alloc(d, h.opcode, &cookie);
     if (p == NULL)
         return -FI_EAGAIN;
     p->kind = PEND_SYNC;
 
-    memcpy(&h, capsule, sizeof(h));
     h.cookie = htole64(cookie);
     memcpy(capsule, &h, sizeof(h));
 
-    deadline = now_ms() + SYNC_WAIT_MS;
+    deadline = now_ms() + d->sync_wait_ms;
     while ((rc = send_capsule(d, capsule, len)) == -FI_EAGAIN) {
         if (now_ms() > deadline)
             break;
@@ -412,8 +436,10 @@ static int call(struct uet_ernic_dev *d, void *capsule, size_t len,
 
     while (!p->done && !d->broken) {
         if (now_ms() > deadline) {
-            /* The reply may still come; it will find nobody waiting. */
-            p->kind = PEND_FREE;
+            /* The reply may still come.  Until it does the slot is not
+             * used again, so it cannot be taken for a later command's. */
+            p->kind = PEND_LATE;
+            d->late++;
             return -FI_ETIMEDOUT;
         }
         progress(d);
@@ -693,6 +719,12 @@ int uet_initialize(uet_handle_t *handle)
         const char *cache = getenv("UET_ERNIC_MR_CACHE");
 
         d->auto_cache = cache == NULL || strcmp(cache, "0") != 0;
+    }
+    {
+        const char *w = getenv("UET_ERNIC_SYNC_WAIT_MS");
+        unsigned long v = w != NULL ? strtoul(w, NULL, 10) : 0;
+
+        d->sync_wait_ms = v > 0 && v <= 600000u ? v : SYNC_WAIT_MS;
     }
 
     list = ibv_get_device_list(&n);
@@ -1342,7 +1374,7 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
         q.local_offset = htole64((uint64_t)((uintptr_t)b - am->start));
     }
 
-    p = pend_alloc(d, &cookie);
+    p = pend_alloc(d, op, &cookie);
     if (p == NULL) {
         progress(d);
         pthread_mutex_unlock(&d->lock);

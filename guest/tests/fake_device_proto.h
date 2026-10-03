@@ -29,6 +29,9 @@ enum fdev_type {
     FDEV_BYE = 5,     /* guest -> device: the device was closed */
     FDEV_WIRE = 6,    /* test -> device: lkey 1 loses every IP frame the
                        * engine sends, 0 stops (ARP still passes) */
+    FDEV_HOLD = 7,    /* test -> device: keep the next reply with opcode
+                       * lkey, and send it just before the command that
+                       * arrives length commands later */
     FDEV_REPLY = 0x81 /* device -> guest: a reply capsule for a QP */
 };
 
