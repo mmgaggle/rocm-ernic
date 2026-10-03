@@ -417,15 +417,22 @@ static int call(struct uet_ernic_dev *d, void *capsule, size_t len,
     int rc;
 
     memcpy(&h, capsule, sizeof(h));
-    p = pend_alloc(d, h.opcode, &cookie);
-    if (p == NULL)
-        return -FI_EAGAIN;
+    deadline = now_ms() + d->sync_wait_ms;
+    /* Transfers in flight hold reply slots too; one frees up as they are
+     * answered.  Giving up at once would make uet_mr_close() release a
+     * region the device never heard of being released. */
+    while ((p = pend_alloc(d, h.opcode, &cookie)) == NULL) {
+        if (d->broken)
+            return -FI_EIO;
+        if (now_ms() > deadline)
+            return -FI_EAGAIN;
+        progress(d);
+    }
     p->kind = PEND_SYNC;
 
     h.cookie = htole64(cookie);
     memcpy(capsule, &h, sizeof(h));
 
-    deadline = now_ms() + d->sync_wait_ms;
     while ((rc = send_capsule(d, capsule, len)) == -FI_EAGAIN) {
         if (now_ms() > deadline)
             break;
