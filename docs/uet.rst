@@ -229,7 +229,10 @@ share its engine, and so its address, and one may write into
 another's region. The engine resolves its own address to its own
 MAC, and a frame it sends to that MAC goes straight to its own
 receive queue, never to the wire. The provider then plays both
-sides, as initiator and as target, over RUDI or RUD.
+sides, as initiator and as target, over RUDI or RUD. The engine
+reads that queue and the wire's in turn, so neither holds the
+other back. Taking a transfer back drops what is still queued
+there (see `Taking transfers back`_).
 
 Guest memory
 ^^^^^^^^^^^^
@@ -470,8 +473,25 @@ of those transfers goes on the wire again. The device drops the
 segments that wait to be posted, posts no new ones, and takes the
 ones in the engine out of the provider: their packets are
 dropped, and a late response to one is ignored. A transfer that
-finished before the ``ABORT`` is answered as usual. The
-``ABORT`` never waits for a peer, so it is answered at once.
+finished before the ``ABORT`` is answered as usual. The device
+never waits for a peer before it answers an ``ABORT``. The guest
+still waits for that answer, as for any command: up to 10 s, or
+``UET_ERNIC_SYNC_WAIT_MS``.
+
+The engine also drops every frame it has sent to itself and not
+read yet (see `The wire`_).
+Frames of other transfers go with them, as if lost on a wire, and
+the transports send them again.
+
+Two other answers are possible:
+
+- ``EAGAIN``: the device had no room in its reply queue for all
+  the answers, so it took nothing back. Send the ``ABORT`` again.
+  The guest library does, until its wait runs out.
+- ``EBUSY``: the engine would not let go of some transfer. That
+  transfer is answered when it leaves the engine, and it can
+  still land until then. The guest library treats this as a
+  failed ``ABORT`` (see below).
 
 A RUDI transfer is taken back alone. A RUD transfer is part of a
 packet delivery context (PDC) that it shares with other RUD
@@ -487,6 +507,55 @@ The engine needed one more hook from the provider:
 ``wip-uet-rigor`` branch. With ``pds=sng`` the provider cannot
 drop what it has sent, so the device answers ``ABORT`` with
 ``EOPNOTSUPP`` and does not report ``UET_ERNIC_CAP_ABORT``.
+
+Late duplicates and dead keys
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+RUDI keeps no state at the target, and the initiator resends any
+packet that is not answered within the retransmit timeout. The
+first copy to arrive is placed and answered, and the transfer
+completes when every packet has an answer. A copy that was resent
+can still be on the way then, and it lands when it arrives. A
+target can therefore get a packet of a write after the write has
+completed.
+
+That is harmless while the memory still holds what the write put
+there, because RUDI writes are idempotent. It is not harmless once
+the owner has reused the memory: the late copy overwrites what is
+there now. A soak of Ceph over UET, with the client's link delayed
+1.5 s, found copies landing about 300 ms after the GET returned,
+in a window the client had already reused.
+
+So a target must close (deregister) a region, or at least disable
+it, before it reuses the memory, and register the memory again for
+its next use. The reference provider gives a region registered
+anew a new key: its keys carry a generation next to the region's
+index, so an index that is used again never brings back an old
+key. The ``dead-key-rudi`` test checks this through the engine.
+
+A packet that names a key no enabled region has is dropped. Nothing
+of it is placed, and the target keeps no state for it and reports
+nothing. It is answered with the SES return code ``UET_RC_BAD_MKEY``
+(invalid key). That answer fails the initiator's operation, so the
+initiator stops sending it again, and an answer to a copy whose
+transfer is already done finds nothing and is ignored. The engine
+counts these packets as ``writes_to_dead_key`` in its statistics
+and in the stats file. RUD is different: its PDC numbers every
+packet and drops a copy it has already taken, so a RUD copy does
+not reach the target's memory.
+
+How likely is a late copy here? With the default retransmit
+timeout of 5 ms, a RUDI packet is resent whenever its answer takes
+longer than that. A TAP queues 1000 frames, and a burst larger than
+the receiver works through in 5 ms is resent in part: before the
+segment bounds above, 4 MiB writes resent 190 to 300 of their 512
+packets in two VMs. The copies then trail the first ones by the
+queue's delay, which is milliseconds on a TAP and a bridge, so they
+usually land while the transfer, and the request it is part of, is
+still finishing. That makes them common but rarely late. A path
+with a longer delay, as in the soak, turns the same copies into
+late ones. Owners must invalidate keys before reuse whatever the
+link.
 
 The Guest Library
 -----------------
@@ -531,15 +600,33 @@ These are the differences from the reference library:
   again at the same address while the old registration is
   cached.
 - ``uet_ep_abort()`` sends one ``ABORT`` for the endpoint's
-  group and waits for its reply, which comes at once. The
-  endpoint reports no completion for the transfers taken back,
-  as the reference does. So ``fi_close()`` on the libfabric
-  provider discards the endpoint's writes, and none of them
-  lands later. A device that cannot take transfers back (one
-  older than ABI version 2, or one with ``pds=sng``) makes
-  ``uet_ep_abort()`` return ``-FI_ENOSYS``. The provider then
-  waits up to 10 s for the writes, as it does with the
-  reference's stop-and-go PDS.
+  group and waits for its reply. The endpoint reports no
+  completion for the transfers taken back, as the reference
+  does. So ``fi_close()`` on the libfabric provider discards the
+  endpoint's writes, and none of them lands later.
+- When the device cannot take transfers back (it is older than
+  ABI version 2, or runs ``pds=sng``), or the ``ABORT`` fails (no
+  answer in time, a broken QP, ``EBUSY``, or an answer that left
+  a transfer unanswered), and the endpoint has transfers in
+  flight, the library tears itself down. It destroys its service
+  QP, so the device drops what its engine can and answers none
+  of it. ``uet_ep_abort()`` returns the error, and the instance
+  is dead: calls that need the device fail with ``-FI_EIO``, and
+  releasing regions, peers, endpoints and the domain succeeds.
+  With nothing in flight, ``uet_ep_abort()`` returns 0 whatever
+  the device can do.
+- ``uet_ep_getopt(UET_OPT_ABORT)`` says up front whether the
+  device can take transfers back. The libfabric provider
+  reports it as the endpoint option ``FI_UET_OPT_CLOSE_DISCARDS``
+  (``FI_PROV_SPECIFIC | 0x5545``, a ``bool`` read with
+  ``fi_getopt()``), and its ``fi_close()`` returns ``-FI_EIO``
+  when the discard is not guaranteed. A consumer that cuts writes
+  off by closing the endpoint, as Ceph's OSD does, checks the
+  option first.
+- A command the library gave up waiting for keeps its slot until
+  its answer arrives, and every answer must match its command's
+  slot, a 56-bit generation and the opcode. So a late answer is
+  never taken for a later command's.
 - ``uet_mr_disable()`` keeps the region reachable by peers
   until ``uet_mr_close()``. Re-enabling it would need a new
   key, and callers keep the old one.
@@ -616,6 +703,19 @@ case checks what really crossed the wire.
    * - ``sng-1MiB``, ``sng-1MiB-ip``
      - The write over the stop-and-go PDS (``pds=sng``), in
        both encapsulations.
+   * - ``dead-key-rudi``
+     - A 1 MiB RUDI write completes. The target closes its region,
+       registers and closes 255 more until the provider's index
+       comes round, clears the memory, and registers it anew at
+       the same index. Then it gets the write's 1024 frames again,
+       as late duplicates. The new key differs from the old one,
+       nothing lands, and every frame counts as a write to a dead
+       key. With a key that was the index alone, the same key came
+       back and 1044414 bytes landed.
+   * - ``loopback-abort-rudi``, ``loopback-abort-rud``
+     - One engine writes 1 MiB to itself and takes it back before
+       it reads anything. The queued frames are dropped (1024 and
+       128), nothing lands and nothing completes.
    * - ``loopback-rudi``, ``loopback-rud``,
        ``loopback-rudi-jumbo``
      - One engine writes from one part of its region to another,
@@ -687,6 +787,12 @@ replies out of the receives they landed in. It checks:
   QP: ``EIO``, and the window is untouched;
 - ``ABORT`` with unknown flags or a short capsule, ``ABORT`` of
   a group with nothing in flight, and versions 0, 1 and 3;
+- a ``WRITE`` on a new group at once after an ``ABORT``,
+  ``ABORT`` of every group (``UET_ERNIC_ABORT_ALL``), ``ABORT``
+  of a ``WRITE`` still in the device waiting for ARP of a peer
+  that never answers, and an ``ABORT`` sent while the reply
+  queue (16 replies in this test's build) is nearly full:
+  answered ``EAGAIN``, taking nothing back, then sent again;
 - two RUDI ``WRITE`` commands in two groups while the wire
   loses every frame, and ``ABORT`` of one group: its ``WRITE``
   is answered ``ECANCELED`` ahead of the ``ABORT``, the other
@@ -705,8 +811,16 @@ and RUD, read back, and check the calls the library refuses
 and an error completion. Then two endpoints each write while
 the device loses every frame, and ``uet_ep_abort()`` aborts the
 first. It reports no completion and nothing of it lands; the
-other endpoint's write completes. Afterwards each device must
-hold nothing.
+other endpoint's write completes. Then a late answer: the device
+keeps its answer to an ``MR_REG`` until the 256th command after
+it, and that command, a write, must not be completed by the
+answer. Afterwards each device must hold nothing.
+
+A second case, ``guest-lib-v1``, runs the initiator on a device
+that plays ABI version 1: ``UET_OPT_ABORT`` is false, writes go
+on version 1 capsules, and ``uet_ep_abort()`` with a write in
+flight returns ``-FI_ENOSYS`` and tears the instance down, after
+which everything closes.
 
 One run, on a Debug build with AddressSanitizer:
 
