@@ -471,7 +471,14 @@ Taking transfers back
 
 A guest gives each ``WRITE`` and ``READ`` a 32-bit group. The
 guest library uses one group for each endpoint. ``ABORT`` names
-a group, or all transfers of the QP with ``UET_ERNIC_ABORT_ALL``.
+a group, or all transfers of the QP with ``UET_ERNIC_ABORT_ALL``,
+or one transfer with ``UET_ERNIC_ABORT_COOKIE``: the one whose
+``WRITE`` or ``READ`` carried the cookie in the ``ABORT``'s
+``cookie`` field (a 32-byte capsule; the 24-byte one without it is
+still accepted for the other flags). A device that takes this
+reports ``UET_ERNIC_CAP_ABORT_OP``. The guest library uses it for
+``uet_ep_abort_op()``, which the libfabric provider's
+``fi_cancel()`` calls for each segment of the write in flight.
 
 The device answers each transfer it takes back first, with
 ``ECANCELED``, and then the ``ABORT``, with the number it took

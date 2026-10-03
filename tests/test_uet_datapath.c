@@ -1080,6 +1080,23 @@ static void capsule_checks(struct node *n)
            "MR_REG with unknown access bits");
     expect(n, release(n, UET_ERNIC_OP_MR_DEREG, 0x12345u), EBADF,
            "MR_DEREG of a handle never handed out");
+    {
+        struct uet_ernic_abort a;
+
+        memset(&a, 0, sizeof(a));
+        hdr_init(&a.hdr, UET_ERNIC_OP_ABORT, ++n->next_cookie);
+        a.flags = htole32(UET_ERNIC_ABORT_COOKIE | UET_ERNIC_ABORT_ALL);
+        expect(n, call(n, &a, sizeof(a), "ABORT", NULL), EINVAL,
+               "ABORT by cookie of every transfer");
+        hdr_init(&a.hdr, UET_ERNIC_OP_ABORT, ++n->next_cookie);
+        a.flags = htole32(UET_ERNIC_ABORT_COOKIE);
+        expect(n, call(n, &a, 24, "ABORT", NULL), EINVAL,
+               "ABORT by cookie without the cookie");
+        hdr_init(&a.hdr, UET_ERNIC_OP_ABORT, ++n->next_cookie);
+        a.cookie = htole64(UINT64_C(0x1234));
+        expect(n, call(n, &a, sizeof(a), "ABORT", NULL), 0,
+               "ABORT by the cookie of no transfer");
+    }
     expect(n, release(n, UET_ERNIC_OP_PEER_REMOVE, 7u), EBADF,
            "PEER_REMOVE of a handle never handed out");
 
@@ -1130,7 +1147,8 @@ static void check_query(struct node *n, uint32_t ip)
         r.u.query.mac[5] != (uint8_t)ip ||
         (le32toh(r.u.query.caps) & UET_ERNIC_CAP_RUDI) == 0 ||
         (le32toh(r.u.query.caps) & UET_ERNIC_CAP_ABORT) == 0 ||
-        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_REKEY) == 0)
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_REKEY) == 0 ||
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_ABORT_OP) == 0)
         fail(n->rep, "QUERY reported the wrong identity");
 }
 

@@ -19,8 +19,9 @@
  * command whose reply comes after the caller gave up: the reply must not
  * be taken for a later command that reused the slot. Then
  * uet_ep_abort(): two endpoints each write while the wire loses every
- * frame, the first is aborted, and only the second's write may land. The
- * target compares its window byte for byte. Then it gives the window a new
+ * frame, the first is aborted, and only the second's write may land; then
+ * uet_ep_abort_op(): two writes of one endpoint, the first taken back
+ * alone. The target compares its window byte for byte. Then it gives the window a new
  * key with uet_mr_rekey(): a write with the old key must fail and land
  * nothing, one with the new key must land. Then both tear everything
  * down, and each device must be left holding nothing.
@@ -62,18 +63,21 @@
 #define IP_A    0xc0a8c865u /* 192.168.200.101 */
 #define IP_B    0xc0a8c866u /* 192.168.200.102 */
 
-#define HALF        (512u * 1024u)
-#define SRC_LEN     (2u * HALF)
-#define WIN_LEN     (2u * 1024u * 1024u)
-#define RD_LEN      (32u * 1024u)
-#define W1          (4096u + 5u)
-#define W2          (W1 + HALF + 9u)
-#define QTR         (128u * 1024u)
-#define W3          (1280u * 1024u)      /* aborted: stays zero */
-#define W4          (1536u * 1024u + 3u) /* the other endpoint's: lands */
-#define W5          (1792u * 1024u)      /* after the re-key: the old key's */
-#define RK_LEN      (32u * 1024u)        /* and then the new key's, after it */
+#define HALF    (512u * 1024u)
+#define SRC_LEN (2u * HALF)
+#define WIN_LEN (2u * 1024u * 1024u)
+#define RD_LEN  (32u * 1024u)
+#define W1      (4096u + 5u)
+#define W2      (W1 + HALF + 9u)
+#define QTR     (128u * 1024u)
+#define W3      (1280u * 1024u)      /* aborted: stays zero */
+#define W4      (1536u * 1024u + 3u) /* the other endpoint's: lands */
+#define W5      (1792u * 1024u)      /* after the re-key: the old key's */
+#define RK_LEN  (32u * 1024u)        /* and then the new key's, after it */
 #define REKEY_TIMED 1000u
+#define W6      (1872u * 1024u)      /* taken back by uet_ep_abort_op() */
+#define W7      (1920u * 1024u)      /* its sibling: lands */
+#define CN_LEN  (32u * 1024u)
 
 struct report {
     int ok;
@@ -272,6 +276,8 @@ static void run_target(struct guest *g)
             want = pattern(HALF + (off - W2));
         else if (off >= W4 && off < W4 + QTR)
             want = pattern(QTR + (off - W4));
+        else if (off >= W7 && off < W7 + CN_LEN)
+            want = pattern(off - W7);
         if (win[off] != want) {
             fail(g->rep, "window byte %zu is wrong", off);
             break;
@@ -296,7 +302,8 @@ static void run_target(struct guest *g)
                 break;
             }
             if (win[W5 + RK_LEN + off] != pattern(off)) {
-                fail(g->rep, "the write with the new key is wrong at %zu", off);
+                fail(g->rep, "the write with the new key is wrong at %zu",
+                     off);
                 break;
             }
         }
@@ -311,7 +318,8 @@ static void run_target(struct guest *g)
         t0 = now_ms();
         for (unsigned i = 0; i < REKEY_TIMED && g->rep->ok; i++) {
             CHECK(g, uet_mr_disable(mr) == 0 && uet_mr_close(mr) == 0);
-            if (!reg(g, dom, ep, win, WIN_LEN, FI_REMOTE_READ | FI_REMOTE_WRITE,
+            if (!reg(g, dom, ep, win, WIN_LEN,
+                     FI_REMOTE_READ | FI_REMOTE_WRITE,
                      UET_MR_KEY_IDEMPOTENT_SAFE, &mr))
                 return;
         }
@@ -499,6 +507,41 @@ static void run_initiator(struct guest *g)
     CHECK(g, uet_ep_abort(ep2) == 0);
     CHECK(g, uet_ep_close(ep2) == 0);
 
+    /* uet_ep_abort_op(): two writes of one endpoint while the wire loses
+     * every frame. The first is taken back alone: it reports nothing and
+     * never lands; the second completes once the wire is back. */
+    uet_ep_handle_t ep4;
+    uet_cq_handle_t txcq4, rxcq4;
+    size_t olen = sizeof(on);
+    CHECK(g, uet_endpoint(dom, NULL, NULL, NULL, &ep4) == 0);
+    CHECK(g, uet_ep_bind_cq(ep4, &attr2, NULL, FI_SEND, NULL, &txcq4) == 0);
+    CHECK(g, uet_ep_bind_cq(ep4, &attr2, NULL, FI_RECV, NULL, &rxcq4) == 0);
+    CHECK(g, uet_ep_enable(ep4) == 0);
+    CHECK(g, uet_ep_setopt(ep4, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    on = false;
+    CHECK(g, uet_ep_getopt(ep4, FI_OPT_ENDPOINT, UET_OPT_ABORT_OP, &on,
+                           &olen) == 0 &&
+                 on);
+    fake_ibv_wire_down(1);
+    CHECK(g, write_retry(ep4, src, CN_LEN, mrs[0], ah, W6, peer.key,
+                         &ctx[0]) == 0);
+    CHECK(g, write_retry(ep4, src, CN_LEN, mrs[0], ah, W7, peer.key,
+                         &ctx[1]) == 0);
+    for (double end = now_ms() + 60.0; now_ms() < end;)
+        (void)uet_ep_progress(ep4);
+    CHECK(g, uet_ep_abort_op(ep4, &ctx[0]) == 0);
+    CHECK(g, uet_ep_abort_op(ep4, &ctx[0]) == -FI_ENOENT);
+    fake_ibv_wire_down(0);
+    CHECK(g, reap(g, ep4, txcq4, &c) == 0 && c.op_context == &ctx[1]);
+    /* a retransmission of the one taken back would land now */
+    for (double end = now_ms() + 300.0; now_ms() < end;)
+        (void)uet_ep_progress(ep4);
+    CHECK(g, uet_cq_read(txcq4, &c, 1) == 0);
+    CHECK(g, uet_ep_abort(ep4) == 0);
+    CHECK(g, uet_ep_close(ep4) == 0);
+    on = true;
+
     done = 'd';
     CHECK(g, send(g->ctl, &done, 1, 0) == 1);
     CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
@@ -519,8 +562,8 @@ static void run_initiator(struct guest *g)
     CHECK(g, uet_ep_enable(ep3) == 0);
     CHECK(g, uet_ep_setopt(ep3, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
                            sizeof(on)) == 0);
-    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5, peer.key, &ctx[2]) ==
-                 0);
+    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5, peer.key,
+                         &ctx[2]) == 0);
     stale = reap(g, ep3, txcq3, &c);
     CHECK(g, stale > 0 && c.op_context == &ctx[2]);
     CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5 + RK_LEN, key,
@@ -531,7 +574,8 @@ static void run_initiator(struct guest *g)
     CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
     if (done != 'y')
         fail(g->rep, "the target's compare after the re-key failed");
-    printf("rekey: a write with the old key failed with %s\n", strerror(stale));
+    printf("rekey: a write with the old key failed with %s\n",
+           strerror(stale));
     CHECK(g, uet_ep_abort(ep3) == 0);
     CHECK(g, uet_ep_close(ep3) == 0);
 
@@ -566,6 +610,11 @@ static void run_initiator_v1(struct guest *g)
     CHECK(g,
           uet_ep_getopt(ep, FI_OPT_ENDPOINT, UET_OPT_ABORT, &can, &len) == 0 &&
               !can);
+    can = true;
+    CHECK(g, uet_ep_getopt(ep, FI_OPT_ENDPOINT, UET_OPT_ABORT_OP, &can,
+                           &len) == 0 &&
+                 !can);
+    CHECK(g, uet_ep_abort_op(ep, &can) == -FI_ENOSYS);
     CHECK(g, recv(g->ctl, &peer, sizeof(peer), 0) == (ssize_t)sizeof(peer));
     CHECK(g, uet_av_insert(dom, &peer.addr, &ah) == 0);
     CHECK(g, uet_ep_setopt(ep, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,

@@ -514,9 +514,20 @@ static void cmd_query(struct uet_svc *s, uint32_t qp_id, uint64_t cookie)
     r.u.query.caps =
         htole32((id.pds == UET_ENGINE_PDS_FULL ? UET_ERNIC_CAP_RUDI : 0u) |
                 (id.sec != UET_ENGINE_SEC_NONE ? UET_ERNIC_CAP_TSS : 0u) |
-                (uet_engine_can_abort(s->e) ? UET_ERNIC_CAP_ABORT : 0u) |
+                (uet_engine_can_abort(s->e)
+                     ? UET_ERNIC_CAP_ABORT | UET_ERNIC_CAP_ABORT_OP
+                     : 0u) |
                 UET_ERNIC_CAP_REKEY);
     send_reply(s, qp_id, &r);
+}
+
+/* Whether ABORT's flags, group and cookie name this transfer. */
+static bool abort_match(const struct svc_op *op, uint32_t flags,
+                        uint32_t group, uint64_t cookie)
+{
+    if ((flags & UET_ERNIC_ABORT_COOKIE) != 0)
+        return op->cookie == cookie;
+    return (flags & UET_ERNIC_ABORT_ALL) != 0 || op->group == group;
 }
 
 static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
@@ -526,14 +537,20 @@ static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     struct uet_ernic_reply r;
     uint32_t count = 0;
 
-    if (len < sizeof(req)) {
+    /* A capsule without the cookie is the original layout. */
+    if (len < offsetof(struct uet_ernic_abort, cookie)) {
         reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EINVAL);
         return;
     }
-    memcpy(&req, capsule, sizeof(req));
+    memset(&req, 0, sizeof(req));
+    memcpy(&req, capsule, len < sizeof(req) ? len : sizeof(req));
     uint32_t flags = le32toh(req.flags);
     uint32_t group = le32toh(req.group);
-    if ((flags & ~UET_ERNIC_ABORT_ALL) != 0) {
+    uint64_t which = le64toh(req.cookie);
+    bool by_cookie = (flags & UET_ERNIC_ABORT_COOKIE) != 0;
+    if ((flags & ~(UET_ERNIC_ABORT_ALL | UET_ERNIC_ABORT_COOKIE)) != 0 ||
+        (by_cookie && ((flags & UET_ERNIC_ABORT_ALL) != 0 ||
+                       len < sizeof(req)))) {
         reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EINVAL);
         return;
     }
@@ -555,7 +572,7 @@ static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
         struct svc_op *op = &s->ops_tab[i];
 
         if (op->used && !op->orphan && op->qp_id == qp_id &&
-            ((flags & UET_ERNIC_ABORT_ALL) != 0 || op->group == group))
+            abort_match(op, flags, group, which))
             want++;
     }
     if (s->nreplies + want + 1u > SVC_MAX_REPLIES) {
@@ -569,7 +586,7 @@ static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
         struct svc_op *op = &s->ops_tab[i];
 
         if (!op->used || op->orphan || op->qp_id != qp_id ||
-            ((flags & UET_ERNIC_ABORT_ALL) == 0 && op->group != group))
+            !abort_match(op, flags, group, which))
             continue;
         if (!op_abort(s, op))
             stuck++;

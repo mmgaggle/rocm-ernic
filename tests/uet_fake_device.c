@@ -145,7 +145,8 @@ static bool svc_reply(void *ctx, uint32_t qp_id, const void *capsule,
             r.hdr.version = htole16(1);
             r.u.query.abi_version = htole16(1);
             r.u.query.caps &=
-                htole32(~(UET_ERNIC_CAP_ABORT | UET_ERNIC_CAP_REKEY));
+                htole32(~(UET_ERNIC_CAP_ABORT | UET_ERNIC_CAP_REKEY |
+                          UET_ERNIC_CAP_ABORT_OP));
             memcpy(m.data, &r, sizeof(r));
         }
     }

@@ -160,7 +160,10 @@ struct uet_ernic_rma {
 };
 
 /* abort.flags */
-#define UET_ERNIC_ABORT_ALL 0x01u /* every transfer of the QP, any group */
+#define UET_ERNIC_ABORT_ALL    0x01u /* every transfer of the QP, any group */
+#define UET_ERNIC_ABORT_COOKIE 0x02u /* the one transfer whose WRITE or READ
+                                      * had abort.cookie (32-byte capsule,
+                                      * UET_ERNIC_CAP_ABORT_OP) */
 
 /*
  * UET_ERNIC_OP_ABORT (version 2): take back the WRITEs and READs of this
@@ -178,6 +181,12 @@ struct uet_ernic_rma {
  * delivery context, which is then closed with the peer: other RUD
  * transfers that still have packets on it, of any QP, fail with an error.
  *
+ * With UET_ERNIC_ABORT_COOKIE, the ABORT takes back only the transfer
+ * whose WRITE or READ carried @cookie (group is ignored), and is answered
+ * the same way: that transfer with ECANCELED, then the ABORT with count 1;
+ * count 0 if the transfer had already been answered, its answer coming
+ * first. A device reports this in QUERY as UET_ERNIC_CAP_ABORT_OP.
+ *
  * A device whose engine cannot take transfers back (pds=sng) answers
  * EOPNOTSUPP and takes nothing back; it does not report UET_ERNIC_CAP_ABORT
  * in QUERY.  A device with no room for the answers takes nothing back and
@@ -188,7 +197,9 @@ struct uet_ernic_rma {
 struct uet_ernic_abort {
     struct uet_ernic_hdr hdr;
     uint32_t group;
-    uint32_t flags; /* UET_ERNIC_ABORT_* */
+    uint32_t flags;  /* UET_ERNIC_ABORT_* */
+    uint64_t cookie; /* UET_ERNIC_ABORT_COOKIE only; a capsule without it
+                      * (24 bytes) is accepted for the other flags */
 };
 
 /* ---- replies ----------------------------------------------------------- */
@@ -198,6 +209,7 @@ struct uet_ernic_abort {
 #define UET_ERNIC_CAP_TSS   0x02u /* the engine's traffic is encrypted */
 #define UET_ERNIC_CAP_ABORT 0x04u /* ABORT takes transfers back */
 #define UET_ERNIC_CAP_REKEY 0x08u /* MR_REKEY */
+#define UET_ERNIC_CAP_ABORT_OP 0x10u /* ABORT of one transfer by cookie */
 
 /*
  * Every reply. status is 0 or a positive Linux errno value: EPROTO for a
@@ -251,7 +263,9 @@ _Static_assert(sizeof(struct uet_ernic_release) == 24, "release layout");
 _Static_assert(sizeof(struct uet_ernic_peer_add) == 24, "PEER_ADD layout");
 _Static_assert(sizeof(struct uet_ernic_rma) == UET_ERNIC_CAPSULE_SIZE,
                "WRITE/READ layout");
-_Static_assert(sizeof(struct uet_ernic_abort) == 24, "ABORT layout");
+_Static_assert(sizeof(struct uet_ernic_abort) == 32, "ABORT layout");
+_Static_assert(offsetof(struct uet_ernic_abort, cookie) == 24,
+               "ABORT without a cookie");
 _Static_assert(sizeof(struct uet_ernic_reply) == UET_ERNIC_CAPSULE_SIZE,
                "reply layout");
 _Static_assert(offsetof(struct uet_ernic_reply, u) == 24, "reply payload");

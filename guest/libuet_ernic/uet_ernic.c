@@ -84,6 +84,8 @@ struct pending {
     uint64_t len;
     uint64_t flags;          /* FI_RMA | FI_WRITE or FI_READ */
     struct auto_mr *auto_mr; /* PEND_RMA from an unregistered buffer */
+    bool cancelling;         /* PEND_RMA being taken back by
+                              * uet_ep_abort_op(): no completion */
 };
 
 struct uet_ernic_dev {
@@ -117,6 +119,11 @@ struct uet_ernic_dev {
      * the next command gives them back first. */
     uint32_t orphans[ORPHANS];
     unsigned norphans;
+
+    /* uet_ep_abort_op(): the answer of the transfer it is taking back,
+     * if it came */
+    bool cancel_answered;
+    int cancel_status;
 
     bool broken;   /* the service QP failed; nothing more will complete */
     unsigned late; /* PEND_LATE slots */
@@ -298,10 +305,16 @@ static void dispatch(struct uet_ernic_dev *d, const uint8_t *capsule)
     }
 
     int status = (int32_t)le32toh((uint32_t)r.status);
-    /* An aborted endpoint's transfers end without completions, as the
-     * reference's do. */
-    if (!p->ep->aborted)
+    if (p->cancelling) {
+        /* uet_ep_abort_op() decides what it reports */
+        d->cancel_answered = true;
+        d->cancel_status = status;
+        p->cancelling = false;
+    } else if (!p->ep->aborted) {
+        /* An aborted endpoint's transfers end without completions, as
+         * the reference's do. */
         cq_push(p->ep->tx_cq, p->context, p->flags, p->len, status);
+    }
     p->ep->in_flight--;
     if (p->auto_mr != NULL)
         p->auto_mr->refs--;
@@ -1289,6 +1302,9 @@ int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
         v = ep->rudi;
     else if (optname == UET_OPT_ABORT)
         v = can_abort(ep->dom->dev);
+    else if (optname == UET_OPT_ABORT_OP)
+        v = can_abort(ep->dom->dev) &&
+            (ep->dom->dev->caps & UET_ERNIC_CAP_ABORT_OP) != 0;
     else
         return -FI_ENOSYS;
     if (optval == NULL || optlen == NULL || *optlen < sizeof(bool)) {
@@ -1390,6 +1406,87 @@ int uet_ep_abort(uet_ep_handle_t ep_handle)
             rc = -FI_EIO;
         if (rc != 0)
             dev_kill(d);
+    }
+    pthread_mutex_unlock(&d->lock);
+    return rc;
+}
+
+int uet_ep_abort_op(uet_ep_handle_t ep_handle, void *context)
+{
+    struct uet_ernic_ep *ep = ep_handle;
+    struct uet_ernic_dev *d;
+    struct uet_ernic_abort q;
+    struct uet_ernic_reply r;
+    struct pending *p = NULL;
+    uint64_t deadline, cookie = 0, len = 0, flags = 0;
+    uint32_t count = 0;
+    int rc;
+
+    if (ep == NULL)
+        return -FI_EINVAL;
+    d = ep->dom->dev;
+
+    pthread_mutex_lock(&d->lock);
+    if (d->broken) {
+        pthread_mutex_unlock(&d->lock);
+        return -FI_EIO;
+    }
+    if (!can_abort(d) || (d->caps & UET_ERNIC_CAP_ABORT_OP) == 0) {
+        pthread_mutex_unlock(&d->lock);
+        return -FI_ENOSYS;
+    }
+    progress(d); /* what has been answered is not taken back */
+    for (;;) {
+        p = NULL;
+        for (unsigned i = 0; i < PENDING; i++) {
+            if (d->pend[i].kind == PEND_RMA && d->pend[i].ep == ep &&
+                d->pend[i].context == context) {
+                p = &d->pend[i];
+                cookie = (p->gen << 8) | i;
+                len = p->len;
+                flags = p->flags;
+                break;
+            }
+        }
+        if (p == NULL) {
+            rc = -FI_ENOENT;
+            break;
+        }
+
+        /* Its answer, ECANCELED or the one it finished with, comes before
+         * the ABORT's, and is kept from the completion queue. */
+        p->cancelling = true;
+        d->cancel_answered = false;
+        count = 0;
+        deadline = now_ms() + d->sync_wait_ms;
+        do {
+            memset(&q, 0, sizeof(q));
+            hdr_init(d, &q.hdr, UET_ERNIC_OP_ABORT, 0);
+            q.flags = htole32(UET_ERNIC_ABORT_COOKIE);
+            q.cookie = htole64(cookie);
+            rc = call(d, &q, sizeof(q), &r);
+            if (rc == -FI_EAGAIN)
+                progress(d);
+        } while (rc == -FI_EAGAIN && now_ms() < deadline);
+        if (rc == 0)
+            count = le32toh(r.u.abort.count);
+
+        if (!d->cancel_answered) {
+            /* Not answered: still in flight.  It reports as usual. */
+            p->cancelling = false;
+            if (rc == 0)
+                rc = -FI_EIO; /* taken back, not answered: a broken ABI */
+            break;
+        }
+        if (rc == 0 && count == 1)
+            break; /* taken back */
+        /* It had finished, or the ABORT failed after its answer: it
+         * reports what it ended with. */
+        if (!ep->aborted)
+            cq_push(ep->tx_cq, context, flags, len, d->cancel_status);
+        if (rc != 0)
+            break;
+        /* finished just before: another with the context may be left */
     }
     pthread_mutex_unlock(&d->lock);
     return rc;
@@ -1547,6 +1644,7 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
     }
     hdr_init(d, &q.hdr, op, cookie);
     p->kind = PEND_RMA;
+    p->cancelling = false;
     p->ep = ep;
     p->context = context;
     p->len = len;

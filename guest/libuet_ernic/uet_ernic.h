@@ -79,6 +79,7 @@
 #define UET_MR_KEY_IDEMPOTENT_SAFE      0x8000000000000000ULL
 #define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
 #define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
+#define UET_OPT_ABORT_OP ((int)(FI_PROV_SPECIFIC | 3U))
 /* clang-format on */
 
 typedef void *uet_handle_t;
@@ -144,6 +145,17 @@ int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
  * that needs the device fails with -FI_EIO, and releasing things succeeds.
  */
 int uet_ep_abort(uet_ep_handle_t ep_handle);
+/*
+ * Take back one transfer of the endpoint posted with @context: the first
+ * one still in flight, if several were (call again for the next).  0 when
+ * the device took it back: nothing of it goes on the wire again, and it
+ * reports no completion.  -FI_ENOENT when none is in flight (one that
+ * finished reports its completion as usual).  -FI_ENOSYS from a device
+ * without UET_ERNIC_CAP_ABORT_OP; -FI_EBUSY when the device could not take
+ * it out of its engine, and it may still land.  UET_OPT_ABORT_OP says
+ * whether it works.
+ */
+int uet_ep_abort_op(uet_ep_handle_t ep_handle, void *context);
 int uet_ep_close(uet_ep_handle_t ep_handle);
 int uet_ep_progress(uet_ep_handle_t ep_handle);
 
