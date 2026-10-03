@@ -126,6 +126,12 @@ The argument of ``--uet`` is a comma-separated list of
      - from ``mtu=``
      - The Payload MTU: 1024, 2048, 4096 or 8192. By default
        the largest whose packets fit the MTU.
+   * - ``window=``
+     - 128, or 512 on a DPDK port
+     - Packets in flight per transfer: the PDS window offered to a
+       peer, and the RUDI bound. A multiple of 128, up to 32640.
+       The wire's queue has to hold a burst of it. A TAP queues
+       1000 frames, and a DPDK port's rings hold 4096.
    * - ``encap=``
      - ``udp``
      - ``udp`` puts UET in UDP to ``port=``; ``ip`` puts it
@@ -1227,7 +1233,10 @@ An Intel E810
 
 These steps run one engine on each port of an E810, with a cable
 between the two ports. Both ports go to ``vfio-pci``, so the host has
-no netdev on that wire. So run the ``rma`` and ``prov`` checks only.
+no netdev on that wire. So run the ``rma`` and ``prov`` checks only,
+and run them with ``UET_PCAP=0``. The checks capture on the CI
+bridge, which the wire does not cross, so a capture would be empty
+and the check would fail on it.
 The commands use ``0000:c1:00.0`` and ``0000:c1:00.1``. Use the
 addresses that ``dpdk-devbind.py -s`` shows.
 
@@ -1287,23 +1296,42 @@ addresses that ``dpdk-devbind.py -s`` shows.
       export ERNIC_LAUNCHER=$PWD/ci/uet-dpdk-launcher
       export ERNIC_UET='ip=192.168.200.10%i,mtu=9000,wire=dpdk,dpdk-dev=0000:c1:00.%j'
       bash ci/jobs/vm-up.sh && bash ci/jobs/vm-functional.sh
-      UET_CHECKS="rma prov" bash ci/jobs/vm-uet.sh
+      UET_PCAP=0 UET_CHECKS="rma prov" bash ci/jobs/vm-uet.sh
 
 7. Make sure that the startup line shows ``(pci)``, ``flow hw``,
    ``tx extbuf zero-copy`` and ``guest mem dma-mapped``. Make sure
    that each region line shows ``DMA-mapped``, except the
    read-only ones. At exit, the stats line must count no transmit
-   frames copied as not mapped.
+   frames copied as not mapped. The engine line must show
+   ``window 512``.
 
    .. code-block:: bash
 
-      grep 'UET wire' /var/tmp/ernic-ci-work/log/1.log
+      grep 'UET wire\|UET engine' /var/tmp/ernic-ci-work/log/1.log
 
 The wrapper raises ``RLIMIT_MEMLOCK`` to unlimited for a port on
 PCI, because VFIO pins the hugepages and each guest region. To see
 the DDP package that ice loaded, add
 ``dpdk-eal=--log-level=pmd.net.ice.init:info`` to ``ERNIC_UET``,
 and look for ``Active package is`` in the log.
+
+Guest memory on 2 MiB pages is worth about 5%: the engine reads
+every payload for the CRC and copies every received one into guest
+memory, and the translation works a page at a time. The guests' RAM
+is a memfd mapping, so transparent huge pages for shared memory
+cover it. The setting does not survive a reboot.
+
+.. code-block:: bash
+
+   echo always | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
+   echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+With all of this, a 1 GiB write from one guest to the other moves
+5.7 GiB/s over RUD and 5.1 GiB/s over RUDI, with each engine on one
+core. The sender's time is the CRC over the payload in guest memory,
+and the receiver's is the copy into guest memory. The 4 MiB writes
+the checks make are too short to show this: they finish in about a
+millisecond and measure the setup.
 
 To give the ports back to the kernel and free the hugepages:
 
@@ -1348,11 +1376,11 @@ Known Limits and Findings
 - ``fi_close()`` on that provider cannot discard writes already
   in the device (see the guest library's differences). A late
   write cut off by closing the endpoint can still land.
-- The DPDK wire ran on virtual devices only: ``net_tap``,
-  ``af_packet``, ``memif``, ``ring`` and ``dma_skeleton``. None of
-  them does DMA. So the guest memory mapping ran with test hooks,
-  and with ``rte_dev_dma_map()`` as a no-op. RSS through a flow
-  rule, buffer split and transmit timestamps did not run.
+- On hardware, the DPDK wire ran on an Intel E810 only, with
+  hardware flow rules, timestamps and checksums, and guest memory
+  DMA-mapped for the port. RSS through a flow rule, buffer split
+  and a dmadev have run on virtual devices only, with
+  ``dma_skeleton`` as the dmadev.
 - ``net_memif`` in DPDK 24.11 crashes when a memif buffer is larger
   than an mbuf, and when a peer disconnects while the other side
   polls. ``uet-dpdk-unit`` uses 8 KiB buffers, and its memif server
