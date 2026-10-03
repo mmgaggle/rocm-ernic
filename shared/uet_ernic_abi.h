@@ -36,6 +36,10 @@
  * its own, and QUERY reports its own. A guest sends the lower of that and
  * its own version; QUERY itself goes as version 1, which every device
  * takes.
+ *
+ * MR_REKEY, which gives a region a new key, came later in version 2: a
+ * device has it when QUERY reports UET_ERNIC_CAP_REKEY, and answers
+ * EOPNOTSUPP otherwise.
  */
 
 #ifndef UET_ERNIC_ABI_H
@@ -75,6 +79,8 @@ enum uet_ernic_op {
     UET_ERNIC_OP_WRITE = 6,       /* RMA write, answered on completion */
     UET_ERNIC_OP_READ = 7,        /* RMA read, answered on completion */
     UET_ERNIC_OP_ABORT = 8,       /* take transfers back (version 2) */
+    UET_ERNIC_OP_MR_REKEY = 9,    /* a new key for a region (version 2,
+                                   * UET_ERNIC_CAP_REKEY) */
 };
 
 /* hdr.flags */
@@ -109,7 +115,18 @@ struct uet_ernic_mr_reg {
     uint32_t access; /* UET_ERNIC_ACC_* */
 };
 
-/* UET_ERNIC_OP_MR_DEREG and UET_ERNIC_OP_PEER_REMOVE. */
+/*
+ * UET_ERNIC_OP_MR_DEREG and UET_ERNIC_OP_PEER_REMOVE; and UET_ERNIC_OP_MR_REKEY
+ * (version 2, UET_ERNIC_CAP_REKEY), which gives the region a new key,
+ * answered like MR_REG with the handle, which stays, and the new key. The
+ * old key is dead once the reply is sent: a request naming it places
+ * nothing and is answered "bad key", whether a late duplicate of a write
+ * that completed or a message still arriving, as if the region had been
+ * deregistered. The region keeps its pages and its transfers, and takes
+ * nothing more on the device, so a region can be re-keyed as often as
+ * needed; deregistering and registering again holds an entry for the
+ * device's quarantine (6 s) each time.
+ */
 struct uet_ernic_release {
     struct uet_ernic_hdr hdr;
     uint32_t handle;
@@ -180,6 +197,7 @@ struct uet_ernic_abort {
 #define UET_ERNIC_CAP_RUDI  0x01u /* the engine can use RUDI */
 #define UET_ERNIC_CAP_TSS   0x02u /* the engine's traffic is encrypted */
 #define UET_ERNIC_CAP_ABORT 0x04u /* ABORT takes transfers back */
+#define UET_ERNIC_CAP_REKEY 0x08u /* MR_REKEY */
 
 /*
  * Every reply. status is 0 or a positive Linux errno value: EPROTO for a
@@ -211,7 +229,7 @@ struct uet_ernic_reply {
             uint32_t handle;
             uint32_t reserved;
             uint64_t rkey; /* what peers name the region by */
-        } mr_reg;
+        } mr_reg; /* MR_REG and MR_REKEY */
         struct {
             uint32_t handle;
             uint32_t reserved;

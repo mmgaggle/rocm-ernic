@@ -469,6 +469,7 @@ struct report {
     uint64_t wrong;
     struct uet_svc_stats svc;
     struct uet_engine_stats eng;
+    uint32_t churn_peak; /* engine regions held at most in the churn */
 };
 
 struct node {
@@ -1128,11 +1129,87 @@ static void check_query(struct node *n, uint32_t ip)
         memcmp(r.u.query.mac, mac_prefix, 2) != 0 ||
         r.u.query.mac[5] != (uint8_t)ip ||
         (le32toh(r.u.query.caps) & UET_ERNIC_CAP_RUDI) == 0 ||
-        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_ABORT) == 0)
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_ABORT) == 0 ||
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_REKEY) == 0)
         fail(n->rep, "QUERY reported the wrong identity");
 }
 
 /* ---- The two roles ------------------------------------------------------ */
+
+#define CHURN_LKEY 0x00000a0au
+#define REKEYS     10000u
+#define CHURNS     2000u
+
+/*
+ * The target's last part, on a new service QP: a window is re-keyed
+ * REKEYS times over the channel, which must take no table entry, then
+ * closed and registered again CHURNS times the way a guest does it
+ * (MR_DEREG, DESTROY_MR, CREATE_MR with a new key byte, MR_REG), which with
+ * this test's 50 ms quarantine must hold no more than that quarantine's
+ * worth of entries, and give them all back.
+ */
+static void rekey_churn(struct node *n)
+{
+    const uint32_t acc =
+        UET_ERNIC_ACC_REMOTE_WRITE | UET_ERNIC_ACC_IDEMPOTENT_SAFE;
+    struct report *rep = n->rep;
+    struct uet_ernic_release q;
+    struct uet_ernic_reply r;
+    struct uet_engine_stats es;
+    struct uet_svc_stats ss;
+    struct region win;
+    uint32_t h, lkey = CHURN_LKEY, mrs0;
+    uint64_t key = 0, prev;
+    int st;
+
+    region_init(&win, TGT_OFF, TGT_LEN);
+    region_register(n->dp, &win, lkey);
+    expect(n, mr_reg(n, lkey, acc, &h, &key), 0, "MR_REG of a window");
+    uet_engine_get_stats(n->e, &es);
+    mrs0 = es.mrs;
+
+    for (unsigned i = 0; i < REKEYS && rep->ok; i++) {
+        prev = key;
+        memset(&q, 0, sizeof(q));
+        hdr_init(&q.hdr, UET_ERNIC_OP_MR_REKEY, ++n->next_cookie);
+        q.handle = htole32(h);
+        st = call(n, &q, sizeof(q), "MR_REKEY", &r);
+        key = le64toh(r.u.mr_reg.rkey);
+        if (st != 0 || le32toh(r.u.mr_reg.handle) != h || key == prev)
+            fail(rep, "MR_REKEY %u: status %d, key %#" PRIx64, i, st, key);
+    }
+    uet_engine_get_stats(n->e, &es);
+    if (es.mrs != mrs0 || es.mr_rekeys < REKEYS)
+        fail(rep, "the re-keys left %u regions, not %u", es.mrs, mrs0);
+    memset(&q, 0, sizeof(q));
+    hdr_init(&q.hdr, UET_ERNIC_OP_MR_REKEY, ++n->next_cookie);
+    q.handle = htole32(0x12345u);
+    expect(n, call(n, &q, sizeof(q), "MR_REKEY", NULL), EBADF,
+           "MR_REKEY of a handle never handed out");
+
+    for (unsigned i = 0; i < CHURNS && rep->ok; i++) {
+        expect(n, release(n, UET_ERNIC_OP_MR_DEREG, h), 0, "MR_DEREG");
+        ionic_datapath_unregister_mr(n->dp, lkey);
+        lkey = CHURN_LKEY | ((i + 1u) & 0xffu) << 24;
+        region_register(n->dp, &win, lkey);
+        expect(n, mr_reg(n, lkey, acc, &h, NULL), 0, "MR_REG again");
+        uet_engine_get_stats(n->e, &es);
+        if (es.mrs > rep->churn_peak)
+            rep->churn_peak = es.mrs;
+    }
+    pump_for(n, 100.0);
+    uet_engine_get_stats(n->e, &es);
+    uet_svc_get_stats(n->dp->uet_svc, &ss);
+    if (es.mrs != mrs0 || es.mrs_quarantined != 0 || es.mrs_held != 0 ||
+        ss.mrs != 1 || ss.mrs_dead != 0)
+        fail(rep,
+             "after the churn the engine holds %u regions (%u quarantined, "
+             "%u held), %u before, and the channel %u (%u dead)",
+             es.mrs, es.mrs_quarantined, es.mrs_held, mrs0, ss.mrs,
+             ss.mrs_dead);
+    expect(n, release(n, UET_ERNIC_OP_MR_DEREG, h), 0, "MR_DEREG");
+    ionic_datapath_unregister_mr(n->dp, lkey);
+}
 
 static void run_target(struct node *n)
 {
@@ -1210,6 +1287,9 @@ static void run_target(struct node *n)
         rep->compared++;
     }
     pump_for(n, 100.0);
+
+    svc_qp_create(n);
+    rekey_churn(n);
 }
 
 static void run_initiator(struct node *n)
@@ -1646,6 +1726,10 @@ int main(void)
                "of a WRITE waiting for ARP (%.1f ms), and %" PRIu64
                " ABORT answered EAGAIN with a full reply queue\n",
                ini.abort_wait_ms, ini.aborts_deferred);
+        printf("  %u MR_REKEY took no entry; %u MR_DEREG + DESTROY_MR + "
+               "CREATE_MR + MR_REG held at most %u engine entries (50 ms "
+               "quarantine) and gave them all back\n",
+               REKEYS, CHURNS, tgt.churn_peak);
         printf("  initiator channel: %" PRIu64 " commands, %" PRIu64
                " replies, %" PRIu64 " waited for a receive, %" PRIu64
                " discarded, %" PRIu64 " dropped\n",

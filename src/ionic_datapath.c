@@ -2105,6 +2105,15 @@ static const struct uet_svc_ops dp_uet_svc_ops = {
     .reply = dp_uet_reply,
 };
 
+bool ionic_datapath_uet_stats(struct ionic_datapath *dp,
+                              struct uet_svc_stats *out)
+{
+    if (!dp || !dp->uet_svc)
+        return false;
+    uet_svc_get_stats(dp->uet_svc, out);
+    return true;
+}
+
 bool ionic_datapath_attach_uet(struct ionic_datapath *dp,
                                struct uet_engine *engine, char *err,
                                size_t errlen)

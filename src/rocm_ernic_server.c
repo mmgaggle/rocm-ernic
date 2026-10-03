@@ -47,6 +47,7 @@
 #include "rocm-ernic-warnings.h"
 #ifdef ERNIC_HAVE_UET
 #include "uet_engine.h"
+#include "uet_svc.h"
 #endif
 #ifdef ERNIC_HAVE_UET_DPDK
 #include "uet_wire_dpdk.h"
@@ -906,10 +907,13 @@ static void uet_stats_section(FILE *fp, void *ctx)
 {
     rocm_ernic_dev_t *dev = ctx;
     struct uet_engine_stats st;
+    struct uet_svc_stats ss;
 
     if (!dev->uet_engine)
         return;
     uet_engine_get_stats(dev->uet_engine, &st);
+    memset(&ss, 0, sizeof(ss));
+    (void)ionic_datapath_uet_stats(dev->ionic_dp, &ss);
     fprintf(fp, "UET Engine:\n");
 #define UET_STAT(name, v) \
     fprintf(fp, "  %-23s : %" PRIu64 "\n", name, (uint64_t)(v))
@@ -928,6 +932,19 @@ static void uet_stats_section(FILE *fp, void *ctx)
     UET_STAT("writes_to_dead_key", st.writes_to_dead_key);
     UET_STAT("revoked_hits", st.revoked_hits);
     UET_STAT("dma_faults", st.dma_faults);
+    /* regions: live = mrs - mrs_quarantined - mrs_held; svc_mrs_dead are
+     * handles whose ionic MR went away before MR_DEREG */
+    UET_STAT("mrs", st.mrs);
+    UET_STAT("mrs_quarantined", st.mrs_quarantined);
+    UET_STAT("mrs_held", st.mrs_held);
+    UET_STAT("mr_regs", st.mr_regs);
+    UET_STAT("mr_deregs", st.mr_deregs);
+    UET_STAT("mr_rekeys", st.mr_rekeys);
+    UET_STAT("svc_mrs", ss.mrs);
+    UET_STAT("svc_mrs_dead", ss.mrs_dead);
+    UET_STAT("svc_peers", ss.peers);
+    UET_STAT("svc_ops_queued", ss.ops_queued);
+    UET_STAT("svc_ops_posted", ss.ops_posted);
 #undef UET_STAT
     fprintf(fp, "\n");
 }

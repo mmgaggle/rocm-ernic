@@ -35,7 +35,10 @@
 #include <sys/uio.h>
 
 #define UET_ENGINE_MAX_PEERS 32u
-#define UET_ENGINE_MAX_MRS   256u
+/* Region handles, quarantined ones included: at the default quarantine of
+ * 6 s, room for close-and-register churn of 600 a second besides the live
+ * ones.  uet_engine_mr_rekey() takes none. */
+#define UET_ENGINE_MAX_MRS   4096u
 #define UET_ENGINE_MAX_OPS   64u /* operations in flight at once */
 
 /* Packet delivery sublayer implementation. */
@@ -276,6 +279,17 @@ int uet_engine_mr_reg_pages(struct uet_engine *e,
 int uet_engine_mr_dereg(struct uet_engine *e, uint32_t mr);
 
 /*
+ * Give a region a new key, in @rkey.  The old key is dead when this
+ * returns, as a deregistered region's is: a request naming it places
+ * nothing and is answered "bad key", whether it is a late duplicate of a
+ * write that completed or a message still arriving.  The region keeps its
+ * handle, pages and operations, so this takes no table entry and no
+ * quarantine.  Returns 0, -EINVAL for a bad or deregistered handle, or
+ * -ENOSYS when the provider cannot.
+ */
+int uet_engine_mr_rekey(struct uet_engine *e, uint32_t mr, uint64_t *rkey);
+
+/*
  * Make a peer endpoint addressable.  Its MAC is resolved by ARP in the
  * background; until that finishes, operations to it return -EAGAIN.
  */
@@ -350,6 +364,10 @@ struct uet_engine_stats {
     uint64_t ops_completed;
     uint64_t ops_failed;
     uint64_t ops_aborted; /* taken back by uet_engine_abort() */
+    /* regions */
+    uint64_t mr_regs;
+    uint64_t mr_deregs;
+    uint64_t mr_rekeys;
     /* region memory */
     uint64_t dma_read_maps;
     uint64_t dma_write_maps;
@@ -360,6 +378,9 @@ struct uet_engine_stats {
                                   * answered "bad key" */
     /* tables, now */
     uint32_t mrs;   /* region handles held, quarantined ones included */
+    uint32_t mrs_quarantined; /* of which deregistered, waiting out the
+                               * quarantine */
+    uint32_t mrs_held; /* of which past it, still used by an operation */
     uint32_t peers; /* peer handles held, ones being removed included */
     uint32_t ops_in_flight;
 };

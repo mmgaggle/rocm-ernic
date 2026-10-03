@@ -105,6 +105,7 @@ enum case_kind {
     CASE_LOOPBACK,       /* one engine writes to itself, off the wire */
     CASE_LOOPBACK_ABORT, /* the same, taken back at once */
     CASE_DEAD_KEY, /* a write, then its duplicates after the key changed */
+    CASE_REKEY,    /* the same, the key changed by uet_engine_mr_rekey() */
 };
 
 struct test_case {
@@ -226,6 +227,13 @@ static const struct test_case cases[] = {
      "duplicates of a RUDI write after the target re-registered its memory",
      true, UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
      UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_DEAD_KEY},
+    /* The same with the key changed in place: the duplicates find nothing.
+     * Then 100000 re-keys must take no table entry, and 100000
+     * registrations and deregistrations must give every entry back. */
+    {"rekey-rudi",
+     "duplicates of a RUDI write after the target re-keyed its region",
+     true, UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_REKEY},
 };
 
 /* ------------------------------------------------------------------ */
@@ -625,6 +633,9 @@ struct report {
     uint64_t old_key, new_key;
     uint64_t dead_key_hits; /* writes_to_dead_key afterwards */
     uint64_t landed;        /* bytes of the new registration not zero */
+    /* CASE_REKEY */
+    double rekey_ns, churn_ns; /* each, on average */
+    uint32_t churn_peak;       /* regions held at most during the churn */
 };
 
 static void fail(struct report *rep, const char *fmt, ...)
@@ -678,6 +689,8 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
     cfg.pds = n->tc->pds;
     /* CASE_DEAD_KEY closes regions at once, to reuse their index */
     if (n->tc->kind == CASE_DEAD_KEY)
+        cfg.mr_quarantine_ms = 0;
+    if (n->tc->kind == CASE_REKEY)
         cfg.mr_quarantine_ms = 0;
 
     struct uet_engine_wire wire = {
@@ -735,8 +748,9 @@ static void replay_after_reregistration(struct node *n, struct report *rep,
     rep->old_key = old_key;
     (void)uet_engine_mr_dereg(n->e, *mr);
     pump(n);
-    /* the provider hands indices out in turn, 256 of them */
-    for (unsigned i = 0; i < 255; i++) {
+    /* the provider hands indices out in turn, as many as the engine has
+     * regions */
+    for (unsigned i = 0; i < UET_ENGINE_MAX_MRS - 1u; i++) {
         rc = uet_engine_mr_reg(n->e, d, &h, &key);
         if (rc != 0) {
             fail(rep, "mr_reg %u: %s", i, strerror(-rc));
@@ -786,6 +800,124 @@ static void replay_after_reregistration(struct node *n, struct report *rep,
     free(n->rec_len);
 }
 
+/* Give the recorded frames to the target again; count what lands. */
+static void replay_recorded(struct node *n, struct report *rep)
+{
+    struct uet_engine_stats st;
+    uint64_t before;
+
+    uet_engine_get_stats(n->e, &st);
+    before = st.writes_to_dead_key;
+    for (size_t i = 0; i < n->nrec; i++) {
+        (void)uet_engine_rx_frame(n->e, n->rec[i], n->rec_len[i]);
+        rep->replayed++;
+        if (i % 64 == 63)
+            uet_engine_poll(n->e);
+    }
+    for (double end = now_ms() + 200.0; now_ms() < end;)
+        pump(n);
+    uet_engine_get_stats(n->e, &st);
+    rep->dead_key_hits = st.writes_to_dead_key - before;
+    for (size_t off = 0; off < n->r.len; off++)
+        rep->landed += *region_byte(&n->g, &n->r, off) != 0 ? 1u : 0u;
+    for (size_t i = 0; i < n->nrec; i++)
+        free(n->rec[i]);
+    free(n->rec);
+    free(n->rec_len);
+    n->rec = NULL;
+    n->nrec = 0;
+}
+
+#define REKEYS 100000u
+
+/*
+ * CASE_REKEY, on the target once the write has landed and compared: the
+ * region gets a new key in place, its memory is cleared, and the recorded
+ * frames come again, as late duplicates: none may land.  Then REKEYS more
+ * re-keys must take no table entry, and REKEYS registrations and
+ * deregistrations of the same memory must give every entry back (with no
+ * quarantine here: in-process, both take well under a microsecond, so any
+ * quarantine fills the table; test_uet_datapath.c churns with one).
+ */
+static void replay_after_rekey(struct node *n, struct report *rep,
+                               const uint32_t *mr,
+                               const struct uet_engine_mr_desc *d,
+                               uint64_t old_key)
+{
+    struct uet_engine_stats st;
+    uint64_t key = 0, prev;
+    uint32_t h, mrs0;
+    double t0;
+    int rc;
+
+    n->recording = false;
+    rep->old_key = old_key;
+    rc = uet_engine_mr_rekey(n->e, *mr, &key);
+    if (rc != 0) {
+        fail(rep, "rekey: %s", strerror(-rc));
+        return;
+    }
+    rep->new_key = key;
+    if (key == old_key || (key & 0xffffffu) != (old_key & 0xffffffu))
+        fail(rep, "%#" PRIx64 " is not a new key for index %#" PRIx64, key,
+             old_key & 0xffffffu);
+    for (size_t off = 0; off < n->r.len; off++)
+        *region_byte(&n->g, &n->r, off) = 0;
+    replay_recorded(n, rep);
+    if (rep->landed != 0)
+        fail(rep, "%" PRIu64 " bytes of the duplicates landed after the "
+             "re-key", rep->landed);
+    if (rep->dead_key_hits == 0)
+        fail(rep, "the duplicates were not counted as writes to a dead key");
+    if (!rep->ok)
+        return;
+
+    uet_engine_get_stats(n->e, &st);
+    mrs0 = st.mrs;
+    prev = key;
+    t0 = now_ms();
+    for (unsigned i = 0; i < REKEYS; i++) {
+        rc = uet_engine_mr_rekey(n->e, *mr, &key);
+        if (rc != 0 || key == prev) {
+            fail(rep, "rekey %u: %s", i, rc != 0 ? strerror(-rc) : "same key");
+            return;
+        }
+        prev = key;
+        if (i % 1024 == 0)
+            uet_engine_poll(n->e);
+    }
+    rep->rekey_ns = (now_ms() - t0) * 1e6 / REKEYS;
+    uet_engine_get_stats(n->e, &st);
+    if (st.mrs != mrs0)
+        fail(rep, "%u regions held after the re-keys, %u before", st.mrs,
+             mrs0);
+
+    t0 = now_ms();
+    for (unsigned i = 0; i < REKEYS; i++) {
+        rc = uet_engine_mr_reg(n->e, d, &h, &key);
+        if (rc != 0) {
+            fail(rep, "registration %u of the churn: %s", i, strerror(-rc));
+            return;
+        }
+        (void)uet_engine_mr_dereg(n->e, h);
+        if (i % 64 == 0) {
+            uet_engine_poll(n->e);
+            uet_engine_get_stats(n->e, &st);
+            if (st.mrs > rep->churn_peak)
+                rep->churn_peak = st.mrs;
+        }
+    }
+    rep->churn_ns = (now_ms() - t0) * 1e6 / REKEYS;
+    for (double end = now_ms() + 20.0; now_ms() < end;)
+        pump(n);
+    uet_engine_get_stats(n->e, &st);
+    if (st.mrs != mrs0 || st.mrs_quarantined != 0 || st.mrs_held != 0)
+        fail(rep,
+             "%u regions held after the churn (%u quarantined, %u held), "
+             "%u before",
+             st.mrs, st.mrs_quarantined, st.mrs_held, mrs0);
+}
+
 static void run_target(struct node *n, struct report *rep)
 {
     struct uet_engine_mr_desc d;
@@ -816,7 +948,7 @@ static void run_target(struct node *n, struct report *rep)
     m.type = CTL_KEY;
     m.rkey = rkey;
     m.a = n->r.len;
-    if (n->tc->kind == CASE_DEAD_KEY) {
+    if (n->tc->kind == CASE_DEAD_KEY || n->tc->kind == CASE_REKEY) {
         n->rec = calloc(4096, sizeof(*n->rec));
         n->rec_len = calloc(4096, sizeof(*n->rec_len));
         n->recording = n->rec != NULL && n->rec_len != NULL;
@@ -862,6 +994,8 @@ static void run_target(struct node *n, struct report *rep)
 
     if (n->tc->kind == CASE_DEAD_KEY && rep->ok)
         replay_after_reregistration(n, rep, &mr, &d, rkey);
+    if (n->tc->kind == CASE_REKEY && rep->ok)
+        replay_after_rekey(n, rep, &mr, &d, rkey);
 
     memset(&m, 0, sizeof(m));
     m.type = CTL_VERIFIED;
@@ -1618,7 +1752,8 @@ static bool run_case(const struct test_case *tc)
              !WIFEXITED(st_tgt) || WEXITSTATUS(st_tgt) != 0)
         fail(&verdict, "a process exited badly (initiator %#x, target %#x)",
              (unsigned)st_ini, (unsigned)st_tgt);
-    else if (tc->kind == CASE_WRITE || tc->kind == CASE_DEAD_KEY)
+    else if (tc->kind == CASE_WRITE || tc->kind == CASE_DEAD_KEY ||
+             tc->kind == CASE_REKEY)
         check_wire(tc, &ini, &tgt, &verdict);
 
     if (have_ini && have_tgt && tc->kind == CASE_DEAD_KEY)
@@ -1627,6 +1762,16 @@ static bool run_case(const struct test_case *tc)
                " counted as writes to a dead key, %" PRIu64 " bytes landed\n",
                tgt.old_key, tgt.new_key, tgt.replayed, tgt.dead_key_hits,
                tgt.landed);
+    if (have_ini && have_tgt && tc->kind == CASE_REKEY)
+        printf("  key %#" PRIx64 " re-keyed to %#" PRIx64 "; %" PRIu64
+               " frames given again: %" PRIu64
+               " counted as writes to a dead key, %" PRIu64
+               " bytes landed\n  %u re-keys, %.0f ns each, no entry taken; "
+               "%u registrations and deregistrations, %.0f ns each, at "
+               "most %u entries held, all given back\n",
+               tgt.old_key, tgt.new_key, tgt.replayed, tgt.dead_key_hits,
+               tgt.landed, REKEYS, tgt.rekey_ns, REKEYS, tgt.churn_ns,
+               tgt.churn_peak);
     if (have_ini && have_tgt && tc->kind == CASE_ABORT) {
         printf("  taken back after %" PRIu64 " requests on a dead wire; the "
                "other write completed %s%s; %" PRIu64

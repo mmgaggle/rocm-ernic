@@ -361,8 +361,8 @@ and after that the lower of the device's version and its own.
    * - ``QUERY``
      - Returns the engine's address, MAC, JobID, PIDonFEP,
        resource index, initiator ID, MTU, the highest ABI
-       version the device speaks, and whether RUDI, TSS and
-       ``ABORT`` work.
+       version the device speaks, and whether RUDI, TSS,
+       ``ABORT`` and ``MR_REKEY`` work.
    * - ``MR_REG``
      - Registers an ionic MR, named by its lkey, with the
        engine. Returns a handle and the 64-bit key peers use.
@@ -370,6 +370,11 @@ and after that the lower of the device's version and its own.
        IDEMPOTENT_SAFE.
    * - ``MR_DEREG``
      - Releases a region handle.
+   * - ``MR_REKEY``
+     - Gives a region a new key and returns it, with the same
+       handle. The old key is dead once the reply is sent. Only
+       when ``QUERY`` reports ``UET_ERNIC_CAP_REKEY`` (see
+       `Re-keying a region`_).
    * - ``PEER_ADD``
      - Makes a peer endpoint (IPv4, PIDonFEP, resource index)
        addressable. Returns a handle. ARP runs in the
@@ -454,7 +459,10 @@ Handles belong to the service QP that created them.
   disabled, for a quarantine of 6 s before it can be reused.
   A partly received message keeps a pointer to the descriptor
   until it completes or goes idle (5 s), and the quarantine
-  stops that pointer from reaching a new region.
+  stops that pointer from reaching a new region. The engine
+  has 4096 region entries, quarantined ones included, so it
+  takes about 600 deregistrations a second besides the live
+  regions. ``MR_REKEY`` takes no entry.
 - A peer handle that is released while transfers use it is
   removed once they finish.
 
@@ -556,6 +564,39 @@ still finishing. That makes them common but rarely late. A path
 with a longer delay, as in the soak, turns the same copies into
 late ones. Owners must invalidate keys before reuse whatever the
 link.
+
+Re-keying a region
+^^^^^^^^^^^^^^^^^^
+
+``MR_REKEY`` invalidates a key without giving the region up. The
+engine asks the provider for a new key at the region's index
+(``uet_mr_rekey()``: the generation next to the index goes up),
+and the region keeps its descriptor, its page list and whatever
+transfers use it as a local buffer. The old key is dead when the
+reply is sent. A packet that names it is dropped as above, and
+the next packet of a message still arriving under it fails. The
+command takes no table entry and no quarantine, so a region can
+be re-keyed for every request. Deregistering and registering the
+same memory again costs an ionic MR (the guest pins the pages
+again) and holds an engine entry for the quarantine each time.
+
+In the guest library it is ``uet_mr_rekey()``, and through the
+libfabric provider it is ``fi_control(&mr->fid,
+FI_UET_MR_REKEY, &key)`` (see the provider's README). Both
+return ``-FI_ENOSYS`` from a device without
+``UET_ERNIC_CAP_REKEY``; then close and register again.
+
+The statistics file counts regions in the ``UET Engine:``
+section:
+
+* ``mrs``: entries in use. ``mrs_quarantined`` of them are
+  deregistered and waiting out the quarantine, and ``mrs_held``
+  are past it but still used by a transfer.
+* ``mr_regs``, ``mr_deregs``, ``mr_rekeys``: totals.
+* ``svc_mrs``: the command channel's region handles.
+  ``svc_mrs_dead`` of them lost their ionic MR before the guest
+  sent ``MR_DEREG``. A count that only grows means a guest is
+  not deregistering.
 
 The Guest Library
 -----------------
@@ -705,13 +746,19 @@ case checks what really crossed the wire.
        both encapsulations.
    * - ``dead-key-rudi``
      - A 1 MiB RUDI write completes. The target closes its region,
-       registers and closes 255 more until the provider's index
+       registers and closes 4095 more until the provider's index
        comes round, clears the memory, and registers it anew at
        the same index. Then it gets the write's 1024 frames again,
        as late duplicates. The new key differs from the old one,
        nothing lands, and every frame counts as a write to a dead
        key. With a key that was the index alone, the same key came
        back and 1044414 bytes landed.
+   * - ``rekey-rudi``
+     - The same, with the region re-keyed in place
+       (``uet_engine_mr_rekey()``) instead of closed: nothing of
+       the 1024 frames given again lands. Then 100000 re-keys take
+       no entry, and 100000 registrations and deregistrations of
+       the same memory give every entry back.
    * - ``loopback-abort-rudi``, ``loopback-abort-rud``
      - One engine writes 1 MiB to itself and takes it back before
        it reads anything. The queued frames are dropped (1024 and
@@ -815,6 +862,14 @@ other endpoint's write completes. Then a late answer: the device
 keeps its answer to an ``MR_REG`` until the 256th command after
 it, and that command, a write, must not be completed by the
 answer. Afterwards each device must hold nothing.
+
+The target then re-keys its window with ``uet_mr_rekey()``: a
+write with the old key fails and lands nothing, one with the new
+key lands. The datapath test sends 10000 ``MR_REKEY`` commands,
+which take no entry, and closes and registers a window 2000
+times as a guest does (``MR_DEREG``, ``DESTROY_MR``,
+``CREATE_MR``, ``MR_REG``), which with its 50 ms quarantine
+holds at most about 1700 engine entries and gives them all back.
 
 A second case, ``guest-lib-v1``, runs the initiator on a device
 that plays ABI version 1: ``UET_OPT_ABORT`` is false, writes go

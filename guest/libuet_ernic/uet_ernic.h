@@ -107,6 +107,10 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
                uint64_t access, uint64_t requested_key, uint64_t flags,
                void *context, uet_mr_handle_t *mr_handle);
 uint64_t uet_mr_key(uet_mr_handle_t mr_handle);
+/* A new key for the region, in @key and from uet_mr_key() (MR_REKEY): the
+ * old key is dead when this returns, and the region keeps its pages and
+ * binding.  -FI_ENOSYS from a device without UET_ERNIC_CAP_REKEY. */
+int uet_mr_rekey(uet_mr_handle_t mr_handle, uint64_t *key);
 int uet_ep_bind_mr(uet_ep_handle_t ep_handle, uet_mr_handle_t mr_handle,
                    uint64_t flags);
 int uet_mr_enable(uet_mr_handle_t mr_handle);

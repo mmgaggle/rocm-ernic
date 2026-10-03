@@ -144,7 +144,8 @@ static bool svc_reply(void *ctx, uint32_t qp_id, const void *capsule,
         if (r.hdr.opcode == UET_ERNIC_OP_QUERY) {
             r.hdr.version = htole16(1);
             r.u.query.abi_version = htole16(1);
-            r.u.query.caps &= htole32(~UET_ERNIC_CAP_ABORT);
+            r.u.query.caps &=
+                htole32(~(UET_ERNIC_CAP_ABORT | UET_ERNIC_CAP_REKEY));
             memcpy(m.data, &r, sizeof(r));
         }
     }

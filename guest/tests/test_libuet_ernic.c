@@ -20,7 +20,9 @@
  * be taken for a later command that reused the slot. Then
  * uet_ep_abort(): two endpoints each write while the wire loses every
  * frame, the first is aborted, and only the second's write may land. The
- * target compares its window byte for byte. Then both tear everything
+ * target compares its window byte for byte. Then it gives the window a new
+ * key with uet_mr_rekey(): a write with the old key must fail and land
+ * nothing, one with the new key must land. Then both tear everything
  * down, and each device must be left holding nothing.
  *
  * A second case runs the initiator on a device of ABI version 1, which
@@ -69,11 +71,15 @@
 #define QTR     (128u * 1024u)
 #define W3      (1280u * 1024u)      /* aborted: stays zero */
 #define W4      (1536u * 1024u + 3u) /* the other endpoint's: lands */
+#define W5      (1792u * 1024u)      /* after the re-key: the old key's */
+#define RK_LEN  (32u * 1024u)        /* and then the new key's, after it */
+#define REKEY_TIMED 1000u
 
 struct report {
     int ok;
     char why[240];
     double write_ms;
+    double rekey_us, rereg_us; /* the target's window, each on average */
     struct fake_ibv_stats fake;
 };
 
@@ -274,6 +280,46 @@ static void run_target(struct guest *g)
     done = g->rep->ok ? 'y' : 'n';
     CHECK(g, send(g->ctl, &done, 1, 0) == 1);
 
+    if (!g_v1) {
+        /* A new key: the initiator writes with the old one, which must
+         * fail, and then with the new one. */
+        uint64_t key = 0;
+
+        CHECK(g, uet_mr_rekey(mr, &key) == 0);
+        CHECK(g, key != hi.key && uet_mr_key(mr) == key &&
+                     (key & UET_MR_KEY_IDEMPOTENT_SAFE) != 0);
+        CHECK(g, send(g->ctl, &key, sizeof(key), 0) == (ssize_t)sizeof(key));
+        CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
+        for (size_t off = 0; off < RK_LEN; off++) {
+            if (win[W5 + off] != 0) {
+                fail(g->rep, "a write with the old key landed at %zu", off);
+                break;
+            }
+            if (win[W5 + RK_LEN + off] != pattern(off)) {
+                fail(g->rep, "the write with the new key is wrong at %zu",
+                     off);
+                break;
+            }
+        }
+        done = g->rep->ok ? 'y' : 'n';
+        CHECK(g, send(g->ctl, &done, 1, 0) == 1);
+
+        /* what each costs the guest, through the channel */
+        double t0 = now_ms();
+        for (unsigned i = 0; i < REKEY_TIMED && g->rep->ok; i++)
+            CHECK(g, uet_mr_rekey(mr, &key) == 0);
+        g->rep->rekey_us = (now_ms() - t0) * 1000.0 / REKEY_TIMED;
+        t0 = now_ms();
+        for (unsigned i = 0; i < REKEY_TIMED && g->rep->ok; i++) {
+            CHECK(g, uet_mr_disable(mr) == 0 && uet_mr_close(mr) == 0);
+            if (!reg(g, dom, ep, win, WIN_LEN,
+                     FI_REMOTE_READ | FI_REMOTE_WRITE,
+                     UET_MR_KEY_IDEMPOTENT_SAFE, &mr))
+                return;
+        }
+        g->rep->rereg_us = (now_ms() - t0) * 1000.0 / REKEY_TIMED;
+    }
+
     close_all(g, h, dom, ep, &mr, 1);
 }
 
@@ -446,6 +492,37 @@ static void run_initiator(struct guest *g)
     CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
     if (done != 'y')
         fail(g->rep, "the target's compare failed");
+
+    /* The target re-keyed its window: the old key fails at once, the new
+     * one works.  The first endpoint was aborted, so a third one. */
+    uint64_t key = 0;
+    uet_ep_handle_t ep3;
+    uet_cq_handle_t txcq3, rxcq3;
+    int stale;
+    CHECK(g, recv(g->ctl, &key, sizeof(key), 0) == (ssize_t)sizeof(key));
+    CHECK(g, key != peer.key);
+    CHECK(g, uet_endpoint(dom, NULL, NULL, NULL, &ep3) == 0);
+    CHECK(g, uet_ep_bind_cq(ep3, &attr2, NULL, FI_SEND, NULL, &txcq3) == 0);
+    CHECK(g, uet_ep_bind_cq(ep3, &attr2, NULL, FI_RECV, NULL, &rxcq3) == 0);
+    CHECK(g, uet_ep_enable(ep3) == 0);
+    CHECK(g, uet_ep_setopt(ep3, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5, peer.key,
+                         &ctx[2]) == 0);
+    stale = reap(g, ep3, txcq3, &c);
+    CHECK(g, stale > 0 && c.op_context == &ctx[2]);
+    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5 + RK_LEN, key,
+                         &ctx[3]) == 0);
+    CHECK(g, reap(g, ep3, txcq3, &c) == 0 && c.op_context == &ctx[3]);
+    done = 'r';
+    CHECK(g, send(g->ctl, &done, 1, 0) == 1);
+    CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
+    if (done != 'y')
+        fail(g->rep, "the target's compare after the re-key failed");
+    printf("rekey: a write with the old key failed with %s\n",
+           strerror(stale));
+    CHECK(g, uet_ep_abort(ep3) == 0);
+    CHECK(g, uet_ep_close(ep3) == 0);
 
     CHECK(g, uet_av_remove(ah) == 0);
     close_all(g, h, dom, ep, mrs, 2);
@@ -678,6 +755,11 @@ static bool run_case(const char *device, bool v1)
                "uet_read back, 1 error completion; guest A sent %" PRIu64
                " capsules, got %" PRIu64 " replies\n",
                ra.write_ms, ra.fake.sends, ra.fake.replies);
+    if (have_a && have_b && !v1)
+        printf("  uet_mr_rekey() of the 2 MiB window: %.1f us; "
+               "uet_mr_close() and uet_mr_reg() again: %.1f us (fake "
+               "verbs, so without pinning)\n",
+               rb.rekey_us, rb.rereg_us);
     show(logs[0], "  device A: ", ok ? "fake-device:" : NULL);
     show(logs[1], "  device B: ", ok ? "fake-device:" : NULL);
 

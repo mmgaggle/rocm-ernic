@@ -152,6 +152,11 @@ bool ionic_datapath_attach_uet(struct ionic_datapath *dp,
                                struct uet_engine *engine, char *err,
                                size_t errlen);
 
+/* The command channel's statistics; false when there is none. */
+struct uet_svc_stats;
+bool ionic_datapath_uet_stats(struct ionic_datapath *dp,
+                              struct uet_svc_stats *out);
+
 /*
  * Set the pvrdma handle so the datapath can post sends via the backend.
  * Call this once after ionic_device_init() and pvrdma_device_realize().

@@ -113,6 +113,15 @@ struct uet_engine {
     struct engine_op ops[UET_ENGINE_MAX_OPS];
     unsigned ops_in_flight;
     unsigned closing; /* regions and peers waiting to be released */
+    unsigned peers_removing;
+
+    /* Free region slots, a stack; and deregistered ones in the order of
+     * deregistration, so in the order their quarantines end. */
+    uint32_t mr_free[UET_ENGINE_MAX_MRS];
+    uint32_t mr_nfree;
+    uint32_t mr_q[UET_ENGINE_MAX_MRS];
+    uint32_t mr_qhead;
+    uint32_t mr_qlen;
 
     struct uet_engine_stats stats;
 };
@@ -809,6 +818,10 @@ struct uet_engine *uet_engine_create(const struct uet_engine_cfg *cfg,
         set_err(err, errlen, "out of memory");
         return NULL;
     }
+    /* slot 0 on top */
+    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++)
+        e->mr_free[i] = UET_ENGINE_MAX_MRS - 1u - i;
+    e->mr_nfree = UET_ENGINE_MAX_MRS;
     e->cfg = *cfg;
     if (e->cfg.mtu == 0)
         e->cfg.mtu = DEFAULT_MTU;
@@ -942,14 +955,24 @@ static void mr_release(struct uet_engine *e, uint32_t slot)
     if (m->closing)
         e->closing--;
     memset(m, 0, sizeof(*m));
+    e->mr_free[e->mr_nfree++] = slot;
+}
+
+/* Put a deregistered region at the back of the quarantine queue. */
+static void mr_quarantine(struct uet_engine *e, uint32_t slot)
+{
+    e->mr_q[(e->mr_qhead + e->mr_qlen) % UET_ENGINE_MAX_MRS] = slot;
+    e->mr_qlen++;
 }
 
 static void peer_release(struct uet_engine *e, uint32_t slot)
 {
     struct engine_peer *p = &e->peers[slot];
 
-    if (p->removing)
+    if (p->removing) {
         e->closing--;
+        e->peers_removing--;
+    }
     memset(p, 0, sizeof(*p));
 }
 
@@ -1032,12 +1055,24 @@ static void reap_closing(struct uet_engine *e)
         return;
     now = now_ms();
 
-    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++) {
-        struct engine_mr *m = &e->mrs[i];
+    /* The queue is in quarantine order, so this stops at the first region
+     * still in quarantine.  One past it but still used by an operation
+     * goes to the back, to be looked at again. */
+    for (uint32_t n = e->mr_qlen; n > 0; n--) {
+        uint32_t slot = e->mr_q[e->mr_qhead];
+        struct engine_mr *m = &e->mrs[slot];
 
-        if (m->used && m->closing && m->refs == 0 && now >= m->close_after_ms)
-            mr_release(e, i);
+        if (now < m->close_after_ms)
+            break;
+        e->mr_qhead = (e->mr_qhead + 1u) % UET_ENGINE_MAX_MRS;
+        e->mr_qlen--;
+        if (m->refs == 0)
+            mr_release(e, slot);
+        else
+            mr_quarantine(e, slot);
     }
+    if (e->peers_removing == 0)
+        return;
     for (uint32_t i = 0; i < UET_ENGINE_MAX_PEERS; i++) {
         struct engine_peer *p = &e->peers[i];
 
@@ -1074,15 +1109,13 @@ bool uet_engine_has_work(const struct uet_engine *e)
            (uet_nic_ernic_rx_pending(e->nic) || e->ops_in_flight > 0);
 }
 
+/* The slot the next registration takes; it is taken by mr_finish_reg(). */
 static int mr_slot_alloc(struct uet_engine *e, uint32_t *slot)
 {
-    for (uint32_t i = 0; i < UET_ENGINE_MAX_MRS; i++) {
-        if (!e->mrs[i].used) {
-            *slot = i;
-            return 0;
-        }
-    }
-    return -ENOSPC;
+    if (e->mr_nfree == 0)
+        return -ENOSPC;
+    *slot = e->mr_free[e->mr_nfree - 1u];
+    return 0;
 }
 
 /* Register, bind and enable; the slot is filled in only on success. */
@@ -1100,12 +1133,14 @@ static int mr_finish_reg(struct uet_engine *e, uint32_t slot, uet_mr_handle_t h,
         return fi_to_errno(rc);
     }
 
+    e->mr_nfree--; /* the slot mr_slot_alloc() named */
     e->mrs[slot].used = true;
     e->mrs[slot].h = h;
     e->mrs[slot].dir = dir;
     e->mrs[slot].ndir = ndir;
     *mr = slot;
     *rkey = uet_mr_key(h);
+    e->stats.mr_regs++;
     return 0;
 }
 
@@ -1206,7 +1241,25 @@ int uet_engine_mr_dereg(struct uet_engine *e, uint32_t mr)
     m->closing = true;
     m->close_after_ms = now_ms() + e->cfg.mr_quarantine_ms;
     e->closing++;
+    e->stats.mr_deregs++;
+    mr_quarantine(e, mr);
     reap_closing(e);
+    return 0;
+}
+
+int uet_engine_mr_rekey(struct uet_engine *e, uint32_t mr, uint64_t *rkey)
+{
+    int rc;
+
+    if (e == NULL || rkey == NULL || mr >= UET_ENGINE_MAX_MRS ||
+        !e->mrs[mr].used || e->mrs[mr].closing)
+        return -EINVAL;
+    /* The provider compares the whole key, so the old one names nothing
+     * from here on; the descriptor and its pages stay as they are. */
+    rc = uet_mr_rekey(e->mrs[mr].h, rkey);
+    if (rc != 0)
+        return fi_to_errno(rc);
+    e->stats.mr_rekeys++;
     return 0;
 }
 
@@ -1262,6 +1315,7 @@ int uet_engine_peer_remove(struct uet_engine *e, uint32_t peer)
     p = &e->peers[peer];
     p->removing = true;
     e->closing++;
+    e->peers_removing++;
     reap_closing(e);
     return 0;
 }
@@ -1486,9 +1540,21 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->nh_pending = ns.nh_pending;
     out->icmp_echo_replies = ns.icmp_echo_replies;
 
-    out->mrs = 0;
-    for (unsigned i = 0; i < UET_ENGINE_MAX_MRS; i++)
-        out->mrs += e->mrs[i].used ? 1u : 0u;
+    uint64_t now = now_ms();
+
+    out->mrs = UET_ENGINE_MAX_MRS - e->mr_nfree;
+    out->mrs_quarantined = 0;
+    out->mrs_held = 0;
+    for (unsigned i = 0; i < UET_ENGINE_MAX_MRS; i++) {
+        const struct engine_mr *m = &e->mrs[i];
+
+        if (!m->used || !m->closing)
+            continue;
+        if (now < m->close_after_ms)
+            out->mrs_quarantined++;
+        else if (m->refs != 0)
+            out->mrs_held++;
+    }
     out->peers = 0;
     for (unsigned i = 0; i < UET_ENGINE_MAX_PEERS; i++)
         out->peers += e->peers[i].used ? 1u : 0u;

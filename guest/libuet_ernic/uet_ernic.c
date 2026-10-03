@@ -935,6 +935,33 @@ uint64_t uet_mr_key(uet_mr_handle_t mr_handle)
     return mr != NULL ? mr->rkey : FI_KEY_NOTAVAIL;
 }
 
+int uet_mr_rekey(uet_mr_handle_t mr_handle, uint64_t *key)
+{
+    struct uet_ernic_mr *mr = mr_handle;
+    struct uet_ernic_dev *d;
+    struct uet_ernic_release q;
+    struct uet_ernic_reply r;
+    int rc;
+
+    if (mr == NULL || key == NULL)
+        return -FI_EINVAL;
+    d = mr->dom->dev;
+    if (d->abi < 2 || (d->caps & UET_ERNIC_CAP_REKEY) == 0)
+        return -FI_ENOSYS;
+
+    pthread_mutex_lock(&d->lock);
+    memset(&q, 0, sizeof(q));
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_REKEY, 0);
+    q.handle = htole32(mr->handle);
+    rc = call(d, &q, sizeof(q), &r);
+    if (rc == 0) {
+        mr->rkey = le64toh(r.u.mr_reg.rkey);
+        *key = mr->rkey;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return rc;
+}
+
 int uet_ep_bind_mr(uet_ep_handle_t ep_handle, uet_mr_handle_t mr_handle,
                    uint64_t flags)
 {

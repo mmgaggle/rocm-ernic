@@ -119,6 +119,7 @@ struct uet_svc {
     void *ctx;
 
     struct svc_mr mrs[SVC_MAX_MRS];
+    uint32_t mr_hint; /* where to look for a free entry first */
     struct svc_peer peers[SVC_MAX_PEERS];
     struct svc_op ops_tab[SVC_MAX_OPS];
     uint32_t nops_live; /* ops_tab entries with used set */
@@ -513,7 +514,8 @@ static void cmd_query(struct uet_svc *s, uint32_t qp_id, uint64_t cookie)
     r.u.query.caps =
         htole32((id.pds == UET_ENGINE_PDS_FULL ? UET_ERNIC_CAP_RUDI : 0u) |
                 (id.sec != UET_ENGINE_SEC_NONE ? UET_ERNIC_CAP_TSS : 0u) |
-                (uet_engine_can_abort(s->e) ? UET_ERNIC_CAP_ABORT : 0u));
+                (uet_engine_can_abort(s->e) ? UET_ERNIC_CAP_ABORT : 0u) |
+                UET_ERNIC_CAP_REKEY);
     send_reply(s, qp_id, &r);
 }
 
@@ -660,9 +662,12 @@ static void cmd_mr_reg(struct uet_svc *s, uint32_t qp_id, const void *capsule,
         return;
     }
 
-    for (uint32_t i = 0; i < SVC_MAX_MRS; i++) {
+    for (uint32_t n = 0; n < SVC_MAX_MRS; n++) {
+        uint32_t i = (s->mr_hint + n) % SVC_MAX_MRS;
+
         if (!s->mrs[i].used) {
             m = &s->mrs[i];
+            s->mr_hint = (i + 1u) % SVC_MAX_MRS;
             break;
         }
     }
@@ -686,6 +691,45 @@ static void cmd_mr_reg(struct uet_svc *s, uint32_t qp_id, const void *capsule,
 
     reply_init(&r, UET_ERNIC_OP_MR_REG, cookie, 0);
     r.u.mr_reg.handle = htole32(handle_of((uint32_t)(m - s->mrs), m->gen));
+    r.u.mr_reg.rkey = htole64(rkey);
+    send_reply(s, qp_id, &r);
+}
+
+static void cmd_mr_rekey(struct uet_svc *s, uint32_t qp_id, const void *capsule,
+                         size_t len, uint64_t cookie)
+{
+    struct uet_ernic_release req;
+    struct uet_ernic_reply r;
+    struct svc_mr *m;
+    uint64_t rkey;
+    int rc;
+
+    if (len < sizeof(req)) {
+        reply_status(s, qp_id, UET_ERNIC_OP_MR_REKEY, cookie, EINVAL);
+        return;
+    }
+    memcpy(&req, capsule, sizeof(req));
+    if (req.reserved != 0) {
+        reply_status(s, qp_id, UET_ERNIC_OP_MR_REKEY, cookie, EINVAL);
+        return;
+    }
+    m = mr_lookup(s, qp_id, le32toh(req.handle));
+    if (m == NULL) {
+        reply_status(s, qp_id, UET_ERNIC_OP_MR_REKEY, cookie, EBADF);
+        return;
+    }
+    if (m->dead) {
+        reply_status(s, qp_id, UET_ERNIC_OP_MR_REKEY, cookie, ECANCELED);
+        return;
+    }
+    rc = uet_engine_mr_rekey(s->e, m->emr, &rkey);
+    if (rc != 0) {
+        reply_status(s, qp_id, UET_ERNIC_OP_MR_REKEY, cookie, -rc);
+        return;
+    }
+    s->stats.rekeys++;
+    reply_init(&r, UET_ERNIC_OP_MR_REKEY, cookie, 0);
+    r.u.mr_reg.handle = req.handle;
     r.u.mr_reg.rkey = htole64(rkey);
     send_reply(s, qp_id, &r);
 }
@@ -835,6 +879,9 @@ void uet_svc_command(struct uet_svc *s, uint32_t qp_id, const void *capsule,
         break;
     case UET_ERNIC_OP_ABORT:
         cmd_abort(s, qp_id, capsule, len, cookie);
+        break;
+    case UET_ERNIC_OP_MR_REKEY:
+        cmd_mr_rekey(s, qp_id, capsule, len, cookie);
         break;
     default:
         reply_status(s, qp_id, h.opcode, cookie, EOPNOTSUPP);
@@ -1018,8 +1065,11 @@ void uet_svc_get_stats(const struct uet_svc *s, struct uet_svc_stats *out)
             out->ops_queued++;
     }
     out->mrs = 0;
-    for (uint32_t i = 0; i < SVC_MAX_MRS; i++)
+    out->mrs_dead = 0;
+    for (uint32_t i = 0; i < SVC_MAX_MRS; i++) {
         out->mrs += s->mrs[i].used ? 1u : 0u;
+        out->mrs_dead += s->mrs[i].used && s->mrs[i].dead ? 1u : 0u;
+    }
     out->peers = 0;
     for (uint32_t i = 0; i < SVC_MAX_PEERS; i++)
         out->peers += s->peers[i].used ? 1u : 0u;

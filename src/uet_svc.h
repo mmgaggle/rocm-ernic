@@ -66,9 +66,12 @@ struct uet_svc_stats {
                                  * their QP went away */
     uint64_t aborts_deferred;   /* ABORT answered EAGAIN: no room for the
                                  * answers yet */
+    uint64_t rekeys;            /* MR_REKEY answered with a new key */
     uint32_t ops_queued;        /* now: waiting to be posted */
     uint32_t ops_posted;        /* now: in the engine */
     uint32_t mrs;               /* now: region handles, dead ones included */
+    uint32_t mrs_dead;          /* now: of which their ionic MR went away
+                                 * before MR_DEREG */
     uint32_t peers;             /* now: peer handles */
     uint32_t replies_pending;   /* now: replies waiting for a receive */
 };
