@@ -17,9 +17,11 @@
  * the lifecycle cases: an MR destroyed while a WRITE from it is in flight,
  * the initiator's service QP destroyed while a WRITE is in flight and its
  * QP number reused, and the target's service QP destroyed so its window is
- * gone.  Before any of that, the capsule checks: bad magic, bad version,
- * unknown opcode, short capsules, unknown lkeys and handles, and a reply
- * that has to wait for the guest to post a receive.
+ * gone, and ABORT: two WRITEs in two groups on a wire that loses every
+ * frame, one group taken back.  Before any of that, the capsule checks:
+ * bad magic, bad version, unknown opcode, short capsules, unknown lkeys
+ * and handles, a malformed ABORT, and a reply that has to wait for the
+ * guest to post a receive.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -381,6 +383,10 @@ void pvrdma_rdma_bytes_count(pvrdma_handle_t handle, uint32_t qp_id,
 #define T3     (1024u * 1024u + 64u * 1024u)  /* cut short by DESTROY_MR */
 #define T4     (2048u * 1024u + 128u * 1024u) /* refused: window gone */
 #define T4_LEN (64u * 1024u)
+#define T5     (2048u * 1024u + 256u * 1024u) /* taken back by ABORT */
+#define T5_LEN (256u * 1024u)
+#define T6     (T5 + T5_LEN + 4096u + 5u) /* the other group: lands */
+#define T6_LEN (256u * 1024u)
 
 #define HALF (512u * 1024u)
 
@@ -449,6 +455,8 @@ struct report {
     double write_ms;
     int status_mr_gone;     /* WRITE whose MR was destroyed under it */
     int status_window_gone; /* WRITE into a window that was withdrawn */
+    int status_aborted;     /* WRITE taken back by ABORT */
+    uint32_t abort_count;   /* what the ABORT reported */
     uint64_t revoked_hits;
     uint64_t replies_discarded;
     uint64_t compared;
@@ -468,6 +476,8 @@ struct node {
     uint32_t rq_prod;
     uint32_t recvs_out; /* receives posted and not yet consumed */
     bool auto_repost;
+    bool wire_down; /* lose every IP frame (ARP still passes) */
+    uint64_t wire_lost;
     uint32_t cq_cons;
     bool cq_color;
     uint64_t next_cookie;
@@ -773,10 +783,12 @@ static int peer_add(struct node *n, uint32_t ip, uint32_t *handle)
     return st;
 }
 
-/* Post a WRITE or READ without waiting; returns its cookie. */
-static uint64_t rma_post(struct node *n, uint8_t op, uint32_t peer, uint32_t mr,
-                         uint64_t local, uint64_t len, uint64_t remote,
-                         uint64_t rkey, bool rudi)
+/* Post a WRITE or READ in ABORT group @group without waiting; returns its
+ * cookie. */
+static uint64_t rma_post_group(struct node *n, uint8_t op, uint32_t peer,
+                               uint32_t mr, uint64_t local, uint64_t len,
+                               uint64_t remote, uint64_t rkey, bool rudi,
+                               uint32_t group)
 {
     struct uet_ernic_rma q;
     uint64_t cookie = ++n->next_cookie;
@@ -790,8 +802,28 @@ static uint64_t rma_post(struct node *n, uint8_t op, uint32_t peer, uint32_t mr,
     q.remote_offset = htole64(remote);
     q.rkey = htole64(rkey);
     q.flags = htole32(rudi ? UET_ERNIC_RMA_RUDI : 0u);
+    q.group = htole32(group);
     post_send(n, &q, sizeof(q));
     return cookie;
+}
+
+static uint64_t rma_post(struct node *n, uint8_t op, uint32_t peer, uint32_t mr,
+                         uint64_t local, uint64_t len, uint64_t remote,
+                         uint64_t rkey, bool rudi)
+{
+    return rma_post_group(n, op, peer, mr, local, len, remote, rkey, rudi, 0);
+}
+
+static int abort_group(struct node *n, uint32_t group, uint32_t flags,
+                       struct uet_ernic_reply *r)
+{
+    struct uet_ernic_abort q;
+
+    memset(&q, 0, sizeof(q));
+    hdr_init(&q.hdr, UET_ERNIC_OP_ABORT, ++n->next_cookie);
+    q.group = htole32(group);
+    q.flags = htole32(flags);
+    return call(n, &q, sizeof(q), "ABORT", r);
 }
 
 static int rma_wait(struct node *n, uint64_t cookie, const char *what,
@@ -855,7 +887,12 @@ static void cq_event(void *opaque, uint32_t eq_id, uint32_t cq_id)
 static int wire_tx(void *ctx, const void *frame, size_t len)
 {
     struct node *n = ctx;
+    const uint8_t *f = frame;
 
+    if (n->wire_down && len >= 14 && f[12] == 0x08 && f[13] == 0x00) {
+        n->wire_lost++;
+        return 0;
+    }
     if (send(n->wire_fd, frame, len, MSG_DONTWAIT) < 0)
         return (errno == EAGAIN || errno == ENOBUFS) ? -EAGAIN : -errno;
     return 0;
@@ -993,8 +1030,34 @@ static void capsule_checks(struct node *n)
         fail(rep, "a capsule with a bad magic was answered");
 
     hdr_init(&h, UET_ERNIC_OP_QUERY, ++n->next_cookie);
-    h.version = htole16(2);
-    expect(n, call(n, &h, sizeof(h), "version 2", NULL), EPROTO, "version 2");
+    h.version = htole16(UET_ERNIC_ABI_VERSION + 1u);
+    expect(n, call(n, &h, sizeof(h), "a version from the future", NULL), EPROTO,
+           "a version from the future");
+    hdr_init(&h, UET_ERNIC_OP_QUERY, ++n->next_cookie);
+    h.version = 0;
+    expect(n, call(n, &h, sizeof(h), "version 0", NULL), EPROTO, "version 0");
+    /* Every version from the oldest one up is taken. */
+    hdr_init(&h, UET_ERNIC_OP_QUERY, ++n->next_cookie);
+    h.version = htole16(UET_ERNIC_ABI_VERSION_MIN);
+    expect(n, call(n, &h, sizeof(h), "version 1", NULL), 0, "version 1");
+
+    /* ABORT: unknown flags and a short capsule are refused; a group with
+     * nothing in flight takes nothing back. */
+    {
+        struct uet_ernic_reply ar;
+
+        expect(n, abort_group(n, 1, 0x80u, NULL), EINVAL,
+               "ABORT with unknown flags");
+        hdr_init(&h, UET_ERNIC_OP_ABORT, ++n->next_cookie);
+        expect(n, call(n, &h, sizeof(h), "short ABORT", NULL), EINVAL,
+               "short ABORT");
+        expect(n, abort_group(n, 42, 0, &ar), 0, "ABORT of an idle group");
+        if (le32toh(ar.u.abort.count) != 0)
+            fail(rep, "ABORT of an idle group took %u back",
+                 le32toh(ar.u.abort.count));
+        expect(n, abort_group(n, 0, UET_ERNIC_ABORT_ALL, &ar), 0,
+               "ABORT of everything, with nothing in flight");
+    }
 
     hdr_init(&h, 200, ++n->next_cookie);
     expect(n, call(n, &h, sizeof(h), "opcode 200", NULL), EOPNOTSUPP,
@@ -1058,7 +1121,8 @@ static void check_query(struct node *n, uint32_t ip)
         le16toh(r.u.query.mtu) != 1500 ||
         memcmp(r.u.query.mac, mac_prefix, 2) != 0 ||
         r.u.query.mac[5] != (uint8_t)ip ||
-        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_RUDI) == 0)
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_RUDI) == 0 ||
+        (le32toh(r.u.query.caps) & UET_ERNIC_CAP_ABORT) == 0)
         fail(n->rep, "QUERY reported the wrong identity");
 }
 
@@ -1120,6 +1184,24 @@ static void run_target(struct node *n)
             fail(rep, "a WRITE landed in a withdrawn window");
             break;
         }
+    }
+    /* ABORT: nothing of the WRITE taken back, all of the other group's. */
+    for (uint64_t off = T5; off < T5 + T5_LEN; off++) {
+        if (*region_byte(&tgt, off) != 0) {
+            fail(rep, "a WRITE taken back by ABORT landed at byte %" PRIu64,
+                 off - T5);
+            break;
+        }
+    }
+    for (uint64_t off = 0; off < T6_LEN; off++) {
+        if (*region_byte(&tgt, T6 + off) != pattern(T5_LEN + off)) {
+            fail(rep,
+                 "the WRITE of the group not taken back is wrong at "
+                 "byte %" PRIu64,
+                 off);
+            break;
+        }
+        rep->compared++;
     }
     pump_for(n, 100.0);
 }
@@ -1239,6 +1321,55 @@ static void run_initiator(struct node *n)
     }
     if (es.ops_in_flight != 0)
         fail(rep, "the orphaned WRITE never drained");
+
+    /* ABORT: two RUDI WRITEs in two groups while the wire loses every
+     * frame, then ABORT of the first group.  Its WRITE is answered,
+     * ECANCELED, ahead of the ABORT; the wire comes back, the other WRITE
+     * lands, and nothing of the first ever does (the target checks). */
+    {
+        uint32_t ha, hpa;
+        struct uet_ernic_reply ar, wr;
+
+        uet_svc_get_stats(n->dp->uet_svc, &st);
+        uint64_t aborted0 = st.ops_aborted; /* the orphan above counts */
+        expect(n, mr_reg(n, SRC2_LKEY, 0, &ha, NULL), 0, "MR_REG for ABORT");
+        expect(n, peer_add(n, IP_TARGET, &hpa), 0, "PEER_ADD for ABORT");
+        n->wire_down = true;
+        uint64_t wa = rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, 0, T5_LEN,
+                                     T5, rkey, true, 7);
+        uint64_t wb = rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, T5_LEN,
+                                     T6_LEN, T6, rkey, true, 8);
+        /* Sent, lost and resent, within the retry budget (20 ms x 10). */
+        pump_for(n, 60.0);
+        expect(n, abort_group(n, 7, 0, &ar), 0, "ABORT of group 7");
+        rep->abort_count = le32toh(ar.u.abort.count);
+        if (rep->abort_count != 1)
+            fail(rep, "ABORT took %u transfers back, not 1", rep->abort_count);
+        /* Replies go out in order: the WRITE's is in already. */
+        if (!take_reply(n, wa, &wr)) {
+            fail(rep, "the WRITE taken back was not answered ahead of the "
+                      "ABORT");
+        } else {
+            rep->status_aborted = (int32_t)le32toh((uint32_t)wr.status);
+            expect(n, rep->status_aborted, ECANCELED, "WRITE taken back");
+        }
+        n->wire_down = false;
+        expect(n, rma_wait(n, wb, "WRITE of the other group", NULL), 0,
+               "WRITE of the other group");
+        /* A retransmission of the first would land now. */
+        pump_for(n, 300.0);
+        uet_svc_get_stats(n->dp->uet_svc, &st);
+        uet_engine_get_stats(n->e, &es);
+        if (st.ops_aborted - aborted0 != 1 || es.ops_aborted < 1)
+            fail(rep,
+                 "%" PRIu64 " transfers taken back, %" PRIu64
+                 " engine operations",
+                 st.ops_aborted - aborted0, es.ops_aborted);
+        expect(n, release(n, UET_ERNIC_OP_MR_DEREG, ha), 0,
+               "MR_DEREG after ABORT");
+        expect(n, release(n, UET_ERNIC_OP_PEER_REMOVE, hpa), 0,
+               "PEER_REMOVE after ABORT");
+    }
 
     /* The target drops its service QP, and with it the window. */
     ctl_send(n, CTL_DROP, 0, 0);
@@ -1406,6 +1537,12 @@ int main(void)
         printf("  WRITE into a window whose service QP was destroyed: %s\n",
                ini.status_window_gone > 0 ? strerror(ini.status_window_gone)
                                           : "ok");
+        printf("  ABORT of one of two groups on a dead wire: %u taken back, "
+               "answered %s; the other group landed; target compared "
+               "%" PRIu64 " bytes in all\n",
+               ini.abort_count,
+               ini.status_aborted > 0 ? strerror(ini.status_aborted) : "ok",
+               tgt.compared);
         printf("  initiator channel: %" PRIu64 " commands, %" PRIu64
                " replies, %" PRIu64 " waited for a receive, %" PRIu64
                " discarded, %" PRIu64 " dropped\n",

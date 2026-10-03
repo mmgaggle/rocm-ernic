@@ -94,6 +94,16 @@ static int chan_send(const struct fdev_msg *m)
     return send(g.chan, m, sizeof(*m), 0) == (ssize_t)sizeof(*m) ? 0 : EIO;
 }
 
+void fake_ibv_wire_down(int down)
+{
+    struct fdev_msg m;
+
+    memset(&m, 0, sizeof(m));
+    m.type = FDEV_WIRE;
+    m.lkey = down != 0 ? 1u : 0u;
+    (void)chan_send(&m);
+}
+
 static void cq_push(struct ibv_cq *ibcq, const struct ibv_wc *wc)
 {
     struct fake_cq *cq = (struct fake_cq *)ibcq;

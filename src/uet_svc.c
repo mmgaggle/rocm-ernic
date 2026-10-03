@@ -92,6 +92,7 @@ struct svc_op {
     bool stop;   /* post no more of it: it failed, or its QP went */
     uint8_t opcode;
     uint32_t qp_id;
+    uint32_t group;  /* the guest's, for ABORT */
     uint32_t mr;     /* region slot */
     uint32_t peer;   /* peer slot */
     uint64_t cookie; /* the guest's */
@@ -372,8 +373,7 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
 
     uint32_t flags = le32toh(req.flags);
     uint64_t length = le64toh(req.length);
-    if ((flags & ~UET_ERNIC_RMA_RUDI) != 0 || req.reserved != 0 ||
-        length == 0) {
+    if ((flags & ~UET_ERNIC_RMA_RUDI) != 0 || length == 0) {
         reply_status(s, qp_id, opcode, cookie, EINVAL);
         return;
     }
@@ -406,6 +406,7 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     s->nops_live++;
     op->opcode = opcode;
     op->qp_id = qp_id;
+    op->group = le32toh(req.group);
     op->mr = (uint32_t)(m - s->mrs);
     op->peer = (uint32_t)(p - s->peers);
     op->cookie = cookie;
@@ -420,6 +421,48 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     op->rma.rudi = (flags & UET_ERNIC_RMA_RUDI) != 0;
 
     op_pump(s, op, now);
+}
+
+/*
+ * Take a transfer back: post nothing more of it, and take its segments out
+ * of the engine, so none of their packets goes on the wire again.  It is
+ * answered at once (with ECANCELED unless it had already failed), or, for
+ * a segment the engine cannot let go of, when that segment leaves.
+ */
+static void op_abort(struct uet_svc *s, struct svc_op *op)
+{
+    op->stop = true;
+    if (op->status == 0)
+        op->status = ECANCELED;
+
+    for (uint32_t k = 0; k < SVC_MAX_SEGS; k++) {
+        if ((op->seg_busy & (1u << k)) == 0)
+            continue;
+        int rc = uet_engine_abort(s->e, op_engine_cookie(s, op, k));
+        /* -ENOENT: it has left the engine already; its completion, if one
+         * is still on the way, finds the segment free and is ignored. */
+        if (rc != 0 && rc != -ENOENT)
+            continue;
+        op->seg_busy &= (uint8_t)~(1u << k);
+        op->segs_out--;
+        if (op->rma.rudi)
+            s->rudi_out -= op->seg_len[k];
+    }
+    s->stats.ops_aborted++;
+    if (op->segs_out == 0)
+        op_finish(s, op, op->status);
+}
+
+/* Settle the segments that have left the engine. */
+static void reap_engine(struct uet_svc *s, uint64_t now)
+{
+    struct uet_engine_comp comp[16];
+    size_t n;
+
+    while ((n = uet_engine_poll_comp(s->e, comp, 16)) > 0) {
+        for (size_t i = 0; i < n; i++)
+            op_seg_done(s, comp[i].cookie, -comp[i].status, now);
+    }
 }
 
 /*
@@ -464,7 +507,52 @@ static void cmd_query(struct uet_svc *s, uint32_t qp_id, uint64_t cookie)
     r.u.query.initiator_id = htole32(id.initiator_id);
     r.u.query.caps =
         htole32((id.pds == UET_ENGINE_PDS_FULL ? UET_ERNIC_CAP_RUDI : 0u) |
-                (id.sec != UET_ENGINE_SEC_NONE ? UET_ERNIC_CAP_TSS : 0u));
+                (id.sec != UET_ENGINE_SEC_NONE ? UET_ERNIC_CAP_TSS : 0u) |
+                (uet_engine_can_abort(s->e) ? UET_ERNIC_CAP_ABORT : 0u));
+    send_reply(s, qp_id, &r);
+}
+
+static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
+                      size_t len, uint64_t cookie)
+{
+    struct uet_ernic_abort req;
+    struct uet_ernic_reply r;
+    uint32_t count = 0;
+
+    if (len < sizeof(req)) {
+        reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EINVAL);
+        return;
+    }
+    memcpy(&req, capsule, sizeof(req));
+    uint32_t flags = le32toh(req.flags);
+    uint32_t group = le32toh(req.group);
+    if ((flags & ~UET_ERNIC_ABORT_ALL) != 0) {
+        reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EINVAL);
+        return;
+    }
+    if (!uet_engine_can_abort(s->e)) {
+        reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EOPNOTSUPP);
+        return;
+    }
+
+    /* A transfer that has finished in the engine is answered as finished,
+     * ahead of the ones taken back. */
+    reap_engine(s, now_ms());
+
+    for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
+        struct svc_op *op = &s->ops_tab[i];
+
+        if (!op->used || op->orphan || op->qp_id != qp_id ||
+            ((flags & UET_ERNIC_ABORT_ALL) == 0 && op->group != group))
+            continue;
+        op_abort(s, op);
+        count++;
+    }
+
+    /* Replies go out in order on a QP, so the guest sees every transfer
+     * taken back answered before this. */
+    reply_init(&r, UET_ERNIC_OP_ABORT, cookie, 0);
+    r.u.abort.count = htole32(count);
     send_reply(s, qp_id, &r);
 }
 
@@ -693,7 +781,9 @@ void uet_svc_command(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     }
 
     uint64_t cookie = le64toh(h.cookie);
-    if (le16toh(h.version) != UET_ERNIC_ABI_VERSION || h.flags != 0) {
+    uint16_t version = le16toh(h.version);
+    if (version < UET_ERNIC_ABI_VERSION_MIN ||
+        version > UET_ERNIC_ABI_VERSION || h.flags != 0) {
         reply_status(s, qp_id, h.opcode, cookie, EPROTO);
         return;
     }
@@ -715,6 +805,9 @@ void uet_svc_command(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     case UET_ERNIC_OP_WRITE:
     case UET_ERNIC_OP_READ:
         cmd_rma(s, qp_id, capsule, len, h.opcode, cookie);
+        break;
+    case UET_ERNIC_OP_ABORT:
+        cmd_abort(s, qp_id, capsule, len, cookie);
         break;
     default:
         reply_status(s, qp_id, h.opcode, cookie, EOPNOTSUPP);
@@ -787,17 +880,11 @@ void uet_svc_destroy(struct uet_svc *s)
 
 void uet_svc_poll(struct uet_svc *s)
 {
-    struct uet_engine_comp comp[16];
-    size_t n;
-
     if (s == NULL)
         return;
 
     uint64_t now = now_ms();
-    while ((n = uet_engine_poll_comp(s->e, comp, 16)) > 0) {
-        for (size_t i = 0; i < n; i++)
-            op_seg_done(s, comp[i].cookie, -comp[i].status, now);
-    }
+    reap_engine(s, now);
 
     /* The table is walked only while an op is in it: this runs on every
      * turn of the server's loop. */
@@ -851,9 +938,13 @@ void uet_svc_qp_gone(struct uet_svc *s, uint32_t qp_id)
         if (!op->used || op->qp_id != qp_id)
             continue;
         if (op->segs_out > 0) {
-            /* Settled, unanswered, once the engine is done with it. */
+            /* Nobody is left to answer, and nobody to want the transfer:
+             * taken out of the engine at once where it can be, otherwise
+             * settled, unanswered, once the engine is done with it. */
             op->orphan = true;
             op->stop = true;
+            if (uet_engine_can_abort(s->e))
+                op_abort(s, op);
         } else {
             memset(op, 0, sizeof(*op));
             s->nops_live--;

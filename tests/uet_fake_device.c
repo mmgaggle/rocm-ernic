@@ -56,6 +56,7 @@ struct dev {
         uint64_t length;
     } mrs[MAX_MRS];
     bool bye;
+    bool wire_down; /* lose every IP frame (FDEV_WIRE) */
 };
 
 static bool parse_u64(const char *s, uint64_t *out)
@@ -89,7 +90,10 @@ static void *mem_map(void *ctx, uint64_t addr, size_t len, bool write)
 static int wire_tx(void *ctx, const void *frame, size_t len)
 {
     struct dev *d = ctx;
+    const uint8_t *f = frame;
 
+    if (d->wire_down && len >= 14 && f[12] == 0x08 && f[13] == 0x00)
+        return 0;
     if (send(d->wire, frame, len, MSG_DONTWAIT) < 0)
         return (errno == EAGAIN || errno == ENOBUFS) ? -EAGAIN : -errno;
     return 0;
@@ -158,6 +162,9 @@ static void handle(struct dev *d, const struct fdev_msg *m)
         break;
     case FDEV_BYE:
         d->bye = true;
+        break;
+    case FDEV_WIRE:
+        d->wire_down = m->lkey != 0;
         break;
     default:
         break;

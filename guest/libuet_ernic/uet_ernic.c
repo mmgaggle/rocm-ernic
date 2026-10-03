@@ -87,6 +87,11 @@ struct uet_ernic_dev {
     uint64_t use_clock;
     bool auto_cache; /* keep on-demand registrations (UET_ERNIC_MR_CACHE) */
 
+    /* The ABI version capsules go out with: the lower of the device's and
+     * ours. */
+    uint16_t abi;
+    uint32_t next_group; /* for the endpoints' ABORT groups */
+
     /* From QUERY. */
     uint32_t ipv4;
     uint16_t pid_on_fep;
@@ -123,6 +128,8 @@ struct uet_ernic_ep {
     struct uet_ernic_cq *rx_cq;
     bool enabled;
     bool rudi;
+    bool aborted;   /* uet_ep_abort(): report no more completions */
+    uint32_t group; /* names its transfers in ABORT */
     unsigned in_flight;
 };
 
@@ -258,7 +265,10 @@ static void dispatch(struct uet_ernic_dev *d, const uint8_t *capsule)
     }
 
     int status = (int32_t)le32toh((uint32_t)r.status);
-    cq_push(p->ep->tx_cq, p->context, p->flags, p->len, status);
+    /* An aborted endpoint's transfers end without completions, as the
+     * reference's do. */
+    if (!p->ep->aborted)
+        cq_push(p->ep->tx_cq, p->context, p->flags, p->len, status);
     p->ep->in_flight--;
     if (p->auto_mr != NULL)
         p->auto_mr->refs--;
@@ -357,11 +367,12 @@ static int send_capsule(struct uet_ernic_dev *d, const void *capsule,
     return 0;
 }
 
-static void hdr_init(struct uet_ernic_hdr *h, uint8_t op, uint64_t cookie)
+static void hdr_init(const struct uet_ernic_dev *d, struct uet_ernic_hdr *h,
+                     uint8_t op, uint64_t cookie)
 {
     memset(h, 0, sizeof(*h));
     h->magic = htole32(UET_ERNIC_MAGIC);
-    h->version = htole16(UET_ERNIC_ABI_VERSION);
+    h->version = htole16(d->abi);
     h->opcode = op;
     h->cookie = htole64(cookie);
 }
@@ -453,7 +464,7 @@ static int auto_mr_drop(struct uet_ernic_dev *d, struct auto_mr *a)
     int rc;
 
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
     q.handle = htole32(a->handle);
     rc = call(d, &q, sizeof(q), &r);
     (void)ibv_dereg_mr(a->ibmr);
@@ -516,7 +527,7 @@ static int auto_mr_get(struct uet_ernic_dev *d, const uint8_t *buf, size_t len,
         return -FI_ENOMEM;
 
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_MR_REG, 0);
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_REG, 0);
     q.lkey = htole32(a->ibmr->lkey);
     rc = call(d, &q, sizeof(q), &r);
     if (rc != 0) {
@@ -730,14 +741,20 @@ int uet_initialize(uet_handle_t *handle)
         return rc;
     }
 
-    hdr_init(&h, UET_ERNIC_OP_QUERY, 0);
+    /* QUERY goes as the oldest version, which every device takes; from
+     * then on the lower of the device's version and ours. */
+    d->abi = UET_ERNIC_ABI_VERSION_MIN;
+    hdr_init(d, &h, UET_ERNIC_OP_QUERY, 0);
     rc = call(d, &h, sizeof(h), &r);
-    if (rc == 0 && le16toh(r.u.query.abi_version) < UET_ERNIC_ABI_VERSION)
+    if (rc == 0 && le16toh(r.u.query.abi_version) < UET_ERNIC_ABI_VERSION_MIN)
         rc = -FI_ENOSYS;
     if (rc != 0) {
         dev_free(d);
         return rc;
     }
+    d->abi = le16toh(r.u.query.abi_version) < UET_ERNIC_ABI_VERSION
+                 ? le16toh(r.u.query.abi_version)
+                 : UET_ERNIC_ABI_VERSION;
     d->ipv4 = le32toh(r.u.query.ipv4);
     d->pid_on_fep = le16toh(r.u.query.pid_on_fep);
     d->resource_index = le16toh(r.u.query.resource_index);
@@ -844,7 +861,7 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
     }
 
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_MR_REG, 0);
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_REG, 0);
     q.lkey = htole32(mr->ibmr->lkey);
     q.access = htole32(acc);
     rc = call(d, &q, sizeof(q), &r);
@@ -925,7 +942,7 @@ int uet_mr_close(uet_mr_handle_t mr_handle)
 
     pthread_mutex_lock(&d->lock);
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
     q.handle = htole32(mr->handle);
     rc = call(d, &q, sizeof(q), &r);
     /* Destroying the ionic region revokes the engine's copy as well, so
@@ -957,7 +974,7 @@ int uet_av_insert(uet_domain_handle_t domain_handle, struct uet_addr *uet_addr,
         return -FI_ENOMEM;
 
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_PEER_ADD, 0);
+    hdr_init(dom->dev, &q.hdr, UET_ERNIC_OP_PEER_ADD, 0);
     q.ipv4 = htole32(uet_addr->fa.v4);
     q.pid_on_fep = htole16(uet_addr->pid_on_fep);
     q.resource_index = htole16(uet_addr->start_index);
@@ -988,7 +1005,7 @@ int uet_av_remove(uet_addr_handle_t addr_handle)
         return -FI_EINVAL;
 
     memset(&q, 0, sizeof(q));
-    hdr_init(&q.hdr, UET_ERNIC_OP_PEER_REMOVE, 0);
+    hdr_init(av->dom->dev, &q.hdr, UET_ERNIC_OP_PEER_REMOVE, 0);
     q.handle = htole32(av->handle);
     pthread_mutex_lock(&av->dom->dev->lock);
     rc = call(av->dom->dev, &q, sizeof(q), &r);
@@ -1023,6 +1040,11 @@ int uet_endpoint(uet_domain_handle_t domain_handle, struct fi_info *info,
     ep->dom = dom;
     /* As in the reference library, the environment sets the default. */
     ep->rudi = getenv("UET_FORCE_RUDI") != NULL;
+    pthread_mutex_lock(&dom->dev->lock);
+    if (++dom->dev->next_group == 0)
+        dom->dev->next_group = 1;
+    ep->group = dom->dev->next_group;
+    pthread_mutex_unlock(&dom->dev->lock);
     dom->refs++;
     *ep_handle = ep;
     return 0;
@@ -1137,14 +1159,43 @@ static void cq_free(struct uet_ernic_cq *cq)
 }
 
 /*
- * The command channel has no way yet to take back a WRITE or READ the
- * device has accepted: one that waits in the device is posted when it can
- * be, and one in the engine runs to its end.  Say so, as the reference's
- * stop-and-go PDS does, so a caller waits for them instead.
+ * Take back every WRITE and READ the endpoint has outstanding with one
+ * ABORT for its group.  The device answers each of them, ECANCELED unless
+ * it had finished, before it answers the ABORT, and from then on sends
+ * nothing more of them; their answers find the endpoint aborted and report
+ * no completion, as the reference does.  A device that cannot take
+ * transfers back (an older one, or one whose engine runs pds=sng) is
+ * reported the way the reference's stop-and-go PDS reports itself, so the
+ * caller waits for them instead.
  */
 int uet_ep_abort(uet_ep_handle_t ep_handle)
 {
-    return ep_handle != NULL ? -FI_ENOSYS : -FI_EINVAL;
+    struct uet_ernic_ep *ep = ep_handle;
+    struct uet_ernic_dev *d;
+    struct uet_ernic_abort q;
+    struct uet_ernic_reply r;
+    int rc = 0;
+
+    if (ep == NULL)
+        return -FI_EINVAL;
+    d = ep->dom->dev;
+    if (d->abi < 2 || (d->caps & UET_ERNIC_CAP_ABORT) == 0)
+        return -FI_ENOSYS;
+
+    pthread_mutex_lock(&d->lock);
+    ep->aborted = true;
+    if (ep->in_flight != 0) {
+        memset(&q, 0, sizeof(q));
+        hdr_init(d, &q.hdr, UET_ERNIC_OP_ABORT, 0);
+        q.group = htole32(ep->group);
+        rc = call(d, &q, sizeof(q), &r);
+        /* Each transfer is answered before the ABORT; one still counted
+         * here means a device that broke the ABI, or a broken QP. */
+        if (rc == 0 && ep->in_flight != 0)
+            rc = -FI_EIO;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return rc;
 }
 
 int uet_ep_close(uet_ep_handle_t ep_handle)
@@ -1270,6 +1321,8 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
     q.remote_offset = htole64(remote_mem_addr);
     q.rkey = htole64(remote_key);
     q.flags = htole32(ep->rudi ? UET_ERNIC_RMA_RUDI : 0u);
+    if (d->abi >= 2)
+        q.group = htole32(ep->group);
 
     pthread_mutex_lock(&d->lock);
     auto_mr_release(d);
@@ -1295,7 +1348,7 @@ static ssize_t post_rma(struct uet_ernic_ep *ep, uint8_t op, uint32_t job_id,
         pthread_mutex_unlock(&d->lock);
         return -FI_EAGAIN;
     }
-    hdr_init(&q.hdr, op, cookie);
+    hdr_init(d, &q.hdr, op, cookie);
     p->kind = PEND_RMA;
     p->ep = ep;
     p->context = context;

@@ -15,9 +15,11 @@
  * initialize, domain, endpoint, completion queues, register, bind, enable,
  * getname, av_insert, then RMA, reaping completions with uet_cq_read().
  * The initiator WRITEs to the target's window over RUDI and RUD, READs
- * some of it back and checks the calls the library refuses; the target
- * compares its window byte for byte. Then both tear everything down, and
- * each device must be left holding nothing.
+ * some of it back and checks the calls the library refuses. Then
+ * uet_ep_abort(): two endpoints each write while the wire loses every
+ * frame, the first is aborted, and only the second's write may land. The
+ * target compares its window byte for byte. Then both tear everything
+ * down, and each device must be left holding nothing.
  *
  * Only libibverbs is faked. Nothing here runs on an ionic device or the
  * kernel driver; that needs a VM.
@@ -55,6 +57,9 @@
 #define RD_LEN  (32u * 1024u)
 #define W1      (4096u + 5u)
 #define W2      (W1 + HALF + 9u)
+#define QTR     (128u * 1024u)
+#define W3      (1280u * 1024u)      /* aborted: stays zero */
+#define W4      (1536u * 1024u + 3u) /* the other endpoint's: lands */
 
 struct report {
     int ok;
@@ -197,8 +202,8 @@ static void close_all(struct guest *g, uet_handle_t h, uet_domain_handle_t dom,
         CHECK(g, uet_mr_disable(mrs[i]) == 0);
         CHECK(g, uet_mr_close(mrs[i]) == 0);
     }
-    /* The channel cannot take transfers back; the provider then waits. */
-    CHECK(g, uet_ep_abort(ep) == -FI_ENOSYS);
+    /* Nothing left to take back: the device answers at once. */
+    CHECK(g, uet_ep_abort(ep) == 0);
     CHECK(g, uet_ep_close(ep) == 0);
     CHECK(g, uet_domain_close(dom) == 0);
     CHECK(g, uet_finalize(h) == 0);
@@ -240,6 +245,8 @@ static void run_target(struct guest *g)
             want = pattern(off - W1);
         else if (off >= W2 && off < W2 + HALF)
             want = pattern(HALF + (off - W2));
+        else if (off >= W4 && off < W4 + QTR)
+            want = pattern(QTR + (off - W4));
         if (win[off] != want) {
             fail(g->rep, "window byte %zu is wrong", off);
             break;
@@ -351,6 +358,42 @@ static void run_initiator(struct guest *g)
                          &ctx[4]) == 0);
     int err = reap(g, ep, txcq, &c);
     CHECK(g, err > 0 && c.op_context == &ctx[4]);
+
+    /* uet_ep_abort(): a second endpoint, then one write each while the
+     * wire loses every frame. The first endpoint is aborted: its write
+     * reports nothing and never lands, even once the wire is back; the
+     * second endpoint's carries on. */
+    uet_ep_handle_t ep2;
+    uet_cq_handle_t txcq2, rxcq2;
+    struct fi_cq_attr attr2 = {.format = FI_CQ_FORMAT_DATA, .size = 64};
+    CHECK(g, uet_endpoint(dom, NULL, NULL, NULL, &ep2) == 0);
+    CHECK(g, uet_ep_bind_cq(ep2, &attr2, NULL, FI_SEND, NULL, &txcq2) == 0);
+    CHECK(g, uet_ep_bind_cq(ep2, &attr2, NULL, FI_RECV, NULL, &rxcq2) == 0);
+    CHECK(g, uet_ep_enable(ep2) == 0);
+    on = true;
+    CHECK(g, uet_ep_setopt(ep, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    CHECK(g, uet_ep_setopt(ep2, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+    fake_ibv_wire_down(1);
+    CHECK(g, write_retry(ep, src, QTR, mrs[0], ah, W3, peer.key, &ctx[0]) == 0);
+    /* No region: the library registers the buffer for this one. */
+    CHECK(g, write_retry(ep2, src + QTR, QTR, NULL, ah, W4, peer.key,
+                         &ctx[1]) == 0);
+    /* Sent, lost and resent, within the device's retry budget. */
+    for (double end = now_ms() + 60.0; now_ms() < end;)
+        (void)uet_ep_progress(ep);
+    CHECK(g, uet_ep_abort(ep) == 0);
+    CHECK(g, uet_cq_read(txcq, &c, 1) == 0);
+    fake_ibv_wire_down(0);
+    CHECK(g, reap(g, ep2, txcq2, &c) == 0 && c.op_context == &ctx[1] &&
+                 c.len == QTR);
+    /* A retransmission of the aborted write would land now. */
+    for (double end = now_ms() + 300.0; now_ms() < end;)
+        (void)uet_ep_progress(ep2);
+    CHECK(g, uet_cq_read(txcq, &c, 1) == 0);
+    CHECK(g, uet_ep_abort(ep2) == 0);
+    CHECK(g, uet_ep_close(ep2) == 0);
 
     done = 'd';
     CHECK(g, send(g->ctl, &done, 1, 0) == 1);

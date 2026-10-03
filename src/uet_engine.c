@@ -1403,6 +1403,54 @@ size_t uet_engine_poll_comp(struct uet_engine *e, struct uet_engine_comp *out,
     return got;
 }
 
+bool uet_engine_can_abort(const struct uet_engine *e)
+{
+    /* The stop-and-go PDS cannot discard what it has sent. */
+    return e != NULL && e->cfg.pds == UET_ENGINE_PDS_FULL;
+}
+
+int uet_engine_abort(struct uet_engine *e, uint64_t cookie)
+{
+    struct engine_op *op = NULL;
+    int rc;
+
+    if (e == NULL)
+        return -EINVAL;
+    if (!uet_engine_can_abort(e))
+        return -EOPNOTSUPP;
+
+    for (unsigned i = 0; i < UET_ENGINE_MAX_OPS; i++) {
+        if (e->ops[i].used && e->ops[i].cookie == cookie) {
+            op = &e->ops[i];
+            break;
+        }
+    }
+    if (op == NULL)
+        return -ENOENT;
+
+    /* The provider finds the operation by the context it was posted with,
+     * which is the slot. */
+    rc = uet_ep_abort_op(e->ep, op);
+    if (rc == -FI_ENOENT)
+        return -ENOENT; /* done; its completion is still in the queue */
+    if (rc == -FI_ENOSYS)
+        return -EOPNOTSUPP;
+    if (rc != 0)
+        return fi_to_errno(rc);
+
+    e->mrs[op->mr].refs--;
+    e->peers[op->peer].refs--;
+    op->used = false;
+    e->ops_in_flight--;
+    e->stats.ops_aborted++;
+    reap_closing(e);
+
+    /* A PDC the abort closed sends its CLOSE now, on a batching wire too. */
+    if (e->wire.flush != NULL)
+        e->wire.flush(e->wire.ctx);
+    return 0;
+}
+
 void uet_engine_get_stats(const struct uet_engine *e,
                           struct uet_engine_stats *out)
 {

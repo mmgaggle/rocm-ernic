@@ -29,6 +29,13 @@
  * Remote addresses are offsets from the start of the remote region, not
  * virtual addresses, and local addresses are offsets from the start of the
  * local region named by its handle.
+ *
+ * Version 2 adds ABORT, which takes back transfers the device has accepted,
+ * and the group of a WRITE or READ, which ABORT names them by. A device
+ * accepts capsules of every version from UET_ERNIC_ABI_VERSION_MIN up to
+ * its own, and QUERY reports its own. A guest sends the lower of that and
+ * its own version; QUERY itself goes as version 1, which every device
+ * takes.
  */
 
 #ifndef UET_ERNIC_ABI_H
@@ -37,7 +44,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define UET_ERNIC_ABI_VERSION 1u
+#define UET_ERNIC_ABI_VERSION     2u
+#define UET_ERNIC_ABI_VERSION_MIN 1u
 
 /* "UETC" in memory order. */
 #define UET_ERNIC_MAGIC 0x43544555u
@@ -66,6 +74,7 @@ enum uet_ernic_op {
     UET_ERNIC_OP_PEER_REMOVE = 5, /* release a peer handle */
     UET_ERNIC_OP_WRITE = 6,       /* RMA write, answered on completion */
     UET_ERNIC_OP_READ = 7,        /* RMA read, answered on completion */
+    UET_ERNIC_OP_ABORT = 8,       /* take transfers back (version 2) */
 };
 
 /* hdr.flags */
@@ -129,14 +138,45 @@ struct uet_ernic_rma {
     uint64_t remote_offset; /* into the remote region */
     uint64_t rkey;          /* the remote region's key */
     uint32_t flags;         /* UET_ERNIC_RMA_* */
-    uint32_t reserved;
+    uint32_t group;         /* chosen by the guest, for ABORT; reserved
+                             * (zero) in version 1 */
+};
+
+/* abort.flags */
+#define UET_ERNIC_ABORT_ALL 0x01u /* every transfer of the QP, any group */
+
+/*
+ * UET_ERNIC_OP_ABORT (version 2): take back the WRITEs and READs of this
+ * service QP in @group that have not been answered yet.
+ *
+ * Each transfer taken back is answered first, with ECANCELED, and then the
+ * ABORT, with the number taken back. Once the ABORT is answered, no packet
+ * of those transfers goes on the wire again, a late response to one is
+ * ignored, and nothing of a READ is placed any more. A transfer that
+ * finished before the ABORT was handled is answered as usual. The ABORT
+ * never waits for a peer.
+ *
+ * A RUDI transfer is taken back alone. A RUD transfer that has packets on
+ * the wire that the peer has not acknowledged leaves holes in its packet
+ * delivery context, which is then closed with the peer: other RUD
+ * transfers that still have packets on it, of any QP, fail with an error.
+ *
+ * A device whose engine cannot take transfers back (pds=sng) answers
+ * EOPNOTSUPP and takes nothing back; it does not report UET_ERNIC_CAP_ABORT
+ * in QUERY.
+ */
+struct uet_ernic_abort {
+    struct uet_ernic_hdr hdr;
+    uint32_t group;
+    uint32_t flags; /* UET_ERNIC_ABORT_* */
 };
 
 /* ---- replies ----------------------------------------------------------- */
 
 /* reply.query.caps */
-#define UET_ERNIC_CAP_RUDI 0x01u /* the engine can use RUDI */
-#define UET_ERNIC_CAP_TSS  0x02u /* the engine's traffic is encrypted */
+#define UET_ERNIC_CAP_RUDI  0x01u /* the engine can use RUDI */
+#define UET_ERNIC_CAP_TSS   0x02u /* the engine's traffic is encrypted */
+#define UET_ERNIC_CAP_ABORT 0x04u /* ABORT takes transfers back */
 
 /*
  * Every reply. status is 0 or a positive Linux errno value: EPROTO for a
@@ -176,6 +216,10 @@ struct uet_ernic_reply {
         struct {
             uint64_t length; /* bytes moved */
         } rma;
+        struct {
+            uint32_t count; /* transfers taken back */
+            uint32_t reserved;
+        } abort;
         uint8_t raw[40];
     } u;
 };
@@ -186,6 +230,7 @@ _Static_assert(sizeof(struct uet_ernic_release) == 24, "release layout");
 _Static_assert(sizeof(struct uet_ernic_peer_add) == 24, "PEER_ADD layout");
 _Static_assert(sizeof(struct uet_ernic_rma) == UET_ERNIC_CAPSULE_SIZE,
                "WRITE/READ layout");
+_Static_assert(sizeof(struct uet_ernic_abort) == 24, "ABORT layout");
 _Static_assert(sizeof(struct uet_ernic_reply) == UET_ERNIC_CAPSULE_SIZE,
                "reply layout");
 _Static_assert(offsetof(struct uet_ernic_reply, u) == 24, "reply payload");

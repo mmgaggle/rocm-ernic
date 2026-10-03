@@ -27,6 +27,8 @@ enum fdev_type {
     FDEV_CMD = 3,     /* guest -> device: a SEND on a service QP */
     FDEV_QP_GONE = 4, /* guest -> device: a service QP was destroyed */
     FDEV_BYE = 5,     /* guest -> device: the device was closed */
+    FDEV_WIRE = 6,    /* test -> device: lkey 1 loses every IP frame the
+                       * engine sends, 0 stops (ARP still passes) */
     FDEV_REPLY = 0x81 /* device -> guest: a reply capsule for a QP */
 };
 

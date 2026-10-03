@@ -315,6 +315,22 @@ struct uet_engine_comp {
 size_t uet_engine_poll_comp(struct uet_engine *e, struct uet_engine_comp *out,
                             size_t max);
 
+/*
+ * Take back a posted operation.  None of its packets goes on the wire again,
+ * a late response to it is ignored, and no completion is reported for it.
+ * A RUDI operation is taken back alone.  A RUD operation with packets the
+ * peer has not acknowledged closes its PDC, and the other operations that
+ * still have packets on that PDC fail.  Never waits for a peer.
+ *
+ * Returns 0; -ENOENT when no operation with @cookie is in flight (it has
+ * completed, and its completion may still wait to be reaped); or
+ * -EOPNOTSUPP when the engine cannot take operations back (pds=sng).
+ */
+int uet_engine_abort(struct uet_engine *e, uint64_t cookie);
+
+/* Whether uet_engine_abort() can work at all. */
+bool uet_engine_can_abort(const struct uet_engine *e);
+
 struct uet_engine_stats {
     /* wire */
     uint64_t rx_frames;
@@ -330,6 +346,7 @@ struct uet_engine_stats {
     uint64_t ops_posted;
     uint64_t ops_completed;
     uint64_t ops_failed;
+    uint64_t ops_aborted; /* taken back by uet_engine_abort() */
     /* region memory */
     uint64_t dma_read_maps;
     uint64_t dma_write_maps;

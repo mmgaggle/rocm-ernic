@@ -29,4 +29,7 @@ struct fake_ibv_stats {
 
 void fake_ibv_get_stats(struct fake_ibv_stats *out);
 
+/* Have the device lose every IP frame its engine sends (true), or not. */
+void fake_ibv_wire_down(int down);
+
 #endif /* FAKE_IBVERBS_H */

@@ -97,6 +97,13 @@ static uint32_t rto_override_ms;
 #define PDS_FLAG_RETX 0x10u
 #define PDS_FLAG_AR   0x08u
 
+/* What a case does.  A plain write is checked on the wire too; the others
+ * check what they are about. */
+enum case_kind {
+    CASE_WRITE = 0, /* the initiator writes, the target compares */
+    CASE_ABORT,     /* two writes on a dead wire, the first taken back */
+};
+
 struct test_case {
     const char *name;
     const char *what;
@@ -114,20 +121,22 @@ struct test_case {
     enum uet_engine_encap encap;
     uint16_t mtu;
     enum uet_engine_pds pds;
+    enum case_kind kind;
 };
 
 static const struct test_case cases[] = {
     {"rudi-1MiB", "RUDI write into an IDEMPOTENT_SAFE window", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"rud-1MiB", "the same write over RUD", false, UET_ENGINE_SEC_NONE, 0, 0,
-     20, 10, false, false, false, UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     20, 10, false, false, false, UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL,
+     CASE_WRITE},
     {"rud-drop500", "RUD with UET_PKT_DROP_THRESH=500 (5% of PDS transmits)",
      false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"tss-cluster-rud", "RUD with UET_SEC_MODE=cluster", false,
      UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     /* RUDI has no window: the whole megabyte (1024 packets) is encrypted
      * and sent when the write is posted.  The provider's AES-GCM and
      * per-packet CMAC KDF run in software, so the timeout has to outlast a
@@ -135,43 +144,58 @@ static const struct test_case cases[] = {
      * reads a response. */
     {"tss-cluster-rudi", "RUDI with UET_SEC_MODE=cluster", true,
      UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"rudi-wireloss2pct",
      "RUDI with 2% loss on the wire (UET_PKT_DROP_THRESH does not reach "
      "RUDI)",
      true, UET_ENGINE_SEC_NONE, 0, 20, 20, 30, true, true, false,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     /* UET directly over IP, as before UDP became the default. */
     {"rudi-1MiB-ip", "RUDI with encap=ip (IP protocol 253)", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_IP,
-     0, UET_ENGINE_PDS_FULL},
+     0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"rud-1MiB-ip", "RUD with encap=ip", false, UET_ENGINE_SEC_NONE, 0, 0, 20,
-     10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL},
+     10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL,
+     CASE_WRITE},
     {"tss-cluster-rud-ip", "RUD with UET_SEC_MODE=cluster and encap=ip", false,
      UET_ENGINE_SEC_CLUSTER, 0, 0, 50, 10, false, false, true,
-     UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     /* Jumbo frames: an MTU of 9000 gives a Payload MTU of 8192, so the
      * megabyte is 128 packets. */
     {"rudi-jumbo", "RUDI at mtu=9000 (8 KiB payloads)", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
-     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"rud-jumbo", "RUD at mtu=9000", false, UET_ENGINE_SEC_NONE, 0, 0, 20, 10,
-     false, false, false, UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
+     false, false, false, UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL,
+     CASE_WRITE},
     {"rud-jumbo-ip", "RUD at mtu=9000 with encap=ip", false,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
-     UET_ENGINE_ENCAP_IP, 9000, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_IP, 9000, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"tss-cluster-rudi-jumbo", "RUDI with UET_SEC_MODE=cluster at mtu=9000",
      true, UET_ENGINE_SEC_CLUSTER, 0, 0, 1000, 10, true, false, true,
-     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL, CASE_WRITE},
     {"rud-drop500-jumbo", "RUD with 5% of PDS transmits dropped at mtu=9000",
      false, UET_ENGINE_SEC_NONE, 500, 0, 20, 30, false, true, false,
-     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL},
+     UET_ENGINE_ENCAP_UDP, 9000, UET_ENGINE_PDS_FULL, CASE_WRITE},
     /* The provider's stop-and-go PDS (pds=sng) builds its own frames. */
     {"sng-1MiB", "the write over the stop-and-go PDS", false,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
-     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_SNG},
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_SNG, CASE_WRITE},
     {"sng-1MiB-ip", "the same with encap=ip", false, UET_ENGINE_SEC_NONE, 0, 0,
-     20, 10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_SNG},
+     20, 10, false, false, false, UET_ENGINE_ENCAP_IP, 0, UET_ENGINE_PDS_SNG,
+     CASE_WRITE},
+    /* Two writes of half the data each while the wire loses every IP
+     * frame; the first is taken back, the wire comes back, and the second
+     * lands.  The retransmit budget (50 ms x 100) outlasts the outage. */
+    {"abort-rudi",
+     "RUDI write taken back on a dead wire; the other one carries on", true,
+     UET_ENGINE_SEC_NONE, 0, 0, 50, 100, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_ABORT},
+    {"abort-rud",
+     "RUD write taken back on a dead wire: its PDC closes, a new one "
+     "carries the rest",
+     false, UET_ENGINE_SEC_NONE, 0, 0, 50, 100, false, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_ABORT},
 };
 
 /* ------------------------------------------------------------------ */
@@ -295,6 +319,7 @@ struct node {
     uint64_t wire_full;     /* frames the socket would not take */
     uint64_t tx_iov_frames; /* frames sent in pieces, payload in place */
     uint64_t wire_lost;     /* frames this test dropped on purpose */
+    bool link_down;         /* lose every IP frame (ARP still passes) */
     uint64_t rx_unclaimed;
     uint64_t rng;
     uint8_t probe[PROBE_LEN];
@@ -418,8 +443,9 @@ static int wire_tx(void *ctx, const void *frame, size_t len)
     classify(n, f, len);
 
     /* ARP is never lost here, so loss only ever exercises the transport. */
-    if (n->tc->wire_loss_pm != 0 && len >= 14 && rd16(f + 12) == 0x0800 &&
-        xorshift(&n->rng) % 1000u < n->tc->wire_loss_pm) {
+    if (len >= 14 && rd16(f + 12) == 0x0800 &&
+        (n->link_down || (n->tc->wire_loss_pm != 0 &&
+                          xorshift(&n->rng) % 1000u < n->tc->wire_loss_pm))) {
         n->wire_lost++;
         return 0;
     }
@@ -457,8 +483,8 @@ static int wire_tx_iov(void *ctx, const struct iovec *iov, unsigned cnt,
     classify(n, f, len);
     n->tx_iov_frames++;
 
-    if (n->tc->wire_loss_pm != 0 &&
-        xorshift(&n->rng) % 1000u < n->tc->wire_loss_pm) {
+    if (n->link_down || (n->tc->wire_loss_pm != 0 &&
+                         xorshift(&n->rng) % 1000u < n->tc->wire_loss_pm)) {
         n->wire_lost++;
         return 0;
     }
@@ -546,6 +572,11 @@ struct report {
     uint64_t compared;
     uint64_t mismatches;
     uint64_t guard_bad;
+    /* CASE_ABORT */
+    int second_status;     /* what the other write first completed with */
+    bool second_reposted;  /* it failed with the closed PDC and went again */
+    uint64_t req_at_abort; /* requests on the wire when it was taken back */
+    uint64_t req_quiet;    /* requests once everything had completed */
 };
 
 static void fail(struct report *rep, const char *fmt, ...)
@@ -679,10 +710,12 @@ static void run_target(struct node *n, struct report *rep)
         }
     }
 
-    /* Every byte of the region: the write, and the untouched edges. */
+    /* Every byte of the region: the write, and the untouched edges.  In an
+     * abort case the first half was taken back and must be untouched. */
+    size_t from = n->tc->kind == CASE_ABORT ? xfer_len / 2 : 0;
     for (size_t off = 0; off < n->r.len; off++) {
         uint8_t got = *region_byte(&n->g, &n->r, off);
-        bool inside = off >= DST_OFF && off < DST_OFF + xfer_len;
+        bool inside = off >= DST_OFF + from && off < DST_OFF + xfer_len;
         uint8_t want = inside ? pattern(off - DST_OFF) : 0;
 
         if (got == want) {
@@ -833,6 +866,212 @@ static void run_initiator(struct node *n, struct report *rep)
     (void)uet_engine_mr_dereg(n->e, mr);
 }
 
+/* Post a write, retrying while the target's MAC is resolved. */
+static int post_retry(struct node *n, const struct uet_engine_rma *w)
+{
+    double deadline = now_ms() + 10000.0;
+    int rc;
+
+    while ((rc = uet_engine_post_write(n->e, w)) == -EAGAIN &&
+           now_ms() < deadline)
+        pump(n);
+    return rc;
+}
+
+/* Pump until the completion of @cookie, failing the case on any other. */
+static bool wait_comp(struct node *n, struct report *rep, uint64_t cookie,
+                      double ms, int *status)
+{
+    struct uet_engine_comp c;
+    double deadline = now_ms() + ms;
+
+    for (;;) {
+        pump(n);
+        if (uet_engine_poll_comp(n->e, &c, 1) == 1) {
+            if (c.cookie != cookie) {
+                fail(rep,
+                     "a completion for cookie %#" PRIx64
+                     " (taken back?) while waiting for %#" PRIx64,
+                     c.cookie, cookie);
+                return false;
+            }
+            *status = c.status;
+            return true;
+        }
+        if (now_ms() > deadline) {
+            fail(rep, "no completion for %#" PRIx64, cookie);
+            return false;
+        }
+    }
+}
+
+static uint64_t requests_sent(const struct node *n)
+{
+    return n->tx.rud_req + n->tx.rod_req + n->tx.rudi_req;
+}
+
+/*
+ * Two writes, A into the first half of the target's span and B into the
+ * second, while the wire loses every IP frame.  A is taken back, the wire
+ * comes back, and B lands.  A must never complete and nothing of it may
+ * reach the target (it compares), and once everything is done the wire
+ * must carry no more requests: a retransmission of A would show there.
+ * Taking back a RUD write closes the PDC it shares with B, so B may fail;
+ * then it is posted again, on a new PDC.
+ */
+static void run_initiator_abort(struct node *n, struct report *rep)
+{
+    struct uet_engine_mr_desc d;
+    struct uet_engine_rma a, b;
+    struct uet_engine_stats st;
+    struct ctl m;
+    uint32_t mr, peer;
+    uint64_t lkey;
+    int rc, status;
+    double deadline;
+    size_t half = xfer_len / 2;
+
+    if (!node_start(n, IP_INITIATOR, xfer_len, SRC_PGOFF, rep))
+        return;
+    for (size_t off = 0; off < xfer_len; off++)
+        *region_byte(&n->g, &n->r, off) = pattern(off);
+
+    memset(&d, 0, sizeof(d));
+    d.root = n->r.root;
+    d.page_size = PAGE;
+    d.level = 1;
+    d.page_offset = n->r.page_offset;
+    d.len = n->r.len;
+    rc = uet_engine_mr_reg(n->e, &d, &mr, &lkey);
+    if (rc != 0) {
+        fail(rep, "mr_reg: %s", strerror(-rc));
+        return;
+    }
+    deadline = now_ms() + 10000.0;
+    while (!ctl_poll(n->ctl_fd, &m) || m.type != CTL_KEY) {
+        if (now_ms() > deadline) {
+            fail(rep, "no key from the target");
+            return;
+        }
+        pump(n);
+    }
+    rc = uet_engine_peer_add(n->e, IP_TARGET, PEER_PID, PEER_INDEX, &peer);
+    if (rc != 0) {
+        fail(rep, "peer_add: %s", strerror(-rc));
+        return;
+    }
+
+    memset(&a, 0, sizeof(a));
+    a.peer = peer;
+    a.mr = mr;
+    a.len = half;
+    a.remote_addr = DST_OFF;
+    a.rkey = m.rkey;
+    a.rudi = n->tc->rudi;
+    a.cookie = 0xa;
+    b = a;
+    b.local_addr = half;
+    b.len = xfer_len - half;
+    b.remote_addr = DST_OFF + half;
+    b.cookie = 0xb;
+
+    /* A first write while the wire works resolves the target and, for
+     * RUD, establishes the PDC, so taking A back has to close a live one.
+     * It writes the start of B's span, which B writes again. */
+    struct uet_engine_rma warm = b;
+    warm.len = PAGE;
+    warm.cookie = 0x1;
+    rc = post_retry(n, &warm);
+    if (rc != 0 || !wait_comp(n, rep, warm.cookie, 10000.0, &status))
+        return;
+    if (status != 0) {
+        fail(rep, "the first write failed: %s", strerror(-status));
+        return;
+    }
+
+    n->link_down = true;
+    rc = post_retry(n, &a);
+    if (rc == 0)
+        rc = post_retry(n, &b);
+    if (rc != 0) {
+        fail(rep, "post_write: %s", strerror(-rc));
+        return;
+    }
+    /* Long enough to send, lose and resend some of both. */
+    for (deadline = now_ms() + 3.0 * n->tc->rto_ms; now_ms() < deadline;)
+        pump(n);
+
+    rep->req_at_abort = requests_sent(n);
+    rc = uet_engine_abort(n->e, a.cookie);
+    if (rc != 0) {
+        fail(rep, "abort: %s", strerror(-rc));
+        return;
+    }
+    if (uet_engine_abort(n->e, a.cookie) != -ENOENT)
+        fail(rep, "taking the write back twice did not report ENOENT");
+    n->link_down = false;
+
+    if (!wait_comp(n, rep, b.cookie, 30000.0, &status))
+        return;
+    rep->second_status = status;
+    if (status != 0) {
+        if (n->tc->rudi) {
+            fail(rep, "the other RUDI write failed: %s", strerror(-status));
+            return;
+        }
+        /* Its PDC was closed under it: the next one carries it. */
+        rep->second_reposted = true;
+        b.cookie = 0xc;
+        rc = post_retry(n, &b);
+        if (rc != 0 || !wait_comp(n, rep, b.cookie, 30000.0, &status))
+            return;
+        if (status != 0) {
+            fail(rep, "the write failed again: %s", strerror(-status));
+            return;
+        }
+    }
+
+    /* Anything of A still about would be resent within a few timeouts. */
+    uint64_t req_done = requests_sent(n);
+    for (deadline = now_ms() + 10.0 * n->tc->rto_ms + 200.0;
+         now_ms() < deadline;) {
+        struct uet_engine_comp c;
+
+        pump(n);
+        if (uet_engine_poll_comp(n->e, &c, 1) == 1)
+            fail(rep, "a completion for %#" PRIx64 " after everything ended",
+                 c.cookie);
+    }
+    rep->req_quiet = requests_sent(n) - req_done;
+    if (rep->req_quiet != 0)
+        fail(rep, "%" PRIu64 " requests went out after everything ended",
+             rep->req_quiet);
+
+    uet_engine_get_stats(n->e, &st);
+    if (st.ops_aborted != 1 || st.ops_in_flight != 0)
+        fail(rep, "engine: %" PRIu64 " taken back, %u in flight",
+             st.ops_aborted, st.ops_in_flight);
+
+    memset(&m, 0, sizeof(m));
+    m.type = CTL_DONE;
+    (void)ctl_send(n->ctl_fd, &m);
+    deadline = now_ms() + 30000.0;
+    for (;;) {
+        pump(n);
+        if (ctl_poll(n->ctl_fd, &m) && m.type == CTL_VERIFIED)
+            break;
+        if (now_ms() > deadline) {
+            fail(rep, "the target never reported its compare");
+            return;
+        }
+    }
+    if (m.status != 0)
+        fail(rep, "the target's compare failed");
+
+    (void)uet_engine_peer_remove(n->e, peer);
+    (void)uet_engine_mr_dereg(n->e, mr);
+}
+
 /* ------------------------------------------------------------------ */
 /* Driver                                                             */
 /* ------------------------------------------------------------------ */
@@ -878,6 +1117,8 @@ static pid_t spawn(const struct test_case *tc, const char *role, int wire_fd,
 
     if (strcmp(role, "target") == 0)
         run_target(&n, &rep);
+    else if (tc->kind == CASE_ABORT)
+        run_initiator_abort(&n, &rep);
     else
         run_initiator(&n, &rep);
     node_finish(&n, &rep);
@@ -1074,10 +1315,22 @@ static bool run_case(const struct test_case *tc)
              !WIFEXITED(st_tgt) || WEXITSTATUS(st_tgt) != 0)
         fail(&verdict, "a process exited badly (initiator %#x, target %#x)",
              (unsigned)st_ini, (unsigned)st_tgt);
-    else
+    else if (tc->kind == CASE_WRITE)
         check_wire(tc, &ini, &tgt, &verdict);
 
-    if (have_ini && have_tgt) {
+    if (have_ini && have_tgt && tc->kind == CASE_ABORT) {
+        printf("  taken back after %" PRIu64 " requests on a dead wire; the "
+               "other write completed %s%s; %" PRIu64
+               " requests once all was done; target compared %" PRIu64
+               " bytes, %" PRIu64 " wrong, %" PRIu64 " untouched bytes "
+               "changed\n",
+               ini.req_at_abort,
+               ini.second_status == 0 ? "ok" : strerror(-ini.second_status),
+               ini.second_reposted ? " and went again on a new PDC" : "",
+               ini.req_quiet, tgt.compared, tgt.mismatches, tgt.guard_bad);
+        print_side("initiator", &ini);
+        print_side("target", &tgt);
+    } else if (have_ini && have_tgt) {
         double mib_s = ini.xfer_ms > 0
                            ? ((double)xfer_len / (1024.0 * 1024.0)) /
                                  (ini.xfer_ms / 1000.0)

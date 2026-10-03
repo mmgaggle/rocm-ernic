@@ -62,6 +62,8 @@ struct uet_svc_stats {
     uint64_t replies_discarded; /* replies for a QP that went away */
     uint64_t ops_completed;     /* WRITE/READ answered with success */
     uint64_t ops_failed;        /* WRITE/READ answered with an error */
+    uint64_t ops_aborted;       /* WRITE/READ taken back by ABORT, or because
+                                 * their QP went away */
     uint32_t ops_queued;        /* now: waiting to be posted */
     uint32_t ops_posted;        /* now: in the engine */
     uint32_t mrs;               /* now: region handles, dead ones included */

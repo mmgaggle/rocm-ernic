@@ -123,7 +123,10 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
                   const void *optval, size_t optlen);
 /*
  * Discard what the endpoint has outstanding, ahead of uet_ep_close(), as in
- * the reference library (the libfabric provider calls it from fi_close).
+ * the reference library (the libfabric provider calls it from fi_close):
+ * the device takes the endpoint's transfers back with ABORT, sends nothing
+ * more of them, and no completion is reported for them.  -FI_ENOSYS from a
+ * device that cannot (older than ABI version 2, or pds=sng).
  */
 int uet_ep_abort(uet_ep_handle_t ep_handle);
 int uet_ep_close(uet_ep_handle_t ep_handle);

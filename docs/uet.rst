@@ -332,6 +332,12 @@ header: a magic number, the ABI version, an opcode, flags and
 a 64-bit cookie that the guest chooses. No capsule is longer
 than 64 bytes. All fields are little-endian.
 
+The ABI is at version 2, which adds ``ABORT`` and the group of a
+``WRITE`` or ``READ``. A device takes capsules of version 1 and
+version 2. ``QUERY`` reports the device's version. The guest
+library sends ``QUERY`` as version 1, which every device takes,
+and after that the lower of the device's version and its own.
+
 .. list-table::
    :header-rows: 1
    :widths: 22 78
@@ -341,8 +347,8 @@ than 64 bytes. All fields are little-endian.
    * - ``QUERY``
      - Returns the engine's address, MAC, JobID, PIDonFEP,
        resource index, initiator ID, MTU, the highest ABI
-       version the device speaks, and whether RUDI and TSS
-       are on.
+       version the device speaks, and whether RUDI, TSS and
+       ``ABORT`` work.
    * - ``MR_REG``
      - Registers an ionic MR, named by its lkey, with the
        engine. Returns a handle and the 64-bit key peers use.
@@ -359,7 +365,11 @@ than 64 bytes. All fields are little-endian.
    * - ``WRITE``, ``READ``
      - RMA between a local region (handle and offset) and a
        remote one (key and offset), with a flag that asks for
-       RUDI.
+       RUDI, and a group that ``ABORT`` names it by.
+   * - ``ABORT``
+     - Takes back the ``WRITE`` and ``READ`` commands of this
+       service QP in one group, or all of them, that are not
+       answered yet (see `Taking transfers back`_).
 
 The device answers every command with exactly one reply. It
 echoes the opcode and the cookie, and it carries a status:
@@ -420,10 +430,12 @@ Handles belong to the service QP that created them.
   the guest may already be reusing. The handle stays
   allocated, but dead, until the guest sends ``MR_DEREG``.
 - **DESTROY_QP of a service QP** releases all of its handles.
-  Its transfers that are still waiting are dropped. Those
-  already in the engine run to completion, and their replies
-  are discarded. A reply never lands on a later QP that gets
-  the same number.
+  Its transfers that are still waiting are dropped, and those
+  in the engine are taken out of it, as ``ABORT`` takes them.
+  Nothing of them goes on the wire again, and no reply is
+  sent. A reply never lands on a later QP that gets the same
+  number. With ``pds=sng`` the engine cannot take them out;
+  they run to their end, and their replies are discarded.
 - The provider descriptor of a revoked region is kept,
   disabled, for a quarantine of 6 s before it can be reused.
   A partly received message keeps a pointer to the descriptor
@@ -431,6 +443,39 @@ Handles belong to the service QP that created them.
   stops that pointer from reaching a new region.
 - A peer handle that is released while transfers use it is
   removed once they finish.
+
+Taking transfers back
+^^^^^^^^^^^^^^^^^^^^^
+
+A guest gives each ``WRITE`` and ``READ`` a 32-bit group. The
+guest library uses one group for each endpoint. ``ABORT`` names
+a group, or all transfers of the QP with ``UET_ERNIC_ABORT_ALL``.
+
+The device answers each transfer it takes back first, with
+``ECANCELED``, and then the ``ABORT``, with the number it took
+back. Replies go out in order on a QP, so the guest has all of
+them when it sees the ``ABORT`` reply. From then on, no packet
+of those transfers goes on the wire again. The device drops the
+segments that wait to be posted, posts no new ones, and takes the
+ones in the engine out of the provider: their packets are
+dropped, and a late response to one is ignored. A transfer that
+finished before the ``ABORT`` is answered as usual. The
+``ABORT`` never waits for a peer, so it is answered at once.
+
+A RUDI transfer is taken back alone. A RUD transfer is part of a
+packet delivery context (PDC) that it shares with other RUD
+transfers to the same peer. If it has packets that the peer has
+not acknowledged, taking them back leaves holes in the PDC's
+sequence numbers. So the PDC is closed with the peer, and the
+other transfers that still have packets on it fail with an error.
+The next transfer opens a new PDC.
+
+The engine needed one more hook from the provider:
+``uet_ep_abort_op()`` drops one operation of an endpoint, as
+``uet_ep_abort()`` drops all of them. It is on the provider's
+``wip-uet-rigor`` branch. With ``pds=sng`` the provider cannot
+drop what it has sent, so the device answers ``ABORT`` with
+``EOPNOTSUPP`` and does not report ``UET_ERNIC_CAP_ABORT``.
 
 The Guest Library
 -----------------
@@ -474,11 +519,16 @@ These are the differences from the reference library:
   must not be written from after it is unmapped and mapped
   again at the same address while the old registration is
   cached.
-- ``uet_ep_abort()`` returns ``-FI_ENOSYS``: the channel cannot
-  take back a transfer the device has accepted. The provider
-  then does what it does with the reference's stop-and-go PDS:
-  ``fi_close()`` drops the writes it has not handed over yet
-  and waits up to 10 s for the ones it has.
+- ``uet_ep_abort()`` sends one ``ABORT`` for the endpoint's
+  group and waits for its reply, which comes at once. The
+  endpoint reports no completion for the transfers taken back,
+  as the reference does. So ``fi_close()`` on the libfabric
+  provider discards the endpoint's writes, and none of them
+  lands later. A device that cannot take transfers back (one
+  older than ABI version 2, or one with ``pds=sng``) makes
+  ``uet_ep_abort()`` return ``-FI_ENOSYS``. The provider then
+  waits up to 10 s for the writes, as it does with the
+  reference's stop-and-go PDS.
 - ``uet_mr_disable()`` keeps the region reachable by peers
   until ``uet_mr_close()``. Re-enabling it would need a new
   key, and callers keep the old one.
@@ -555,6 +605,14 @@ case checks what really crossed the wire.
    * - ``sng-1MiB``, ``sng-1MiB-ip``
      - The write over the stop-and-go PDS (``pds=sng``), in
        both encapsulations.
+   * - ``abort-rudi``, ``abort-rud``
+     - Two writes of half a megabyte each while the wire loses
+       every IP frame. The first is taken back, the wire comes
+       back, and the second lands. The first never completes,
+       nothing of it reaches the target, and no request goes
+       on the wire once the second is done. In ``abort-rud`` a
+       first write sets up the PDC, so taking the write back
+       closes a live PDC.
 
 The cases without ``-ip`` run over UDP, and the cases without
 ``-jumbo`` at an MTU of 1500 (1 KiB payloads). Every case checks
@@ -611,6 +669,13 @@ replies out of the receives they landed in. It checks:
   are gone;
 - a ``WRITE`` into a window whose owner destroyed its service
   QP: ``EIO``, and the window is untouched;
+- ``ABORT`` with unknown flags or a short capsule, ``ABORT`` of
+  a group with nothing in flight, and versions 0, 1 and 3;
+- two RUDI ``WRITE`` commands in two groups while the wire
+  loses every frame, and ``ABORT`` of one group: its ``WRITE``
+  is answered ``ECANCELED`` ahead of the ``ABORT``, the other
+  lands once the wire is back, and nothing of the first ever
+  does;
 - nothing left in the channel or the engine at the end.
 
 The ``uet-guest-lib-unit`` test covers phase 4. It runs two
@@ -621,8 +686,11 @@ engine behind a socket that stands in for the rings. A
 guest's memory is a memfd that its device maps too. The
 guests call the library as the provider does, write over RUDI
 and RUD, read back, and check the calls the library refuses
-and an error completion. Afterwards each device must hold
-nothing.
+and an error completion. Then two endpoints each write while
+the device loses every frame, and ``uet_ep_abort()`` aborts the
+first. It reports no completion and nothing of it lands; the
+other endpoint's write completes. Afterwards each device must
+hold nothing.
 
 One run, on a Debug build with AddressSanitizer:
 
@@ -1373,9 +1441,9 @@ Known Limits and Findings
   returns ``-FI_ENOSYS``), because the engine raises no events at
   the target. ``test_rma`` targets therefore check their window
   rather than wait for a signal.
-- ``fi_close()`` on that provider cannot discard writes already
-  in the device (see the guest library's differences). A late
-  write cut off by closing the endpoint can still land.
+- Taking back a RUD transfer closes the PDC it shares with the
+  other RUD transfers to that peer, and those fail (see `Taking
+  transfers back`_). RUDI transfers are taken back alone.
 - On hardware, the DPDK wire ran on an Intel E810 only, with
   hardware flow rules, timestamps and checksums, and guest memory
   DMA-mapped for the port. RSS through a flow rule, buffer split
@@ -1398,16 +1466,6 @@ Known Limits and Findings
 Next Phases
 -----------
 
-- Discarding transfers. ``uet_ep_abort()`` needs the channel
-  to take back a guest endpoint's transfers: drop those still
-  waiting in the device, post no more segments of the others,
-  and abort what is in the engine. The last part needs the
-  provider's ``uet_ep_abort()`` (on the provider's
-  ``wip-libfabric-provider-cutoff`` branch, not yet on the
-  hooks branch the engine builds from), which aborts a whole
-  provider endpoint. The engine has one, shared by every
-  service QP, so it would have to post again the transfers of
-  other QPs that the abort took with it.
 - Target-side events, for immediate data and ``fi_writedata``.
 - Throughput: each segment is a command and a reply on the
   service QP, and the engine runs on the vfio-user thread.
