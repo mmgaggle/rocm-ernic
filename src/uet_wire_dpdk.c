@@ -1329,6 +1329,17 @@ static struct rte_mbuf *gather(struct uet_wire_dpdk *w, struct rte_mbuf *m)
     return one;
 }
 
+bool uet_wire_dpdk_rx_pending(const struct uet_wire_dpdk *w)
+{
+    if (w == NULL)
+        return false;
+    for (uint16_t q = 0; q < w->nq; q++) {
+        if (rte_eth_rx_queue_count(w->port, q) > 0)
+            return true;
+    }
+    return false;
+}
+
 unsigned uet_wire_dpdk_poll(struct uet_wire_dpdk *w, uet_wire_dpdk_rx_fn rx,
                             void *ctx, unsigned budget)
 {

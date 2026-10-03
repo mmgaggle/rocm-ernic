@@ -166,6 +166,11 @@ struct uet_wire_dpdk_frame {
  */
 typedef bool (*uet_wire_dpdk_rx_fn)(void *ctx,
                                     const struct uet_wire_dpdk_frame *f);
+/* Whether frames are waiting in the port's receive rings.  Cheap: the
+ * driver reads descriptor status in host memory.  False when the driver
+ * cannot tell. */
+bool uet_wire_dpdk_rx_pending(const struct uet_wire_dpdk *w);
+
 unsigned uet_wire_dpdk_poll(struct uet_wire_dpdk *w, uet_wire_dpdk_rx_fn rx,
                             void *ctx, unsigned budget);
 

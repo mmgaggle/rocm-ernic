@@ -954,13 +954,31 @@ static void uet_engine_stop(rocm_ernic_dev_t *dev)
 }
 #endif /* ERNIC_HAVE_UET */
 
+/* Frames taken from a DPDK port per round, and rounds per turn of the
+ * server's loop. */
+#define UET_DPDK_RX_BUDGET 64u
+#define UET_DPDK_RX_ROUNDS 16u
+
+
 /* Run the UET engine, if there is one: wire frames, timers, ARP. */
 static void uet_engine_service(rocm_ernic_dev_t *dev)
 {
 #ifdef ERNIC_HAVE_UET
 #ifdef ERNIC_HAVE_UET_DPDK
-    if (dev->uet_engine && g_uet_dpdk)
-        (void)uet_wire_dpdk_poll(g_uet_dpdk, uet_dpdk_rx, dev, 64);
+    if (dev->uet_engine && g_uet_dpdk) {
+        /* Keep draining while the port keeps handing frames over: a
+         * burst that fills the budget means more are waiting, and the
+         * rest of this loop is not cheap. */
+        for (unsigned round = 0; round < UET_DPDK_RX_ROUNDS; round++) {
+            unsigned got = uet_wire_dpdk_poll(g_uet_dpdk, uet_dpdk_rx, dev,
+                                              UET_DPDK_RX_BUDGET);
+
+            uet_engine_poll(dev->uet_engine);
+            if (got < UET_DPDK_RX_BUDGET)
+                return;
+        }
+        return;
+    }
 #endif
     if (dev->uet_engine)
         uet_engine_poll(dev->uet_engine);
@@ -972,6 +990,12 @@ static void uet_engine_service(rocm_ernic_dev_t *dev)
 static bool uet_engine_busy(rocm_ernic_dev_t *dev)
 {
 #ifdef ERNIC_HAVE_UET
+#ifdef ERNIC_HAVE_UET_DPDK
+    /* Frames in the port's ring are work too; without this the loop
+     * sleeps 100 us with a burst waiting. */
+    if (dev->uet_engine && g_uet_dpdk && uet_wire_dpdk_rx_pending(g_uet_dpdk))
+        return true;
+#endif
     return dev->uet_engine && uet_engine_has_work(dev->uet_engine);
 #else
     (void)dev;
