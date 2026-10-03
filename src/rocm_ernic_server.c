@@ -930,6 +930,9 @@ static void uet_stats_section(FILE *fp, void *ctx)
     UET_STAT("ops_aborted", st.ops_aborted);
     UET_STAT("ops_in_flight", st.ops_in_flight);
     UET_STAT("writes_to_dead_key", st.writes_to_dead_key);
+    UET_STAT("retx", st.retx);
+    UET_STAT("dup_rsp", st.dup_rsp);
+    UET_STAT("rtt_samples", st.rtt_samples);
     UET_STAT("revoked_hits", st.revoked_hits);
     UET_STAT("dma_faults", st.dma_faults);
     /* regions: live = mrs - mrs_quarantined - mrs_held; svc_mrs_dead are

@@ -316,8 +316,17 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
             return false;
         }
     } else if (strcmp(key, "rto") == 0) {
-        if (!parse_u32_range(val, 1, 60000, &cfg->rto_ms)) {
-            set_err(err, errlen, "rto must be 1..60000 ms (got '%s')", val);
+        if (strcmp(val, "adaptive") == 0) {
+            cfg->rto_ms = 0;
+        } else if (!parse_u32_range(val, 1, 60000, &cfg->rto_ms)) {
+            set_err(err, errlen,
+                    "rto must be adaptive or 1..60000 ms (got '%s')", val);
+            return false;
+        }
+    } else if (strcmp(key, "rto_min") == 0) {
+        if (!parse_u32_range(val, 1, 60000, &cfg->rto_min_ms)) {
+            set_err(err, errlen, "rto_min must be 1..60000 ms (got '%s')",
+                    val);
             return false;
         }
     } else if (strcmp(key, "retries") == 0) {
@@ -595,7 +604,8 @@ static bool engine_set_env(const struct uet_engine_cfg *cfg, char *err,
      * the provider-wide delivery overrides are not engine features. */
     static const char *const owned_unset[] = {
         "UET_IMPAIRMENT_SHIM", "UET_FORCE_RUDI",     "UET_FORCE_UUD",
-        "UET_SEC_SERVER",      "UET_SEC_CLIENT_SSI",
+        "UET_SEC_SERVER",      "UET_SEC_CLIENT_SSI", "UET_PDS_TX_TIMEOUT",
+        "UET_PDS_RTO",         "UET_PDS_RTO_MIN",
     };
 
     for (size_t i = 0; i < sizeof(owned_unset) / sizeof(owned_unset[0]); i++)
@@ -623,8 +633,14 @@ static bool engine_set_env(const struct uet_engine_cfg *cfg, char *err,
         }
     }
 
+    /* rto=<ms> is a fixed timeout; without it the provider's adaptive
+     * one (RFC 6298, per peer), whose margin rto_min= sets */
     if (cfg->rto_ms != 0 &&
-        !set_env_u32("UET_PDS_TX_TIMEOUT", cfg->rto_ms, err, errlen))
+        (!set_env_u32("UET_PDS_TX_TIMEOUT", cfg->rto_ms, err, errlen) ||
+         setenv("UET_PDS_RTO", "fixed", 1) != 0))
+        return false;
+    if (cfg->rto_min_ms != 0 &&
+        !set_env_u32("UET_PDS_RTO_MIN", cfg->rto_min_ms, err, errlen))
         return false;
     if (cfg->max_retries != 0 &&
         !set_env_u32("UET_PDS_MAX_TX_RETRIES", cfg->max_retries, err, errlen))
@@ -1519,6 +1535,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
 {
     struct uet_nic_ernic_stats ns;
     struct uet_target_stats ts;
+    struct uet_retx_stats rs;
 
     if (e == NULL || out == NULL)
         return;
@@ -1526,6 +1543,11 @@ void uet_engine_get_stats(const struct uet_engine *e,
     *out = e->stats;
     if (uet_get_target_stats(e->uet, &ts) == 0)
         out->writes_to_dead_key = ts.dead_key_pkts;
+    if (uet_get_retx_stats(e->uet, &rs) == 0) {
+        out->retx = rs.retx;
+        out->dup_rsp = rs.dup_rsp;
+        out->rtt_samples = rs.rtt_samples;
+    }
     uet_nic_ernic_get_stats(e->nic, &ns);
     out->rx_frames = ns.rx_frames;
     out->rx_frames_ext = ns.rx_frames_ext;

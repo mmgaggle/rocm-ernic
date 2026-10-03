@@ -114,8 +114,14 @@ The argument of ``--uet`` is a comma-separated list of
      - the IP address
      - The TSS source identifier.
    * - ``rto=``
-     - provider (5 ms)
-     - PDS retransmit timeout, in milliseconds.
+     - ``adaptive``
+     - PDS retransmit timeout: ``adaptive``, RFC 6298 per peer
+       (smoothed round trip plus a margin of 4 RTTVAR, at least
+       ``rto_min``; doubled on a timeout; 1 s before the first
+       sample, at most 2 s), or a fixed number of milliseconds.
+   * - ``rto_min=``
+     - provider (10 ms)
+     - Adaptive: the least margin over the smoothed round trip.
    * - ``retries=``
      - provider (5)
      - PDS retransmit limit.
@@ -559,9 +565,9 @@ and in the stats file. RUD is different: its PDC numbers every
 packet and drops a copy it has already taken, so a RUD copy does
 not reach the target's memory.
 
-How likely is a late copy here? With the default retransmit
-timeout of 5 ms, a RUDI packet is resent whenever its answer takes
-longer than that. A TAP queues 1000 frames, and a burst larger than
+How likely is a late copy here? With a fixed retransmit timeout
+(``rto=5``, the provider's default until the adaptive one), a RUDI
+packet is resent whenever its answer takes longer than that. A TAP queues 1000 frames, and a burst larger than
 the receiver works through in 5 ms is resent in part: before the
 segment bounds above, 4 MiB writes resent 190 to 300 of their 512
 packets in two VMs. The copies then trail the first ones by the
@@ -571,6 +577,16 @@ still finishing. That makes them common but rarely late. A path
 with a longer delay, as in the soak, turns the same copies into
 late ones. Owners must invalidate keys before reuse whatever the
 link.
+
+The adaptive retransmit timeout, now the default, keeps copies
+rare: it follows each peer's round trip (RFC 6298, from packets
+answered on their first transmission) with a margin of at least
+10 ms (``rto_min=``), so a packet is sent again only when its
+answer is that much later than usual. The statistics file counts
+``retx`` (packets sent again) and ``dup_rsp`` (answers to a packet
+already answered, so copies that were not needed, or twins of lost
+answers). On two namespaces with 300 ms of delay, a fixed 200 ms
+timeout sent 15000 copies of a 16 MiB write; the adaptive one none.
 
 Re-keying a region
 ^^^^^^^^^^^^^^^^^^
@@ -740,6 +756,12 @@ case checks what really crossed the wire.
        ``UET_PKT_DROP_THRESH`` only acts on the RUD/ROD path,
        so it cannot force RUDI retransmissions. This case
        does that instead.
+   * - ``rudi-wireloss2pct-adaptive``
+     - The same with the adaptive retransmit timeout (no
+       ``rto=``). The packets sent before the first round trip
+       was measured are armed with the initial 1 s; the first
+       sample arms them again, so the write takes 23 ms, as with
+       a fixed 20 ms, and not a second.
    * - ``rudi-1MiB-ip``, ``rud-1MiB-ip``,
        ``tss-cluster-rud-ip``
      - The same with ``encap=ip``: every frame in IP protocol

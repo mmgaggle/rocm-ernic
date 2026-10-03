@@ -154,6 +154,12 @@ static const struct test_case cases[] = {
      "RUDI)",
      true, UET_ENGINE_SEC_NONE, 0, 20, 20, 30, true, true, false,
      UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
+    /* The same with the adaptive retransmit timeout (rto 0): the lost
+     * packets are sent again after the round trip plus its margin. */
+    {"rudi-wireloss2pct-adaptive",
+     "the same with the adaptive (RFC 6298) retransmit timeout", true,
+     UET_ENGINE_SEC_NONE, 0, 20, 0, 30, true, true, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_WRITE},
     /* UET directly over IP, as before UDP became the default. */
     {"rudi-1MiB-ip", "RUDI with encap=ip (IP protocol 253)", true,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_IP,

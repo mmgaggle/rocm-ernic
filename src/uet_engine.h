@@ -90,7 +90,8 @@ struct uet_engine_cfg {
     enum uet_engine_pds pds;
     enum uet_engine_sec sec;
     uint32_t ssi;         /* TSS source identifier, 0: use the IP */
-    uint32_t rto_ms;      /* PDS retransmit timeout, 0: provider's */
+    uint32_t rto_ms;      /* PDS retransmit timeout, fixed; 0: adaptive */
+    uint32_t rto_min_ms;  /* adaptive: least margin over SRTT, 0: provider's */
     uint32_t max_retries; /* PDS retransmit limit, 0: provider's */
     uint32_t drop_thresh; /* test only: drop this many 1/100 % of PDS
                            * transmits (UET_PKT_DROP_THRESH), 0: none */
@@ -376,6 +377,10 @@ struct uet_engine_stats {
     uint64_t writes_to_dead_key; /* request packets naming a key no region
                                   * has (any more): nothing placed, each
                                   * answered "bad key" */
+    /* retransmission */
+    uint64_t retx;        /* packets sent again on a timeout */
+    uint64_t dup_rsp;     /* answers to a packet already answered */
+    uint64_t rtt_samples; /* round trips measured (rto adaptive) */
     /* tables, now */
     uint32_t mrs;   /* region handles held, quarantined ones included */
     uint32_t mrs_quarantined; /* of which deregistered, waiting out the
