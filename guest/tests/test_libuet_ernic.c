@@ -23,6 +23,11 @@
  * target compares its window byte for byte. Then both tear everything
  * down, and each device must be left holding nothing.
  *
+ * A second case runs the initiator on a device of ABI version 1, which
+ * cannot take transfers back: UET_OPT_ABORT is false, writes still work,
+ * and uet_ep_abort() with a write in flight returns -FI_ENOSYS and tears
+ * the instance down, after which everything closes.
+ *
  * Only libibverbs is faked. Nothing here runs on an ionic device or the
  * kernel driver; that needs a VM.
  *
@@ -82,6 +87,10 @@ struct hello {
     struct uet_addr addr;
     uint64_t key;
 };
+
+/* the case being run: the initiator's device is an ABI version 1 one */
+static bool g_v1;
+#define V1_LEN (64u * 1024u)
 
 static void fail(struct report *rep, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -245,7 +254,13 @@ static void run_target(struct guest *g)
     for (size_t off = 0; off < WIN_LEN; off++) {
         uint8_t want = 0;
 
-        if (off >= W1 && off < W1 + HALF)
+        if (g_v1) {
+            /* only the write before the teardown is sure to land */
+            if (off >= W1 && off < W1 + V1_LEN)
+                want = pattern(off - W1);
+            else if (off >= W3)
+                continue;
+        } else if (off >= W1 && off < W1 + HALF)
             want = pattern(off - W1);
         else if (off >= W2 && off < W2 + HALF)
             want = pattern(HALF + (off - W2));
@@ -436,10 +451,68 @@ static void run_initiator(struct guest *g)
     close_all(g, h, dom, ep, mrs, 2);
 }
 
+/* On a device of ABI version 1: no ABORT, so a close tears down. */
+static void run_initiator_v1(struct guest *g)
+{
+    uet_handle_t h;
+    uet_domain_handle_t dom;
+    uet_ep_handle_t ep;
+    uet_cq_handle_t txcq;
+    uet_mr_handle_t mr;
+    uet_addr_handle_t ah;
+    struct hello peer;
+    struct fi_cq_data_entry c;
+    uint8_t *src = g->mem + 1024u * 1024u;
+    int ctx[2];
+    bool can = true, on = true;
+    size_t len = sizeof(can);
+    char done;
+
+    if (!open_ep(g, &h, &dom, &ep, &txcq))
+        return;
+    for (size_t i = 0; i < SRC_LEN; i++)
+        src[i] = pattern(i);
+    if (!reg(g, dom, ep, src, SRC_LEN, 0, UET_MR_KEY_NONE, &mr))
+        return;
+    CHECK(g, uet_ep_enable(ep) == 0);
+    CHECK(g,
+          uet_ep_getopt(ep, FI_OPT_ENDPOINT, UET_OPT_ABORT, &can, &len) == 0 &&
+              !can);
+    CHECK(g, recv(g->ctl, &peer, sizeof(peer), 0) == (ssize_t)sizeof(peer));
+    CHECK(g, uet_av_insert(dom, &peer.addr, &ah) == 0);
+    CHECK(g, uet_ep_setopt(ep, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
+                           sizeof(on)) == 0);
+
+    /* version 1 capsules, without a group, work as before */
+    CHECK(g, write_retry(ep, src, V1_LEN, mr, ah, W1, peer.key, &ctx[0]) == 0);
+    CHECK(g, reap(g, ep, txcq, &c) == 0 && c.op_context == &ctx[0]);
+
+    /* a write the device cannot take back: the instance goes */
+    fake_ibv_wire_down(1);
+    CHECK(g, write_retry(ep, src, QTR, mr, ah, W3, peer.key, &ctx[1]) == 0);
+    for (double end = now_ms() + 60.0; now_ms() < end;)
+        (void)uet_ep_progress(ep);
+    CHECK(g, uet_ep_abort(ep) == -FI_ENOSYS);
+    CHECK(g, uet_cq_read(txcq, &c, 1) == 0);
+    CHECK(g, uet_write(ep, UET_DEF_JOB_ID, src, 4096, NULL, mr, ah, W1,
+                       peer.key, &ctx[0]) == -FI_EIO);
+    fake_ibv_wire_down(0);
+
+    done = 'd';
+    CHECK(g, send(g->ctl, &done, 1, 0) == 1);
+    CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
+    if (done != 'y')
+        fail(g->rep, "the target's compare failed");
+
+    /* and everything closes: the device's handles went with its QP */
+    CHECK(g, uet_av_remove(ah) == 0);
+    close_all(g, h, dom, ep, &mr, 1);
+}
+
 /* ---- Driver ------------------------------------------------------------- */
 
 static pid_t start_device(const char *path, uint32_t ip, int mem_fd, int chan,
-                          int wire, const char *log)
+                          int wire, const char *log, bool v1)
 {
     char a_ip[16], a_mem[16], a_len[16], a_chan[16], a_wire[16];
 
@@ -456,7 +529,8 @@ static pid_t start_device(const char *path, uint32_t ip, int mem_fd, int chan,
     snprintf(a_len, sizeof(a_len), "%u", MEM_LEN);
     snprintf(a_chan, sizeof(a_chan), "%d", chan);
     snprintf(a_wire, sizeof(a_wire), "%d", wire);
-    execl(path, path, a_ip, a_mem, a_len, a_chan, a_wire, (char *)NULL);
+    execl(path, path, a_ip, a_mem, a_len, a_chan, a_wire,
+          v1 ? "v1" : (char *)NULL, (char *)NULL);
     perror(path);
     _exit(2);
 }
@@ -487,6 +561,8 @@ static pid_t start_guest(bool target, int mem_fd, int chan, int ctl, int rep_fd,
         fake_ibv_attach(chan, g.mem, MEM_LEN);
         if (target)
             run_target(&g);
+        else if (g_v1)
+            run_initiator_v1(&g);
         else
             run_initiator(&g);
         fake_ibv_get_stats(&rep.fake);
@@ -519,7 +595,7 @@ static void show(const char *log, const char *prefix, const char *only)
     fclose(f);
 }
 
-int main(int argc, char **argv)
+static bool run_case(const char *device, bool v1)
 {
     int wire[2], chan_a[2], chan_b[2], ctl[2], rep_a[2], rep_b[2];
     int mem_a, mem_b;
@@ -528,12 +604,7 @@ int main(int argc, char **argv)
     struct report ra, rb;
     int st[4];
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s PATH_TO_uet_fake_device\n", argv[0]);
-        return 2;
-    }
-    signal(SIGPIPE, SIG_IGN);
-    setenv("UET_ERNIC_SYNC_WAIT_MS", SYNC_MS, 1);
+    g_v1 = v1;
     for (int i = 0; i < 4; i++)
         snprintf(logs[i], sizeof(logs[i]), "%s/uet-guestlib-%d-%d.log",
                  tmp != NULL ? tmp : "/tmp", i, (int)getpid());
@@ -548,7 +619,7 @@ int main(int argc, char **argv)
         socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ctl) != 0 || pipe(rep_a) != 0 ||
         pipe(rep_b) != 0) {
         perror("setup");
-        return 1;
+        return false;
     }
     for (int i = 0; i < 2; i++) {
         int sz = 4 * 1024 * 1024;
@@ -556,24 +627,40 @@ int main(int argc, char **argv)
         (void)setsockopt(wire[i], SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     }
 
-    printf("case guest-lib: libuet_ernic over fake verbs, real channel and "
-           "engines\n");
+    if (v1)
+        printf("case guest-lib-v1: the initiator's device speaks ABI "
+               "version 1 and cannot take transfers back\n");
+    else
+        printf("case guest-lib: libuet_ernic over fake verbs, real channel "
+               "and engines\n");
     fflush(stdout);
 
     pid_t pids[4];
-    pids[0] = start_device(argv[1], IP_A, mem_a, chan_a[1], wire[0], logs[0]);
-    pids[1] = start_device(argv[1], IP_B, mem_b, chan_b[1], wire[1], logs[1]);
+    pids[0] =
+        start_device(device, IP_A, mem_a, chan_a[1], wire[0], logs[0], v1);
+    pids[1] =
+        start_device(device, IP_B, mem_b, chan_b[1], wire[1], logs[1], false);
     pids[2] = start_guest(false, mem_a, chan_a[0], ctl[0], rep_a[1], logs[2]);
     pids[3] = start_guest(true, mem_b, chan_b[0], ctl[1], rep_b[1], logs[3]);
     close(rep_a[1]);
     close(rep_b[1]);
     close(wire[0]);
     close(wire[1]);
+    close(chan_a[0]);
+    close(chan_a[1]);
+    close(chan_b[0]);
+    close(chan_b[1]);
+    close(ctl[0]);
+    close(ctl[1]);
+    close(mem_a);
+    close(mem_b);
 
     memset(&ra, 0, sizeof(ra));
     memset(&rb, 0, sizeof(rb));
     bool have_a = read(rep_a[0], &ra, sizeof(ra)) == (ssize_t)sizeof(ra);
     bool have_b = read(rep_b[0], &rb, sizeof(rb)) == (ssize_t)sizeof(rb);
+    close(rep_a[0]);
+    close(rep_b[0]);
     for (int i = 0; i < 4; i++)
         (void)waitpid(pids[i], &st[i], 0);
 
@@ -581,7 +668,12 @@ int main(int argc, char **argv)
     for (int i = 0; i < 4; i++)
         ok = ok && WIFEXITED(st[i]) && WEXITSTATUS(st[i]) == 0;
 
-    if (have_a && have_b)
+    if (have_a && have_b && v1)
+        printf("  a write on version 1 capsules, then uet_ep_abort() with "
+               "one in flight: -FI_ENOSYS, torn down; guest A sent %" PRIu64
+               " capsules, got %" PRIu64 " replies\n",
+               ra.fake.sends, ra.fake.replies);
+    else if (have_a && have_b)
         printf("  2 x 512 KiB uet_write (RUDI + RUD) in %.1f ms, 32 KiB "
                "uet_read back, 1 error completion; guest A sent %" PRIu64
                " capsules, got %" PRIu64 " replies\n",
@@ -590,10 +682,10 @@ int main(int argc, char **argv)
     show(logs[1], "  device B: ", ok ? "fake-device:" : NULL);
 
     if (ok) {
-        printf("  PASS\n\n1/1 cases passed\n");
+        printf("  PASS\n\n");
         for (int i = 0; i < 4; i++)
             unlink(logs[i]);
-        return 0;
+        return true;
     }
     if (have_a && !ra.ok)
         printf("  FAIL: initiator: %s\n", ra.why);
@@ -603,6 +695,22 @@ int main(int argc, char **argv)
         printf("  process %d exit status %#x\n", i, (unsigned)st[i]);
     show(logs[2], "  guest A: ", NULL);
     show(logs[3], "  guest B: ", NULL);
-    printf("\n0/1 cases passed\n");
-    return 1;
+    printf("\n");
+    return false;
+}
+
+int main(int argc, char **argv)
+{
+    unsigned passed = 0;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s PATH_TO_uet_fake_device\n", argv[0]);
+        return 2;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    setenv("UET_ERNIC_SYNC_WAIT_MS", SYNC_MS, 1);
+    passed += run_case(argv[1], false) ? 1u : 0u;
+    passed += run_case(argv[1], true) ? 1u : 0u;
+    printf("%u/2 cases passed\n", passed);
+    return passed == 2 ? 0 : 1;
 }

@@ -78,6 +78,7 @@
 #define UET_MR_KEY_NONE                 ((uint64_t) 0)
 #define UET_MR_KEY_IDEMPOTENT_SAFE      0x8000000000000000ULL
 #define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
+#define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
 /* clang-format on */
 
 typedef void *uet_handle_t;
@@ -121,12 +122,22 @@ int uet_ep_bind_cq(uet_ep_handle_t ep_handle, struct fi_cq_attr *attr,
 int uet_ep_enable(uet_ep_handle_t ep_handle);
 int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
                   const void *optval, size_t optlen);
+/* UET_OPT_ABORT: whether uet_ep_abort() can take transfers back. */
+int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
+                  void *optval, size_t *optlen);
 /*
  * Discard what the endpoint has outstanding, ahead of uet_ep_close(), as in
  * the reference library (the libfabric provider calls it from fi_close):
  * the device takes the endpoint's transfers back with ABORT, sends nothing
- * more of them, and no completion is reported for them.  -FI_ENOSYS from a
- * device that cannot (older than ABI version 2, or pds=sng).
+ * more of them, and no completion is reported for them.  Returns 0 once
+ * they are gone, or when there were none.
+ *
+ * When the device cannot take them back (older than ABI version 2, or
+ * pds=sng: -FI_ENOSYS), or ABORT fails (another error), the library tears
+ * itself down instead: it destroys its service QP, which makes the device
+ * drop what it can and answer none of it, and reports an error.  The
+ * endpoint can then be closed, but the instance is dead: every later call
+ * that needs the device fails with -FI_EIO, and releasing things succeeds.
  */
 int uet_ep_abort(uet_ep_handle_t ep_handle);
 int uet_ep_close(uet_ep_handle_t ep_handle);

@@ -12,7 +12,10 @@
  * which defines the same uet_* functions as the reference library linked
  * here.
  *
- * Usage: uet_fake_device IPV4 MEM_FD MEM_LEN CHAN_FD WIRE_FD
+ * Usage: uet_fake_device IPV4 MEM_FD MEM_LEN CHAN_FD WIRE_FD [v1]
+ *
+ * With v1 it plays a device of ABI version 1: QUERY reports version 1 and
+ * no ABORT, and a capsule of a later version is refused with EPROTO.
  *
  * It runs until the guest closes the device, waits for the engine to hand
  * everything back, prints one line of statistics and exits 0 when the
@@ -22,6 +25,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <endian.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -38,6 +42,7 @@
 
 #include "fake_device_proto.h"
 #include "uet_engine.h"
+#include "uet_ernic_abi.h"
 #include "uet_svc.h"
 
 #define MAX_MRS 64u
@@ -57,6 +62,7 @@ struct dev {
     } mrs[MAX_MRS];
     bool bye;
     bool wire_down; /* lose every IP frame (FDEV_WIRE) */
+    bool v1;        /* play an ABI version 1 device */
     /* FDEV_HOLD: a reply kept back, and when to let it go */
     int hold_op;         /* opcode to keep, or -1 */
     bool held;           /* one is kept */
@@ -131,6 +137,17 @@ static bool svc_reply(void *ctx, uint32_t qp_id, const void *capsule,
     m.qp = qp_id;
     m.len = (uint32_t)(len < sizeof(m.data) ? len : sizeof(m.data));
     memcpy(m.data, capsule, m.len);
+    if (d->v1 && m.len == sizeof(struct uet_ernic_reply)) {
+        struct uet_ernic_reply r;
+
+        memcpy(&r, m.data, sizeof(r));
+        if (r.hdr.opcode == UET_ERNIC_OP_QUERY) {
+            r.hdr.version = htole16(1);
+            r.u.query.abi_version = htole16(1);
+            r.u.query.caps &= htole32(~UET_ERNIC_CAP_ABORT);
+            memcpy(m.data, &r, sizeof(r));
+        }
+    }
     /* A reply the test wants late: kept, as if the device were slow. */
     if (d->hold_op >= 0 && !d->held && m.len > 6 &&
         m.data[6] == (uint8_t)d->hold_op) {
@@ -167,6 +184,22 @@ static void handle(struct dev *d, const struct fdev_msg *m)
         }
         break;
     case FDEV_CMD:
+        if (d->v1 && m->len >= sizeof(struct uet_ernic_hdr)) {
+            struct uet_ernic_hdr h;
+
+            memcpy(&h, m->data, sizeof(h));
+            if (le16toh(h.version) > 1) {
+                struct uet_ernic_reply r;
+
+                memset(&r, 0, sizeof(r));
+                r.hdr = h;
+                r.hdr.version = htole16(1);
+                r.hdr.flags = UET_ERNIC_F_REPLY;
+                r.status = (int32_t)htole32(EPROTO);
+                (void)svc_reply(d, m->qp, &r, sizeof(r));
+                break;
+            }
+        }
         if (d->held && d->hold_after > 0 && --d->hold_after == 0) {
             (void)send(d->chan, &d->held_msg, sizeof(d->held_msg), 0);
             d->held = false;
@@ -223,11 +256,12 @@ int main(int argc, char **argv)
     uint64_t ip, mem_fd, mem_len, chan, wire;
     char err[256] = "";
 
-    if (argc != 6 || !parse_u64(argv[1], &ip) || !parse_u64(argv[2], &mem_fd) ||
+    if ((argc != 6 && (argc != 7 || strcmp(argv[6], "v1") != 0)) ||
+        !parse_u64(argv[1], &ip) || !parse_u64(argv[2], &mem_fd) ||
         !parse_u64(argv[3], &mem_len) || !parse_u64(argv[4], &chan) ||
         !parse_u64(argv[5], &wire) || ip == 0 || ip > UINT32_MAX ||
         mem_fd > INT32_MAX || chan > INT32_MAX || wire > INT32_MAX) {
-        fprintf(stderr, "usage: %s IPV4 MEM_FD MEM_LEN CHAN_FD WIRE_FD\n",
+        fprintf(stderr, "usage: %s IPV4 MEM_FD MEM_LEN CHAN_FD WIRE_FD [v1]\n",
                 argv[0]);
         return 2;
     }
@@ -237,6 +271,7 @@ int main(int argc, char **argv)
 
     memset(&d, 0, sizeof(d));
     d.hold_op = -1;
+    d.v1 = argc == 7;
     d.mem_len = (size_t)mem_len;
     d.chan = (int)chan;
     d.wire = (int)wire;

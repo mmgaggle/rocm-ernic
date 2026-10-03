@@ -304,6 +304,8 @@ static void progress(struct uet_ernic_dev *d)
     struct ibv_wc wc[16];
     int n;
 
+    if (d->qp == NULL)
+        return; /* torn down: nothing more comes */
     while ((n = ibv_poll_cq(d->cq, 16, wc)) > 0) {
         for (int i = 0; i < n; i++) {
             if (wc[i].status != IBV_WC_SUCCESS) {
@@ -489,10 +491,14 @@ static int auto_mr_drop(struct uet_ernic_dev *d, struct auto_mr *a)
     struct uet_ernic_reply r;
     int rc;
 
-    memset(&q, 0, sizeof(q));
-    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
-    q.handle = htole32(a->handle);
-    rc = call(d, &q, sizeof(q), &r);
+    /* A dead service QP took the device's handles with it. */
+    rc = 0;
+    if (!d->broken) {
+        memset(&q, 0, sizeof(q));
+        hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+        q.handle = htole32(a->handle);
+        rc = call(d, &q, sizeof(q), &r);
+    }
     (void)ibv_dereg_mr(a->ibmr);
     memset(a, 0, sizeof(*a));
     return rc;
@@ -973,10 +979,13 @@ int uet_mr_close(uet_mr_handle_t mr_handle)
     d = mr->dom->dev;
 
     pthread_mutex_lock(&d->lock);
-    memset(&q, 0, sizeof(q));
-    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
-    q.handle = htole32(mr->handle);
-    rc = call(d, &q, sizeof(q), &r);
+    rc = 0;
+    if (!d->broken) {
+        memset(&q, 0, sizeof(q));
+        hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+        q.handle = htole32(mr->handle);
+        rc = call(d, &q, sizeof(q), &r);
+    }
     /* Destroying the ionic region revokes the engine's copy as well, so
      * even a failed deregistration leaves nothing reachable. */
     (void)ibv_dereg_mr(mr->ibmr);
@@ -1040,7 +1049,8 @@ int uet_av_remove(uet_addr_handle_t addr_handle)
     hdr_init(av->dom->dev, &q.hdr, UET_ERNIC_OP_PEER_REMOVE, 0);
     q.handle = htole32(av->handle);
     pthread_mutex_lock(&av->dom->dev->lock);
-    rc = call(av->dom->dev, &q, sizeof(q), &r);
+    /* A dead service QP took the device's handles with it. */
+    rc = av->dom->dev->broken ? 0 : call(av->dom->dev, &q, sizeof(q), &r);
     pthread_mutex_unlock(&av->dom->dev->lock);
     if (rc != 0 && rc != -FI_EBADF)
         return rc;
@@ -1180,6 +1190,35 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
     return 0;
 }
 
+static bool can_abort(const struct uet_ernic_dev *d)
+{
+    return d->abi >= 2 && (d->caps & UET_ERNIC_CAP_ABORT) != 0;
+}
+
+int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
+                  void *optval, size_t *optlen)
+{
+    struct uet_ernic_ep *ep = ep_handle;
+    bool v;
+
+    if (ep == NULL || level != FI_OPT_ENDPOINT)
+        return -FI_ENOSYS;
+    if (optname == UET_OPT_FORCE_RUDI)
+        v = ep->rudi;
+    else if (optname == UET_OPT_ABORT)
+        v = can_abort(ep->dom->dev);
+    else
+        return -FI_ENOSYS;
+    if (optval == NULL || optlen == NULL || *optlen < sizeof(bool)) {
+        if (optlen != NULL)
+            *optlen = sizeof(bool);
+        return -FI_ETOOSMALL;
+    }
+    *(bool *)optval = v;
+    *optlen = sizeof(bool);
+    return 0;
+}
+
 static void cq_free(struct uet_ernic_cq *cq)
 {
     if (cq == NULL)
@@ -1191,14 +1230,43 @@ static void cq_free(struct uet_ernic_cq *cq)
 }
 
 /*
+ * The device cannot be trusted to take the transfers back: destroy the
+ * service QP.  The device drops the QP's transfers as it would on ABORT,
+ * where its engine can, and answers none of them; one that cannot lets
+ * them run but answers none.  Every transfer is settled here: an aborted
+ * endpoint's without a completion, any other's with an error.  The
+ * instance is dead from now on.  Called with the lock held.
+ */
+static void dev_kill(struct uet_ernic_dev *d)
+{
+    if (d->qp != NULL) {
+        (void)ibv_destroy_qp(d->qp);
+        d->qp = NULL;
+    }
+    d->broken = true;
+    for (unsigned i = 0; i < PENDING; i++) {
+        struct pending *p = &d->pend[i];
+
+        if (p->kind == PEND_RMA) {
+            if (!p->ep->aborted)
+                cq_push(p->ep->tx_cq, p->context, p->flags, p->len, ECANCELED);
+            p->ep->in_flight--;
+            if (p->auto_mr != NULL)
+                p->auto_mr->refs--;
+            p->auto_mr = NULL;
+        }
+        p->kind = PEND_FREE;
+    }
+    d->late = 0;
+}
+
+/*
  * Take back every WRITE and READ the endpoint has outstanding with one
  * ABORT for its group.  The device answers each of them, ECANCELED unless
  * it had finished, before it answers the ABORT, and from then on sends
  * nothing more of them; their answers find the endpoint aborted and report
- * no completion, as the reference does.  A device that cannot take
- * transfers back (an older one, or one whose engine runs pds=sng) is
- * reported the way the reference's stop-and-go PDS reports itself, so the
- * caller waits for them instead.
+ * no completion, as the reference does.  When that cannot be done, the
+ * instance is torn down (see uet_ernic.h).
  */
 int uet_ep_abort(uet_ep_handle_t ep_handle)
 {
@@ -1206,25 +1274,40 @@ int uet_ep_abort(uet_ep_handle_t ep_handle)
     struct uet_ernic_dev *d;
     struct uet_ernic_abort q;
     struct uet_ernic_reply r;
+    uint64_t deadline;
     int rc = 0;
 
     if (ep == NULL)
         return -FI_EINVAL;
     d = ep->dom->dev;
-    if (d->abi < 2 || (d->caps & UET_ERNIC_CAP_ABORT) == 0)
-        return -FI_ENOSYS;
 
     pthread_mutex_lock(&d->lock);
     ep->aborted = true;
-    if (ep->in_flight != 0) {
-        memset(&q, 0, sizeof(q));
-        hdr_init(d, &q.hdr, UET_ERNIC_OP_ABORT, 0);
-        q.group = htole32(ep->group);
-        rc = call(d, &q, sizeof(q), &r);
+    if (ep->in_flight == 0) {
+        /* nothing to take back, whatever the device can do */
+    } else if (d->broken) {
+        rc = -FI_EIO;
+        dev_kill(d);
+    } else if (!can_abort(d)) {
+        rc = -FI_ENOSYS;
+        dev_kill(d);
+    } else {
+        deadline = now_ms() + d->sync_wait_ms;
+        do {
+            memset(&q, 0, sizeof(q));
+            hdr_init(d, &q.hdr, UET_ERNIC_OP_ABORT, 0);
+            q.group = htole32(ep->group);
+            rc = call(d, &q, sizeof(q), &r);
+            /* EAGAIN: the device had no room for the answers yet */
+            if (rc == -FI_EAGAIN)
+                progress(d);
+        } while (rc == -FI_EAGAIN && now_ms() < deadline);
         /* Each transfer is answered before the ABORT; one still counted
          * here means a device that broke the ABI, or a broken QP. */
         if (rc == 0 && ep->in_flight != 0)
             rc = -FI_EIO;
+        if (rc != 0)
+            dev_kill(d);
     }
     pthread_mutex_unlock(&d->lock);
     return rc;
