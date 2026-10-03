@@ -304,11 +304,20 @@ static struct uet_wire_dpdk *g_uet_dpdk;
  * the port and the dmadev where they need it (uet_wire_dpdk.h, "Guest
  * memory"); what came of that goes to the log.
  */
+#ifdef ERNIC_HAVE_UET
+static void uet_dma_region_add(const vfu_dma_info_t *info);
+static void uet_dma_region_remove(const vfu_dma_info_t *info);
+#endif
+
 static void dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     vfu_log(vfu_ctx, LOG_DEBUG,
             "DMA region registered: iova=%p len=%zu vaddr=%p prot=%#x",
             info->iova.iov_base, info->iova.iov_len, info->vaddr, info->prot);
+
+#ifdef ERNIC_HAVE_UET
+    uet_dma_region_add(info);
+#endif
 
 #ifdef ERNIC_HAVE_UET_DPDK
     if (g_uet_dpdk && info->vaddr) {
@@ -335,6 +344,10 @@ static void dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
     vfu_log(vfu_ctx, LOG_DEBUG, "DMA region unregistered: iova=%p len=%zu",
             info->iova.iov_base, info->iova.iov_len);
+
+#ifdef ERNIC_HAVE_UET
+    uet_dma_region_remove(info);
+#endif
 
 #ifdef ERNIC_HAVE_UET_DPDK
     if (g_uet_dpdk && info->vaddr &&
@@ -663,12 +676,51 @@ static int setup_interrupts(vfu_ctx_t *vfu_ctx, rocm_ernic_dev_t *dev)
  * rest of the device.  All of it runs on this thread, from the main loop.
  * ---------------------------------------------------------------------------
  */
+/* Guest memory regions this process has mapped, for the fast path below. */
+#define UET_DMA_REGIONS 32u
+
+struct uet_dma_region {
+    uint64_t iova;
+    size_t len;
+    uint8_t *va;
+    bool writable;
+};
+
 struct uet_dma_vfu {
     vfu_ctx_t *vfu_ctx;
     dma_sg_t *sg; /* scratch, reused: everything runs on one thread */
+    struct uet_dma_region reg[UET_DMA_REGIONS];
+    unsigned nreg;
 };
 
 static struct uet_dma_vfu g_uet_dma;
+
+static void uet_dma_region_add(const vfu_dma_info_t *info)
+{
+    struct uet_dma_vfu *d = &g_uet_dma;
+
+    if (info->vaddr == NULL || d->nreg >= UET_DMA_REGIONS)
+        return;
+    d->reg[d->nreg].iova = (uint64_t)(uintptr_t)info->iova.iov_base;
+    d->reg[d->nreg].len = info->iova.iov_len;
+    d->reg[d->nreg].va = info->vaddr;
+    d->reg[d->nreg].writable = (info->prot & PROT_WRITE) != 0;
+    d->nreg++;
+}
+
+static void uet_dma_region_remove(const vfu_dma_info_t *info)
+{
+    struct uet_dma_vfu *d = &g_uet_dma;
+    uint64_t iova = (uint64_t)(uintptr_t)info->iova.iov_base;
+
+    for (unsigned i = 0; i < d->nreg; i++) {
+        if (d->reg[i].iova == iova && d->reg[i].len == info->iova.iov_len) {
+            d->reg[i] = d->reg[d->nreg - 1];
+            d->nreg--;
+            return;
+        }
+    }
+}
 
 /*
  * Map a range of guest memory for the engine.  The engine asks for one page
@@ -684,6 +736,19 @@ static void *uet_dma_vfu_map(void *ctx, uint64_t addr, size_t len, bool write)
 
     if (!d->vfu_ctx || !d->sg || len == 0)
         return NULL;
+
+    /* The regions this process mapped, before libvfio-user's lookup: the
+     * engine asks for every page of every payload.  No dirty marking on
+     * this path: the device sets up no migration, so there is no dirty
+     * log to keep. */
+    for (unsigned i = 0; i < d->nreg; i++) {
+        const struct uet_dma_region *r = &d->reg[i];
+
+        if (addr >= r->iova && addr - r->iova <= r->len &&
+            len <= r->len - (addr - r->iova) && (!write || r->writable))
+            return r->va + (addr - r->iova);
+    }
+
     if (vfu_addr_to_sgl(d->vfu_ctx, (vfu_dma_addr_t)(uintptr_t)addr, len, d->sg,
                         1, write ? PROT_READ | PROT_WRITE : PROT_READ) != 1)
         return NULL;
