@@ -94,6 +94,7 @@ struct uet_wire_dpdk {
     bool flow_isolated;
     bool flow_no_rss; /* the port has RSS, but not as a flow action */
     unsigned flow_rules;
+    bool flow_icmp; /* the ICMP rule validated, or was created */
     char flow_why[96];
     bool rss_hw;
     uint64_t rss_hf;
@@ -311,9 +312,11 @@ static void flow_note(struct uet_wire_dpdk *w, const char *what,
  * IP protocol and ICMP (the engine answers pings), all to the engine's
  * address, and ARP.  UET over UDP is spread over the queues by RSS on the
  * source port (the entropy) when there is more than one.  Validated first,
- * created only if all of them validate.
+ * created only if the three the engine needs validate.  The ICMP rule is
+ * optional: a port that rejects it keeps the others, and its isolation,
+ * and only goes without answering pings.
  */
-#define FLOW_RULES 4u
+#define FLOW_REQUIRED 3u
 static void flow_setup(struct uet_wire_dpdk *w, bool create)
 {
     struct rte_flow_attr attr = {.ingress = 1};
@@ -401,27 +404,40 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
         const char *what;
         const struct rte_flow_item *pat;
         const struct rte_flow_action *act;
+        bool optional;
     } rules[] = {
-        {"UDP rule", udp_pat, udp_act},
-        {"IP protocol rule", ipp_pat, to_q0},
-        {"ICMP rule", icmp_pat, to_q0},
-        {"ARP rule", arp_pat, to_q0},
+        {"UDP rule", udp_pat, udp_act, false},
+        {"IP protocol rule", ipp_pat, to_q0, false},
+        {"ARP rule", arp_pat, to_q0, false},
+        {"ICMP rule", icmp_pat, to_q0, true},
     };
-    _Static_assert(sizeof(rules) / sizeof(rules[0]) == FLOW_RULES,
-                   "every rule is counted");
+    unsigned required = 0;
 
+    if (!create)
+        w->flow_icmp = true;
     for (unsigned i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
         memset(&fe, 0, sizeof(fe));
+        if (rules[i].optional && !w->flow_icmp)
+            continue; /* it did not validate */
         if (!create) {
             if (rte_flow_validate(w->port, &attr, rules[i].pat, rules[i].act,
                                   &fe) != 0) {
+                if (rules[i].optional) {
+                    w->flow_icmp = false;
+                    continue;
+                }
                 flow_note(w, rules[i].what, &fe);
                 return;
             }
+            required += rules[i].optional ? 0u : 1u;
             continue;
         }
         if (rte_flow_create(w->port, &attr, rules[i].pat, rules[i].act, &fe) ==
             NULL) {
+            if (rules[i].optional) {
+                w->flow_icmp = false;
+                continue;
+            }
             flow_note(w, rules[i].what, &fe);
             (void)rte_flow_flush(w->port, &fe);
             w->flow_rules = 0;
@@ -431,8 +447,8 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
     }
     if (create)
         w->flow_hw = true;
-    else
-        w->flow_rules = FLOW_RULES; /* all validated */
+    else if (required == FLOW_REQUIRED)
+        w->flow_rules = FLOW_REQUIRED; /* the needed ones validated */
 }
 
 /* Buffer split after the UDP header, where the port splits by protocol. */
@@ -518,7 +534,7 @@ static int port_start(struct uet_wire_dpdk *w,
     w->flow_why[0] = '\0';
     w->flow_no_rss = false;
     flow_setup(w, false);
-    if (w->flow_rules == FLOW_RULES) {
+    if (w->flow_rules == FLOW_REQUIRED) {
         memset(&fe, 0, sizeof(fe));
         w->flow_isolated = rte_flow_isolate(w->port, 1, &fe) == 0;
     }
@@ -985,7 +1001,8 @@ void uet_wire_dpdk_describe(const struct uet_wire_dpdk *w, char *buf,
     char split[48];
 
     if (w->flow_hw)
-        snprintf(flow, sizeof(flow), "flow hw (%u rules%s%s)", w->flow_rules,
+        snprintf(flow, sizeof(flow), "flow hw (%u rules%s%s%s)", w->flow_rules,
+                 w->flow_icmp ? "" : ", no ping rule",
                  w->flow_isolated ? ", isolated" : "",
                  w->flow_no_rss ? ", queue 0: no rss action" : "");
     else

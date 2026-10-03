@@ -1123,8 +1123,11 @@ Offloads
      - Hardware that runs it
    * - Flow steering. ``rte_flow`` rules send UDP to port 4793,
        IP protocol 253, ICMP to the engine's address and ARP to
-       the engine's queues. If all four rules validate, the port
-       is isolated, and other frames stay with the kernel.
+       the engine's queues. If the UDP, IP protocol and ARP rules
+       validate, the port is isolated, and other frames stay with
+       the kernel. The ICMP rule is optional: a port that rejects
+       it does not answer pings, and the startup line says
+       ``no ping rule``.
      - The engine's filter sees every frame and gives the
        frames that are not UET to the guest.
      - ``net_tap``: rules as TC filters, isolated. ``af_packet``,
