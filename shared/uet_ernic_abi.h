@@ -163,7 +163,10 @@ struct uet_ernic_rma {
  *
  * A device whose engine cannot take transfers back (pds=sng) answers
  * EOPNOTSUPP and takes nothing back; it does not report UET_ERNIC_CAP_ABORT
- * in QUERY.
+ * in QUERY.  A device with no room for the answers takes nothing back and
+ * answers EAGAIN: send the ABORT again.  A device that could not take some
+ * transfer out of its engine answers EBUSY; that transfer is answered when
+ * it leaves the engine, and may still land until then.
  */
 struct uet_ernic_abort {
     struct uet_ernic_hdr hdr;

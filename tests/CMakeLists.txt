@@ -599,7 +599,9 @@ if(ERNIC_UET)
         ${GLIB2_INCLUDE_DIRS}
         ${ERNIC_IBVERBS_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_uet_datapath PRIVATE _GNU_SOURCE)
+    # A small reply queue, so ABORT can be tried against a full one.
+    target_compile_definitions(test_uet_datapath PRIVATE _GNU_SOURCE
+        SVC_MAX_REPLIES=16u)
     target_compile_options(test_uet_datapath PRIVATE ${ERNIC_UNIT_TEST_SAN})
     target_link_options(test_uet_datapath PRIVATE ${ERNIC_UNIT_TEST_SAN_LINK})
     target_link_directories(test_uet_datapath PRIVATE ${GLIB2_LIBRARY_DIRS})

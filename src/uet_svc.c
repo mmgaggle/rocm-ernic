@@ -18,11 +18,13 @@
 #include "uet_ernic_abi.h"
 #include "uet_svc.h"
 
-#define SVC_MAX_MRS     UET_ENGINE_MAX_MRS
-#define SVC_MAX_PEERS   UET_ENGINE_MAX_PEERS
-#define SVC_MAX_OPS     256u  /* WRITE/READ accepted and not yet answered */
+#define SVC_MAX_MRS   UET_ENGINE_MAX_MRS
+#define SVC_MAX_PEERS UET_ENGINE_MAX_PEERS
+#define SVC_MAX_OPS   256u    /* WRITE/READ accepted and not yet answered */
+#ifndef SVC_MAX_REPLIES       /* a test sets a small one */
 #define SVC_MAX_REPLIES 1024u /* replies waiting for a posted receive */
-#define SVC_MAX_BLOCKED 8u    /* QPs a flush skips before it gives up */
+#endif
+#define SVC_MAX_BLOCKED 8u /* QPs a flush skips before it gives up */
 
 /* How long a WRITE/READ may wait to be posted (ARP, engine slots). */
 #define SVC_POST_TIMEOUT_MS 5000u
@@ -427,9 +429,10 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
  * Take a transfer back: post nothing more of it, and take its segments out
  * of the engine, so none of their packets goes on the wire again.  It is
  * answered at once (with ECANCELED unless it had already failed), or, for
- * a segment the engine cannot let go of, when that segment leaves.
+ * a segment the engine cannot let go of, when that segment leaves; false
+ * then.
  */
-static void op_abort(struct uet_svc *s, struct svc_op *op)
+static bool op_abort(struct uet_svc *s, struct svc_op *op)
 {
     op->stop = true;
     if (op->status == 0)
@@ -449,8 +452,10 @@ static void op_abort(struct uet_svc *s, struct svc_op *op)
             s->rudi_out -= op->seg_len[k];
     }
     s->stats.ops_aborted++;
-    if (op->segs_out == 0)
-        op_finish(s, op, op->status);
+    if (op->segs_out != 0)
+        return false;
+    op_finish(s, op, op->status);
+    return true;
 }
 
 /* Settle the segments that have left the engine. */
@@ -539,19 +544,41 @@ static void cmd_abort(struct uet_svc *s, uint32_t qp_id, const void *capsule,
      * ahead of the ones taken back. */
     reap_engine(s, now_ms());
 
+    /* Every transfer taken back is answered, and then the ABORT: there has
+     * to be room for all of those answers, or one would be lost and the
+     * guest would wait for it.  Without room, nothing is taken back and the
+     * ABORT is answered EAGAIN, for the guest to send it again. */
+    uint32_t want = 0;
+    for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
+        struct svc_op *op = &s->ops_tab[i];
+
+        if (op->used && !op->orphan && op->qp_id == qp_id &&
+            ((flags & UET_ERNIC_ABORT_ALL) != 0 || op->group == group))
+            want++;
+    }
+    if (s->nreplies + want + 1u > SVC_MAX_REPLIES) {
+        s->stats.aborts_deferred++;
+        reply_status(s, qp_id, UET_ERNIC_OP_ABORT, cookie, EAGAIN);
+        return;
+    }
+
+    uint32_t stuck = 0;
     for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
         struct svc_op *op = &s->ops_tab[i];
 
         if (!op->used || op->orphan || op->qp_id != qp_id ||
             ((flags & UET_ERNIC_ABORT_ALL) == 0 && op->group != group))
             continue;
-        op_abort(s, op);
+        if (!op_abort(s, op))
+            stuck++;
         count++;
     }
 
     /* Replies go out in order on a QP, so the guest sees every transfer
-     * taken back answered before this. */
-    reply_init(&r, UET_ERNIC_OP_ABORT, cookie, 0);
+     * taken back answered before this.  A transfer the engine would not
+     * let go of is answered later, when it leaves the engine, and the
+     * ABORT says so: EBUSY. */
+    reply_init(&r, UET_ERNIC_OP_ABORT, cookie, stuck != 0 ? EBUSY : 0);
     r.u.abort.count = htole32(count);
     send_reply(s, qp_id, &r);
 }

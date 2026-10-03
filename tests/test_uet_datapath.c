@@ -18,10 +18,13 @@
  * the initiator's service QP destroyed while a WRITE is in flight and its
  * QP number reused, and the target's service QP destroyed so its window is
  * gone, and ABORT: two WRITEs in two groups on a wire that loses every
- * frame, one group taken back.  Before any of that, the capsule checks:
- * bad magic, bad version, unknown opcode, short capsules, unknown lkeys
- * and handles, a malformed ABORT, and a reply that has to wait for the
- * guest to post a receive.
+ * frame, one group taken back; a WRITE posted again at once on a new
+ * group; ABORT of every group; ABORT of a WRITE still waiting in the
+ * device for ARP; and ABORT with too little room for its answers (the
+ * test builds the channel with a 16-reply queue).  Before any of that, the
+ * capsule checks: bad magic, bad version, unknown opcode, short capsules,
+ * unknown lkeys and handles, a malformed ABORT, and a reply that has to wait
+ * for the guest to post a receive.
  *
  * Copyright (C) Advanced Micro Devices, Inc.
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -336,6 +339,7 @@ void pvrdma_rdma_bytes_count(pvrdma_handle_t handle, uint32_t qp_id,
 
 #define IP_INITIATOR 0xc0a8c865u /* 192.168.200.101 */
 #define IP_TARGET    0xc0a8c866u /* 192.168.200.102 */
+#define IP_NOBODY    0xc0a8c8fau /* 192.168.200.250: never answers ARP */
 #define PEER_PID     0u
 #define PEER_INDEX   15u
 
@@ -457,6 +461,8 @@ struct report {
     int status_window_gone; /* WRITE into a window that was withdrawn */
     int status_aborted;     /* WRITE taken back by ABORT */
     uint32_t abort_count;   /* what the ABORT reported */
+    double abort_wait_ms;   /* ABORT of a WRITE waiting for ARP */
+    uint64_t aborts_deferred;
     uint64_t revoked_hits;
     uint64_t replies_discarded;
     uint64_t compared;
@@ -1365,6 +1371,99 @@ static void run_initiator(struct node *n)
                  "%" PRIu64 " transfers taken back, %" PRIu64
                  " engine operations",
                  st.ops_aborted - aborted0, es.ops_aborted);
+        /* The same peer at once, on a new group: it carries on. */
+        uint64_t wc = rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, T5_LEN,
+                                     T6_LEN, T6, rkey, true, 9);
+        expect(n, rma_wait(n, wc, "WRITE on a new group", NULL), 0,
+               "WRITE on a new group after ABORT");
+
+        /* ABORT of every group: both answered ECANCELED, count 2. */
+        n->wire_down = true;
+        uint64_t w10 = rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, 0,
+                                      T5_LEN / 2, T5, rkey, true, 10);
+        uint64_t w11 =
+            rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, 0, T5_LEN / 2,
+                           T5 + T5_LEN / 2, rkey, false, 11);
+        pump_for(n, 30.0);
+        expect(n, abort_group(n, 0, UET_ERNIC_ABORT_ALL, &ar), 0,
+               "ABORT of every group");
+        if (le32toh(ar.u.abort.count) != 2)
+            fail(rep, "ABORT of every group took %u back",
+                 le32toh(ar.u.abort.count));
+        if (!take_reply(n, w10, &wr) ||
+            (int32_t)le32toh((uint32_t)wr.status) != ECANCELED ||
+            !take_reply(n, w11, &wr) ||
+            (int32_t)le32toh((uint32_t)wr.status) != ECANCELED)
+            fail(rep, "a WRITE taken back by ABORT_ALL was not answered "
+                      "ECANCELED ahead of it");
+        n->wire_down = false;
+
+        /* A WRITE still in the device, waiting for ARP of a peer that
+         * never answers: taken back at once. */
+        uint32_t hnobody;
+        expect(n, peer_add(n, IP_NOBODY, &hnobody), 0, "PEER_ADD of nobody");
+        uint64_t wn = rma_post_group(n, UET_ERNIC_OP_WRITE, hnobody, ha, 0,
+                                     4096, T5, rkey, true, 12);
+        pump_for(n, 50.0);
+        double ta = now_ms_f();
+        expect(n, abort_group(n, 12, 0, &ar), 0, "ABORT of a waiting WRITE");
+        rep->abort_wait_ms = now_ms_f() - ta;
+        if (le32toh(ar.u.abort.count) != 1 || !take_reply(n, wn, &wr) ||
+            (int32_t)le32toh((uint32_t)wr.status) != ECANCELED)
+            fail(rep, "the WRITE waiting for ARP was not taken back");
+        expect(n, release(n, UET_ERNIC_OP_PEER_REMOVE, hnobody), 0,
+               "PEER_REMOVE of nobody");
+
+        /* No room for the answers: 15 replies wait for receives, so an
+         * ABORT with one transfer to take back (2 answers) does not fit
+         * the 16-reply queue.  It is answered EAGAIN and takes nothing
+         * back; sent again with receives posted, it does. */
+        n->auto_repost = false;
+        while (n->recvs_out > 0) {
+            struct uet_ernic_hdr qh;
+
+            hdr_init(&qh, UET_ERNIC_OP_QUERY, ++n->next_cookie);
+            (void)call(n, &qh, sizeof(qh), "QUERY", NULL);
+        }
+        uint64_t first_q = n->next_cookie + 1;
+        for (int i = 0; i < 15; i++) {
+            struct uet_ernic_hdr qh;
+
+            hdr_init(&qh, UET_ERNIC_OP_QUERY, ++n->next_cookie);
+            post_send(n, &qh, sizeof(qh));
+        }
+        n->wire_down = true;
+        uint64_t wf = rma_post_group(n, UET_ERNIC_OP_WRITE, hpa, ha, 0, 4096,
+                                     T5, rkey, true, 13);
+        struct uet_ernic_abort aq;
+        uint64_t a1 = ++n->next_cookie;
+        memset(&aq, 0, sizeof(aq));
+        hdr_init(&aq.hdr, UET_ERNIC_OP_ABORT, a1);
+        aq.group = htole32(13);
+        post_send(n, &aq, sizeof(aq));
+        pump_for(n, 20.0);
+        n->auto_repost = true;
+        while (n->recvs_out < RECVS)
+            post_recv(n);
+        for (uint64_t c = first_q; c < first_q + 15; c++)
+            if (!wait_reply(n, c, 5000.0, &wr))
+                fail(rep, "a waiting QUERY reply never arrived");
+        if (!wait_reply(n, a1, 5000.0, &ar) ||
+            (int32_t)le32toh((uint32_t)ar.status) != EAGAIN)
+            fail(rep, "an ABORT without room for its answers was not "
+                      "answered EAGAIN");
+        if (take_reply(n, wf, &wr))
+            fail(rep, "an ABORT answered EAGAIN took a transfer back");
+        expect(n, abort_group(n, 13, 0, &ar), 0, "ABORT sent again");
+        if (le32toh(ar.u.abort.count) != 1 || !take_reply(n, wf, &wr) ||
+            (int32_t)le32toh((uint32_t)wr.status) != ECANCELED)
+            fail(rep, "the ABORT sent again did not take the WRITE back");
+        n->wire_down = false;
+        uet_svc_get_stats(n->dp->uet_svc, &st);
+        rep->aborts_deferred = st.aborts_deferred;
+        if (st.aborts_deferred != 1)
+            fail(rep, "%" PRIu64 " ABORTs deferred, not 1", st.aborts_deferred);
+
         expect(n, release(n, UET_ERNIC_OP_MR_DEREG, ha), 0,
                "MR_DEREG after ABORT");
         expect(n, release(n, UET_ERNIC_OP_PEER_REMOVE, hpa), 0,
@@ -1543,6 +1642,10 @@ int main(void)
                ini.abort_count,
                ini.status_aborted > 0 ? strerror(ini.status_aborted) : "ok",
                tgt.compared);
+        printf("  then a WRITE on a new group, ABORT of every group, ABORT "
+               "of a WRITE waiting for ARP (%.1f ms), and %" PRIu64
+               " ABORT answered EAGAIN with a full reply queue\n",
+               ini.abort_wait_ms, ini.aborts_deferred);
         printf("  initiator channel: %" PRIu64 " commands, %" PRIu64
                " replies, %" PRIu64 " waited for a receive, %" PRIu64
                " discarded, %" PRIu64 " dropped\n",
