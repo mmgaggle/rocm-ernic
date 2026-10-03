@@ -66,16 +66,19 @@ struct uet_nic_ernic_cfg {
 };
 
 struct uet_nic_ernic_stats {
-    uint64_t rx_frames;     /* UET frames queued for the provider */
-    uint64_t rx_frames_ext; /* of which left in the wire's buffer */
-    uint64_t rx_dropped;    /* UET frames dropped: queue full or too big */
-    uint64_t tx_frames;     /* frames the provider transmitted */
-    uint64_t tx_frames_iov; /* of which in pieces, payload in place */
-    uint64_t tx_dropped;    /* frames the wire would not take */
-    uint64_t arp_requests;  /* ARP requests sent to resolve a next hop */
-    uint64_t arp_replies;   /* ARP replies sent for the engine's address */
-    uint64_t arp_learned;   /* neighbors learned or refreshed from ARP */
-    uint64_t nh_pending;    /* resolutions answered with -EAGAIN */
+    uint64_t rx_frames;         /* UET frames queued for the provider */
+    uint64_t rx_frames_ext;     /* of which left in the wire's buffer */
+    uint64_t rx_dropped;        /* UET frames dropped: queue full or too big */
+    uint64_t tx_frames;         /* frames the provider transmitted */
+    uint64_t tx_frames_iov;     /* of which in pieces, payload in place */
+    uint64_t tx_dropped;        /* frames the wire would not take */
+    uint64_t arp_requests;      /* ARP requests sent to resolve a next hop */
+    uint64_t arp_replies;       /* ARP replies sent for the engine's address */
+    uint64_t arp_learned;       /* neighbors learned or refreshed from ARP */
+    uint64_t nh_pending;        /* resolutions answered with -EAGAIN */
+    uint64_t icmp_echo_replies; /* pings to the engine answered */
+    uint64_t icmp_limited;      /* echo requests over the rate, unanswered */
+    uint64_t icmp_dropped;      /* other or malformed ICMP to the engine */
 };
 
 /*

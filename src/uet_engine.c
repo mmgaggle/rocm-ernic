@@ -344,10 +344,11 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
         }
         cfg->udp_port = (uint16_t)v;
     } else if (strcmp(key, "proto") == 0) {
-        /* Not UDP or TCP: the filter would take the guest's traffic. */
-        if (!parse_u32_range(val, 1, 255, &v) || v == 6 || v == 17) {
+        /* Not UDP or TCP: the filter would take the guest's traffic.
+         * Not ICMP: the engine answers pings with it. */
+        if (!parse_u32_range(val, 2, 255, &v) || v == 6 || v == 17) {
             set_err(err, errlen,
-                    "proto must be 1..255 and not TCP or UDP (got '%s')", val);
+                    "proto must be 2..255 and not TCP or UDP (got '%s')", val);
             return false;
         }
         cfg->ipproto = (uint8_t)v;
@@ -1470,6 +1471,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->arp_requests = ns.arp_requests;
     out->arp_replies = ns.arp_replies;
     out->nh_pending = ns.nh_pending;
+    out->icmp_echo_replies = ns.icmp_echo_replies;
 
     out->mrs = 0;
     for (unsigned i = 0; i < UET_ENGINE_MAX_MRS; i++)

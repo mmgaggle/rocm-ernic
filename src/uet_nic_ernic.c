@@ -36,6 +36,14 @@
 #define ARP_OP_REQUEST_    1u
 #define ARP_OP_REPLY_      2u
 #define ARP_HTYPE_ETHERNET 1u
+#define IPPROTO_ICMP_      1u
+#define ICMP_HLEN          8u
+#define ICMP_ECHO_REPLY    0u
+#define ICMP_ECHO_REQUEST  8u
+
+/* Echo replies: a burst of ICMP_BURST, then one every ICMP_INTERVAL_MS. */
+#define ICMP_BURST       16u
+#define ICMP_INTERVAL_MS 10u
 
 /* Frames received but not yet polled by the provider. */
 #define RX_SLOTS 256u
@@ -92,6 +100,9 @@ struct uet_nic_ernic {
 
     struct neigh neigh[NEIGH_MAX];
 
+    unsigned icmp_tokens; /* echo replies that may go now */
+    uint64_t icmp_refill_ms;
+
     struct uet_nic_ernic_stats stats;
 };
 
@@ -132,16 +143,25 @@ static void wr32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)v;
 }
 
-/* RFC 1071: the ones' complement sum over a valid header is all ones. */
-static bool ipv4_csum_ok(const uint8_t *ip, size_t ihl)
+/* RFC 1071 ones' complement sum, folded, of @len bytes (odd ones padded). */
+static uint16_t csum_sum(const uint8_t *p, size_t len)
 {
     uint32_t sum = 0;
+    size_t i;
 
-    for (size_t i = 0; i + 1 < ihl; i += 2)
-        sum += rd16(ip + i);
+    for (i = 0; i + 1 < len; i += 2)
+        sum += rd16(p + i);
+    if (i < len)
+        sum += (uint32_t)p[i] << 8;
     while (sum >> 16)
         sum = (sum & 0xffffu) + (sum >> 16);
-    return sum == 0xffffu;
+    return (uint16_t)sum;
+}
+
+/* The ones' complement sum over a valid header is all ones. */
+static bool ipv4_csum_ok(const uint8_t *ip, size_t ihl)
+{
+    return csum_sum(ip, ihl) == 0xffffu;
 }
 
 static void format_mac(char *out, const uint8_t mac[6])
@@ -273,6 +293,82 @@ static bool handle_arp(struct uet_nic_ernic *n, const uint8_t *f, size_t len)
         send_arp(n, ARP_OP_REPLY_, sha, spa);
 
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* ICMP                                                               */
+/* ------------------------------------------------------------------ */
+
+/* One more echo reply allowed now?  A burst, then a steady rate. */
+static bool icmp_token(struct uet_nic_ernic *n)
+{
+    uint64_t now = now_ms();
+    uint64_t gained = (now - n->icmp_refill_ms) / ICMP_INTERVAL_MS;
+
+    if (gained > 0) {
+        n->icmp_tokens = (unsigned)(n->icmp_tokens + gained > ICMP_BURST
+                                        ? ICMP_BURST
+                                        : n->icmp_tokens + gained);
+        n->icmp_refill_ms += gained * ICMP_INTERVAL_MS;
+    }
+    if (n->icmp_tokens == 0)
+        return false;
+    n->icmp_tokens--;
+    return true;
+}
+
+/*
+ * An ICMP datagram to the engine's address and MAC (@ip, header @ihl long).
+ * An echo request is answered, so a host that finds its peers by ping, as
+ * the reference provider's raw-socket shim does, does not wait for a reply
+ * that never comes; anything else is dropped.
+ */
+static void handle_icmp(struct uet_nic_ernic *n, const uint8_t *f, size_t len,
+                        size_t ihl, bool csum_ok)
+{
+    const uint8_t *ip = f + ETH_HLEN_;
+    size_t tot_len = rd16(ip + 2);
+    uint8_t r[ETH_HLEN_ + 9000u];
+
+    /* No options to reflect, no fragments, a length that fits what
+     * arrived and the reply's MTU, and both checksums good. */
+    if (ihl != IPV4_MIN_HLEN || tot_len < ihl + ICMP_HLEN ||
+        ETH_HLEN_ + tot_len > len || tot_len > n->mtu ||
+        ETH_HLEN_ + tot_len > sizeof(r) || (rd16(ip + 6) & 0x3fffu) != 0 ||
+        (!csum_ok && !ipv4_csum_ok(ip, ihl)) || ip[ihl] != ICMP_ECHO_REQUEST ||
+        ip[ihl + 1] != 0 || csum_sum(ip + ihl, tot_len - ihl) != 0xffffu) {
+        n->stats.icmp_dropped++;
+        return;
+    }
+    if (!icmp_token(n)) {
+        n->stats.icmp_limited++;
+        return;
+    }
+
+    size_t flen = ETH_HLEN_ + tot_len;
+    memcpy(r, f, flen);
+    if (flen < ETH_MIN_FRAME) {
+        memset(r + flen, 0, ETH_MIN_FRAME - flen);
+        flen = ETH_MIN_FRAME;
+    }
+    memcpy(r, f + 6, 6);
+    memcpy(r + 6, n->mac, 6);
+
+    uint8_t *rip = r + ETH_HLEN_;
+    rip[8] = 64; /* TTL */
+    wr32(rip + 12, n->ip);
+    memcpy(rip + 16, ip + 12, 4);
+    wr16(rip + 10, 0);
+    if (!n->tx_ipv4_csum)
+        wr16(rip + 10, (uint16_t)~csum_sum(rip, ihl));
+
+    uint8_t *icmp = rip + ihl;
+    icmp[0] = ICMP_ECHO_REPLY;
+    wr16(icmp + 2, 0);
+    wr16(icmp + 2, (uint16_t)~csum_sum(icmp, tot_len - ihl));
+
+    if (n->tx(n->tx_ctx, r, flen) == 0)
+        n->stats.icmp_echo_replies++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -527,6 +623,8 @@ struct uet_nic_ernic *uet_nic_ernic_create(const struct uet_nic_ernic_cfg *cfg)
     n->tx_iov = cfg->tx_iov;
     n->tx_ctx = cfg->tx_ctx;
     n->tx_ipv4_csum = cfg->tx_ipv4_csum;
+    n->icmp_tokens = ICMP_BURST;
+    n->icmp_refill_ms = now_ms();
 
     n->slot_size = (size_t)cfg->mtu + ETH_HLEN_;
     n->slot_mem = calloc(RX_SLOTS, n->slot_size);
@@ -592,6 +690,15 @@ static bool rx_frame(struct uet_nic_ernic *n, const uint8_t *f, size_t len,
         return false;
     if (rd32(ip + 16) != n->ip)
         return false;
+    /* ICMP to the engine: echo requests are answered, the rest dropped. */
+    if (ip[9] == IPPROTO_ICMP_) {
+        if (memcmp(f, n->mac, 6) != 0)
+            return false;
+        handle_icmp(n, f, len, ihl, csum_ok);
+        if (ext && release != NULL)
+            release(cookie);
+        return true;
+    }
     /* UET over IP, or UET over UDP to the UET port.  Other UDP to the
      * engine's address is not UET, and not the guest's either, but it is
      * left alone like any other stray frame. */

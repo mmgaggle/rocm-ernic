@@ -1456,6 +1456,38 @@ static size_t build_udp4(uint8_t *f, uint16_t dport, uint32_t dst_ip,
     return len;
 }
 
+/* The RFC 1071 sum, folded: all ones over data that holds its checksum. */
+static uint16_t ones_sum(const uint8_t *p, size_t len)
+{
+    uint32_t sum = 0;
+
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += rd16(p + i);
+    if (len % 2 != 0)
+        sum += (uint32_t)p[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffffu) + (sum >> 16);
+    return (uint16_t)sum;
+}
+
+/* An ICMP echo request from the peer, with @data bytes 0, 1, 2, ... */
+static size_t build_icmp_echo(uint8_t *f, uint32_t dst_ip,
+                              const uint8_t *dst_mac, uint16_t id, uint16_t seq,
+                              size_t data)
+{
+    size_t len = build_ipv4(f, 1, dst_ip, dst_mac, 8 + data, 0);
+    uint8_t *icmp = f + 34;
+
+    icmp[0] = 8;
+    icmp[1] = 0;
+    put16(icmp + 4, id);
+    put16(icmp + 6, seq);
+    for (size_t i = 0; i < data; i++)
+        icmp[8 + i] = (uint8_t)i;
+    put16(icmp + 2, (uint16_t)~ones_sum(icmp, 8 + data));
+    return len;
+}
+
 static bool test_wire_filter(void)
 {
     struct filter_tx tx;
@@ -1555,6 +1587,55 @@ static bool test_wire_filter(void)
     EXPECT(st.rx_dropped == dropped + 4,
            "malformed datagrams were not dropped");
     EXPECT(st.rx_frames == 2, "a malformed datagram was queued");
+
+    /* A ping of the engine is answered: addresses swapped, the identifier,
+     * sequence number and data echoed, both checksums good. */
+    unsigned sent = tx.count;
+    len = build_icmp_echo(f, IP_INITIATOR, filter_mac, 0x1234, 7, 32);
+    EXPECT(uet_nic_ernic_rx_frame(n, f, len), "echo request not taken");
+    EXPECT(tx.count == sent + 1 && tx.len == len, "echo request not answered");
+    EXPECT(memcmp(tx.frame, peer_mac, 6) == 0 &&
+               memcmp(tx.frame + 6, filter_mac, 6) == 0 &&
+               rd16(tx.frame + 12) == 0x0800,
+           "echo reply has the wrong Ethernet header");
+    EXPECT(tx.frame[23] == 1 && rd16(tx.frame + 26) == (IP_INITIATOR >> 16) &&
+               rd16(tx.frame + 28) == (uint16_t)IP_INITIATOR &&
+               rd16(tx.frame + 30) == (IP_TARGET >> 16) &&
+               rd16(tx.frame + 32) == (uint16_t)IP_TARGET &&
+               ones_sum(tx.frame + 14, 20) == 0xffffu,
+           "echo reply has the wrong IP header");
+    EXPECT(tx.frame[34] == 0 && tx.frame[35] == 0 &&
+               rd16(tx.frame + 38) == 0x1234 && rd16(tx.frame + 40) == 7 &&
+               memcmp(tx.frame + 42, f + 42, 32) == 0 &&
+               ones_sum(tx.frame + 34, 8 + 32) == 0xffffu,
+           "echo reply has the wrong ICMP message");
+
+    /* A bad checksum is taken off the wire and not answered; ICMP for
+     * another address or MAC is the guest's. */
+    sent = tx.count;
+    len = build_icmp_echo(f, IP_INITIATOR, filter_mac, 1, 1, 32);
+    f[60] ^= 0x01;
+    EXPECT(uet_nic_ernic_rx_frame(n, f, len), "corrupt echo request left");
+    len = build_icmp_echo(f, IP_INITIATOR + 1, filter_mac, 1, 1, 32);
+    EXPECT(!uet_nic_ernic_rx_frame(n, f, len), "ping of another host taken");
+    len = build_icmp_echo(f, IP_INITIATOR, peer_mac, 1, 1, 32);
+    EXPECT(!uet_nic_ernic_rx_frame(n, f, len), "ping to another MAC taken");
+    EXPECT(tx.count == sent, "a ping that is not the engine's was answered");
+
+    /* A flood is answered up to a burst, then at a steady rate. */
+    sent = tx.count;
+    for (uint16_t seq = 0; seq < 200; seq++) {
+        len = build_icmp_echo(f, IP_INITIATOR, filter_mac, 2, seq, 32);
+        (void)uet_nic_ernic_rx_frame(n, f, len);
+    }
+    uet_nic_ernic_get_stats(n, &st);
+    EXPECT(tx.count - sent >= 15 && tx.count - sent < 60 &&
+               st.icmp_limited >= 140,
+           "a flood of pings was not rate-limited");
+    EXPECT(st.icmp_dropped == 1, "the corrupt echo request was not counted");
+    printf("  ping: answered; a flood of 200: %u answered, %" PRIu64
+           " over the rate\n",
+           tx.count - sent, st.icmp_limited);
 #undef EXPECT
 
     uet_nic_ernic_destroy(n);

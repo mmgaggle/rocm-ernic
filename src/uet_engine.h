@@ -342,6 +342,7 @@ struct uet_engine_stats {
     uint64_t arp_requests;
     uint64_t arp_replies;
     uint64_t nh_pending;
+    uint64_t icmp_echo_replies; /* pings to the engine answered */
     /* operations */
     uint64_t ops_posted;
     uint64_t ops_completed;

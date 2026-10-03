@@ -307,18 +307,20 @@ static void flow_note(struct uet_wire_dpdk *w, const char *what,
 }
 
 /*
- * The rules that bring the engine its frames: UDP to the UET port and the
- * UET IP protocol, both to the engine's address, and ARP.  UET over UDP is
- * spread over the queues by RSS on the source port (the entropy) when
- * there is more than one.  Validated first, created only if all three
- * validate.
+ * The rules that bring the engine its frames: UDP to the UET port, the UET
+ * IP protocol and ICMP (the engine answers pings), all to the engine's
+ * address, and ARP.  UET over UDP is spread over the queues by RSS on the
+ * source port (the entropy) when there is more than one.  Validated first,
+ * created only if all of them validate.
  */
+#define FLOW_RULES 4u
 static void flow_setup(struct uet_wire_dpdk *w, bool create)
 {
     struct rte_flow_attr attr = {.ingress = 1};
     struct rte_flow_error fe;
     struct rte_flow_item_ipv4 ip_spec, ip_mask;
     struct rte_flow_item_ipv4 ipp_spec, ipp_mask;
+    struct rte_flow_item_ipv4 icmp_spec, icmp_mask;
     struct rte_flow_item_udp udp_spec, udp_mask;
     struct rte_flow_item_eth arp_spec, arp_mask;
     uint16_t queues[MAX_QUEUES];
@@ -333,6 +335,9 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
     ipp_mask = ip_mask;
     ipp_spec.hdr.next_proto_id = w->cfg.ipproto;
     ipp_mask.hdr.next_proto_id = UINT8_MAX;
+    icmp_spec = ipp_spec;
+    icmp_mask = ipp_mask;
+    icmp_spec.hdr.next_proto_id = 1; /* ICMP */
     memset(&udp_spec, 0, sizeof(udp_spec));
     memset(&udp_mask, 0, sizeof(udp_mask));
     udp_spec.hdr.dst_port = rte_cpu_to_be_16(w->cfg.udp_port);
@@ -359,6 +364,13 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
     const struct rte_flow_item ipp_pat[] = {
         {.type = RTE_FLOW_ITEM_TYPE_ETH},
         {.type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = &ipp_spec, .mask = &ipp_mask},
+        {.type = RTE_FLOW_ITEM_TYPE_END},
+    };
+    const struct rte_flow_item icmp_pat[] = {
+        {.type = RTE_FLOW_ITEM_TYPE_ETH},
+        {.type = RTE_FLOW_ITEM_TYPE_IPV4,
+         .spec = &icmp_spec,
+         .mask = &icmp_mask},
         {.type = RTE_FLOW_ITEM_TYPE_END},
     };
     const struct rte_flow_item arp_pat[] = {
@@ -392,8 +404,11 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
     } rules[] = {
         {"UDP rule", udp_pat, udp_act},
         {"IP protocol rule", ipp_pat, to_q0},
+        {"ICMP rule", icmp_pat, to_q0},
         {"ARP rule", arp_pat, to_q0},
     };
+    _Static_assert(sizeof(rules) / sizeof(rules[0]) == FLOW_RULES,
+                   "every rule is counted");
 
     for (unsigned i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
         memset(&fe, 0, sizeof(fe));
@@ -417,7 +432,7 @@ static void flow_setup(struct uet_wire_dpdk *w, bool create)
     if (create)
         w->flow_hw = true;
     else
-        w->flow_rules = 3; /* all validated */
+        w->flow_rules = FLOW_RULES; /* all validated */
 }
 
 /* Buffer split after the UDP header, where the port splits by protocol. */
@@ -503,7 +518,7 @@ static int port_start(struct uet_wire_dpdk *w,
     w->flow_why[0] = '\0';
     w->flow_no_rss = false;
     flow_setup(w, false);
-    if (w->flow_rules == 3) {
+    if (w->flow_rules == FLOW_RULES) {
         memset(&fe, 0, sizeof(fe));
         w->flow_isolated = rte_flow_isolate(w->port, 1, &fe) == 0;
     }

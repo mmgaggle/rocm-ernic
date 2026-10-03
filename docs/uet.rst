@@ -142,7 +142,7 @@ The argument of ``--uet`` is a comma-separated list of
      - The UDP destination port.
    * - ``proto=``
      - ``253``
-     - The IP protocol without UDP; not 6 or 17.
+     - The IP protocol without UDP; not 1, 6 or 17.
    * - ``wire=``
      - ``tap``
      - ``tap`` sends on the TAP of ``--tap``. ``dpdk`` sends on
@@ -213,7 +213,11 @@ drops them. The engine transmits straight onto the TAP with
 ``ionic_eth_emu_wire_send()``, without using the guest's
 queues.
 
-The engine answers ARP for its own address. To reach a peer
+The engine answers ARP for its own address, and ICMP echo
+requests to it. It answers a burst of 16 pings, then one every
+10 ms, and drops the rest. Other ICMP to it is dropped. A host
+that finds its peers with ``ping``, as the reference provider's
+raw socket shim does, gets its reply at once. To reach a peer
 it resolves the peer's MAC by ARP, without blocking: the
 first operation to an unresolved peer returns ``-EAGAIN``, an
 ARP request goes out, and a retry succeeds once the reply has
@@ -845,9 +849,9 @@ a window on the host. All four passed with ``sec=none`` (4096
 authenticated each way). Guests wrote to the host at
 217 and 218 MiB/s, the host to the guests at 106 and 110 MiB/s
 (3.7 to 3.9 MiB/s with TSS). The host's first write to a
-guest takes about 10 s longer, because the reference provider
-resolves the next hop with ``ping``, and the engine answers ARP
-but not ICMP.
+guest took about 10 s longer then, because the reference
+provider resolved the next hop with ``ping``, and the engine
+answered ARP but not ICMP. The engine now answers ``ping``.
 
 Packet Size and Encapsulation
 -----------------------------
@@ -1106,9 +1110,9 @@ Offloads
      - On the virtual devices
      - Hardware that runs it
    * - Flow steering. ``rte_flow`` rules send UDP to port 4793,
-       IP protocol 253 and ARP to the engine's queues. If all
-       three rules validate, the port is isolated, and other
-       frames stay with the kernel.
+       IP protocol 253, ICMP to the engine's address and ARP to
+       the engine's queues. If all four rules validate, the port
+       is isolated, and other frames stay with the kernel.
      - The engine's filter sees every frame and gives the
        frames that are not UET to the guest.
      - ``net_tap``: rules as TC filters, isolated. ``af_packet``,
