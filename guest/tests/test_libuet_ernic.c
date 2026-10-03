@@ -62,17 +62,17 @@
 #define IP_A    0xc0a8c865u /* 192.168.200.101 */
 #define IP_B    0xc0a8c866u /* 192.168.200.102 */
 
-#define HALF    (512u * 1024u)
-#define SRC_LEN (2u * HALF)
-#define WIN_LEN (2u * 1024u * 1024u)
-#define RD_LEN  (32u * 1024u)
-#define W1      (4096u + 5u)
-#define W2      (W1 + HALF + 9u)
-#define QTR     (128u * 1024u)
-#define W3      (1280u * 1024u)      /* aborted: stays zero */
-#define W4      (1536u * 1024u + 3u) /* the other endpoint's: lands */
-#define W5      (1792u * 1024u)      /* after the re-key: the old key's */
-#define RK_LEN  (32u * 1024u)        /* and then the new key's, after it */
+#define HALF        (512u * 1024u)
+#define SRC_LEN     (2u * HALF)
+#define WIN_LEN     (2u * 1024u * 1024u)
+#define RD_LEN      (32u * 1024u)
+#define W1          (4096u + 5u)
+#define W2          (W1 + HALF + 9u)
+#define QTR         (128u * 1024u)
+#define W3          (1280u * 1024u)      /* aborted: stays zero */
+#define W4          (1536u * 1024u + 3u) /* the other endpoint's: lands */
+#define W5          (1792u * 1024u)      /* after the re-key: the old key's */
+#define RK_LEN      (32u * 1024u)        /* and then the new key's, after it */
 #define REKEY_TIMED 1000u
 
 struct report {
@@ -296,8 +296,7 @@ static void run_target(struct guest *g)
                 break;
             }
             if (win[W5 + RK_LEN + off] != pattern(off)) {
-                fail(g->rep, "the write with the new key is wrong at %zu",
-                     off);
+                fail(g->rep, "the write with the new key is wrong at %zu", off);
                 break;
             }
         }
@@ -312,8 +311,7 @@ static void run_target(struct guest *g)
         t0 = now_ms();
         for (unsigned i = 0; i < REKEY_TIMED && g->rep->ok; i++) {
             CHECK(g, uet_mr_disable(mr) == 0 && uet_mr_close(mr) == 0);
-            if (!reg(g, dom, ep, win, WIN_LEN,
-                     FI_REMOTE_READ | FI_REMOTE_WRITE,
+            if (!reg(g, dom, ep, win, WIN_LEN, FI_REMOTE_READ | FI_REMOTE_WRITE,
                      UET_MR_KEY_IDEMPOTENT_SAFE, &mr))
                 return;
         }
@@ -451,6 +449,20 @@ static void run_initiator(struct guest *g)
     for (double end = now_ms() + 100.0; now_ms() < end;)
         CHECK(g, uet_cq_read(txcq, &c, 1) == 0);
 
+    /* A late MR_DEREG: the close gives up and keeps the region, which a
+     * second close, after the answer came, releases. */
+    uet_mr_handle_t keep;
+    CHECK(g, uet_mr_reg(dom, g->mem + 5u * 1024u * 1024u, 4096, 0,
+                        UET_MR_KEY_NONE, 0, NULL, &keep) == 0);
+    fake_ibv_hold_reply(UET_ERNIC_OP_MR_DEREG, 2);
+    CHECK(g, uet_mr_close(keep) == -FI_ETIMEDOUT);
+    for (int i = 0; i < 2; i++) {
+        CHECK(g, write_retry(ep, src, 4096, mrs[0], ah, W1, peer.key,
+                             &ctx[3]) == 0);
+        CHECK(g, reap(g, ep, txcq, &c) == 0);
+    }
+    CHECK(g, uet_mr_close(keep) == 0);
+
     /* uet_ep_abort(): a second endpoint, then one write each while the
      * wire loses every frame. The first endpoint is aborted: its write
      * reports nothing and never lands, even once the wire is back; the
@@ -507,8 +519,8 @@ static void run_initiator(struct guest *g)
     CHECK(g, uet_ep_enable(ep3) == 0);
     CHECK(g, uet_ep_setopt(ep3, FI_OPT_ENDPOINT, UET_OPT_FORCE_RUDI, &on,
                            sizeof(on)) == 0);
-    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5, peer.key,
-                         &ctx[2]) == 0);
+    CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5, peer.key, &ctx[2]) ==
+                 0);
     stale = reap(g, ep3, txcq3, &c);
     CHECK(g, stale > 0 && c.op_context == &ctx[2]);
     CHECK(g, write_retry(ep3, src, RK_LEN, mrs[0], ah, W5 + RK_LEN, key,
@@ -519,8 +531,7 @@ static void run_initiator(struct guest *g)
     CHECK(g, recv(g->ctl, &done, 1, 0) == 1);
     if (done != 'y')
         fail(g->rep, "the target's compare after the re-key failed");
-    printf("rekey: a write with the old key failed with %s\n",
-           strerror(stale));
+    printf("rekey: a write with the old key failed with %s\n", strerror(stale));
     CHECK(g, uet_ep_abort(ep3) == 0);
     CHECK(g, uet_ep_close(ep3) == 0);
 

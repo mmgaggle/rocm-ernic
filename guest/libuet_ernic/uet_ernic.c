@@ -38,6 +38,7 @@
 #define SEND_TAG     (UINT64_C(1) << 63)
 #define SYNC_WAIT_MS 10000u /* UET_ERNIC_SYNC_WAIT_MS overrides it */
 #define PENDING      (2u * SLOTS)
+#define ORPHANS      16u /* late MR_REG handles waiting to be given back */
 
 /*
  * A reply names its command by the cookie: the slot in the low 8 bits and
@@ -111,6 +112,11 @@ struct uet_ernic_dev {
     uint32_t job_id;
     uint32_t initiator_id;
     uint32_t caps;
+
+    /* Handles from MR_REG answers that came after the caller gave up:
+     * the next command gives them back first. */
+    uint32_t orphans[ORPHANS];
+    unsigned norphans;
 
     bool broken;   /* the service QP failed; nothing more will complete */
     unsigned late; /* PEND_LATE slots */
@@ -274,10 +280,15 @@ static void dispatch(struct uet_ernic_dev *d, const uint8_t *capsule)
         return;
 
     if (p->kind == PEND_LATE) {
-        /* Nobody waits for it any more; the slot can be used again.  (A
-         * handle it hands out is released with the service QP.) */
+        /* Nobody waits for it any more; the slot can be used again. */
         d->late--;
         p->kind = PEND_FREE;
+        /* The caller of an MR_REG that gave up destroyed its ionic MR,
+         * so a handle it hands out now is dead: give it back, without
+         * waiting for the answer. */
+        if (r.hdr.opcode == UET_ERNIC_OP_MR_REG && r.status == 0 &&
+            d->norphans < ORPHANS)
+            d->orphans[d->norphans++] = le32toh(r.u.mr_reg.handle);
         return;
     }
     if (p->kind == PEND_SYNC) {
@@ -403,6 +414,32 @@ static void hdr_init(const struct uet_ernic_dev *d, struct uet_ernic_hdr *h,
     h->cookie = htole64(cookie);
 }
 
+/* MR_DEREG of the orphaned handles, whose answers nobody waits for.  One
+ * that cannot go yet stays for the next command; with the service QP they
+ * go anyway.  Called with the lock held. */
+static void give_back_orphans(struct uet_ernic_dev *d)
+{
+    struct uet_ernic_release q;
+    struct pending *p;
+    uint64_t cookie;
+
+    while (d->norphans > 0 && !d->broken) {
+        p = pend_alloc(d, UET_ERNIC_OP_MR_DEREG, &cookie);
+        if (p == NULL)
+            return;
+        memset(&q, 0, sizeof(q));
+        hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, cookie);
+        q.handle = htole32(d->orphans[d->norphans - 1u]);
+        p->kind = PEND_LATE;
+        if (send_capsule(d, &q, sizeof(q)) != 0) {
+            p->kind = PEND_FREE;
+            return;
+        }
+        d->late++;
+        d->norphans--;
+    }
+}
+
 /*
  * Send a command and wait for its reply.  @capsule starts with a header
  * whose cookie this fills in.  Returns 0 or a negative fabric errno, the
@@ -416,6 +453,7 @@ static int call(struct uet_ernic_dev *d, void *capsule, size_t len,
     uint64_t cookie, deadline;
     int rc;
 
+    give_back_orphans(d);
     memcpy(&h, capsule, sizeof(h));
     deadline = now_ms() + d->sync_wait_ms;
     /* Transfers in flight hold reply slots too; one frees up as they are
@@ -492,23 +530,38 @@ static bool vma_of(uintptr_t addr, uintptr_t *lo, uintptr_t *hi)
     return found;
 }
 
-static int auto_mr_drop(struct uet_ernic_dev *d, struct auto_mr *a)
+/*
+ * MR_DEREG of a handle: 0 once the device no longer has it, whether it
+ * released it now, had already (EBADF: an earlier MR_DEREG that timed out
+ * got through), or went with a dead service QP.  Otherwise the handle may
+ * still be live, and the caller keeps the ionic MR under it: destroying
+ * that would leave the handle dead on the device, holding an entry until
+ * an MR_DEREG that would never come.
+ */
+static int mr_dereg(struct uet_ernic_dev *d, uint32_t handle)
 {
     struct uet_ernic_release q;
     struct uet_ernic_reply r;
     int rc;
 
-    /* A dead service QP took the device's handles with it. */
-    rc = 0;
-    if (!d->broken) {
-        memset(&q, 0, sizeof(q));
-        hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
-        q.handle = htole32(a->handle);
-        rc = call(d, &q, sizeof(q), &r);
-    }
+    if (d->broken)
+        return 0;
+    memset(&q, 0, sizeof(q));
+    hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
+    q.handle = htole32(handle);
+    rc = call(d, &q, sizeof(q), &r);
+    return rc == -FI_EBADF || d->broken ? 0 : rc;
+}
+
+static int auto_mr_drop(struct uet_ernic_dev *d, struct auto_mr *a)
+{
+    int rc = mr_dereg(d, a->handle);
+
+    if (rc != 0)
+        return rc; /* kept, and dropped again later */
     (void)ibv_dereg_mr(a->ibmr);
     memset(a, 0, sizeof(*a));
-    return rc;
+    return 0;
 }
 
 /*
@@ -544,7 +597,7 @@ static int auto_mr_get(struct uet_ernic_dev *d, const uint8_t *buf, size_t len,
         if (victim == NULL)
             return -FI_EAGAIN; /* every one is in use; try again */
         rc = auto_mr_drop(d, victim);
-        if (rc != 0 && rc != -FI_EBADF)
+        if (rc != 0)
             return rc;
         a = victim;
     }
@@ -1004,8 +1057,6 @@ int uet_mr_close(uet_mr_handle_t mr_handle)
 {
     struct uet_ernic_mr *mr = mr_handle;
     struct uet_ernic_dev *d;
-    struct uet_ernic_release q;
-    struct uet_ernic_reply r;
     int rc;
 
     if (mr == NULL)
@@ -1013,21 +1064,18 @@ int uet_mr_close(uet_mr_handle_t mr_handle)
     d = mr->dom->dev;
 
     pthread_mutex_lock(&d->lock);
-    rc = 0;
-    if (!d->broken) {
-        memset(&q, 0, sizeof(q));
-        hdr_init(d, &q.hdr, UET_ERNIC_OP_MR_DEREG, 0);
-        q.handle = htole32(mr->handle);
-        rc = call(d, &q, sizeof(q), &r);
-    }
-    /* Destroying the ionic region revokes the engine's copy as well, so
-     * even a failed deregistration leaves nothing reachable. */
-    (void)ibv_dereg_mr(mr->ibmr);
+    /* On a failure the region stays, as the reference's does, and the
+     * caller may close it again. */
+    rc = mr_dereg(d, mr->handle);
+    if (rc == 0)
+        (void)ibv_dereg_mr(mr->ibmr);
     pthread_mutex_unlock(&d->lock);
+    if (rc != 0)
+        return rc;
 
     mr->dom->refs--;
     free(mr);
-    return rc == -FI_EBADF ? 0 : rc;
+    return 0;
 }
 
 int uet_av_insert(uet_domain_handle_t domain_handle, struct uet_addr *uet_addr,
