@@ -38,7 +38,7 @@
 
 #define RX_BURST    32u
 #define TX_BURST    64u
-#define RING_DESC   1024u
+#define RING_DESC   4096u
 #define MAX_QUEUES  16u
 #define MAX_TX_SEGS 16u   /* pieces of one frame, see struct uet_engine_wire */
 #define EXT_SHINFO  8192u /* external buffers attached at once, at most */

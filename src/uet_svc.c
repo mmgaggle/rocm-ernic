@@ -46,6 +46,12 @@
  * with 8 KiB payloads and the packet bounds alone (2 MiB segments, a
  * 4 MiB window) retransmitted 190 to 300 packets each; with the byte
  * bounds none, and went faster.
+ *
+ * Those bounds are for a wire that queues about 1000 frames.  An owner
+ * that knows its wire holds more gives the engine a window (struct
+ * uet_engine_cfg, window), and then that is the bound here too, in
+ * SVC_MAX_SEGS segments: a DPDK port with a 4096-descriptor ring takes
+ * 512 packets, 4 MiB at the 8 KiB payload.
  */
 #define SVC_RUDI_SEG_PKTS    256u           /* packets per RUDI segment */
 #define SVC_RUDI_WINDOW_PKTS 512u           /* RUDI packets in the engine */
@@ -744,6 +750,11 @@ struct uet_svc *uet_svc_create(struct uet_engine *engine,
     struct uet_engine_cfg id;
     uet_engine_identity(engine, &id);
     uint64_t payload = id.payload != 0 ? id.payload : 1024u;
+    if (id.window != 0) {
+        s->rudi_window = (uint64_t)id.window * payload;
+        s->rudi_seg = s->rudi_window / SVC_MAX_SEGS;
+        return s;
+    }
     s->rudi_seg = SVC_RUDI_SEG_PKTS * payload;
     s->rudi_window = SVC_RUDI_WINDOW_PKTS * payload;
     if (s->rudi_seg > SVC_RUDI_SEG_MAX)

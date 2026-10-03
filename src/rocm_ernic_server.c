@@ -290,6 +290,11 @@ static int device_reset_cb(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 
 #ifdef ERNIC_HAVE_UET_DPDK
 static struct uet_wire_dpdk *g_uet_dpdk;
+
+/* Packets in flight per transfer on a DPDK port: 4 MiB at the 8 KiB
+ * payload, which its 4096-descriptor rings hold (RING_DESC in
+ * uet_wire_dpdk.c).  window= in --uet overrides it. */
+#define UET_DPDK_WINDOW_PKTS 512u
 #endif
 
 /**
@@ -855,6 +860,9 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         if (uet_dpdk_open(dev, &c, &wire, &dma) < 0)
             return -1;
         have_wire = true;
+        /* The port's rings hold a burst of this; a TAP's queue would not. */
+        if (c.window == 0)
+            c.window = UET_DPDK_WINDOW_PKTS;
 #else
         fprintf(stderr, "Error: uet engine: this build has no DPDK wire "
                         "(configure with -DERNIC_UET_DPDK=ON)\n");

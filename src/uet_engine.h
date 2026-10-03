@@ -98,6 +98,10 @@ struct uet_engine_cfg {
     uint8_t ipproto;   /* IP protocol without UDP */
     uint32_t payload;  /* Payload MTU (1024, 2048, 4096, 8192); 0: the
                         * largest whose packets fit the MTU */
+    uint32_t window;   /* packets in flight per transfer: the PDS window
+                        * offered to a peer, and the RUDI bound; a multiple
+                        * of 128.  0: the provider's 128, which suits a
+                        * wire that queues 1000 frames */
     /* The wire, for the owner (see enum uet_engine_wire_kind).  In --uet,
      * ';' stands for ',' in dpdk-dev= and dpdk-dma=, and separates the
      * arguments of dpdk-eal=. */

@@ -297,6 +297,15 @@ static bool parse_one(struct uet_engine_cfg *cfg, const char *key,
                     val);
             return false;
         }
+    } else if (strcmp(key, "window") == 0) {
+        if (!parse_u32_range(val, 128, 32640, &cfg->window) ||
+            cfg->window % 128u != 0) {
+            set_err(err, errlen,
+                    "window must be a multiple of 128 up to 32640 packets "
+                    "(got '%s')",
+                    val);
+            return false;
+        }
     } else if (strcmp(key, "rto") == 0) {
         if (!parse_u32_range(val, 1, 60000, &cfg->rto_ms)) {
             set_err(err, errlen, "rto must be 1..60000 ms (got '%s')", val);
@@ -628,6 +637,14 @@ static bool engine_set_env(const struct uet_engine_cfg *cfg, char *err,
     } else {
         unsetenv("UET_MAX_PAYLOAD");
     }
+    /* The window is the wire's to size (its queue has to hold a burst of
+     * it), so it is owned as well. */
+    if (cfg->window != 0) {
+        if (!set_env_u32("UET_PDS_MP_RANGE", cfg->window, err, errlen))
+            return false;
+    } else {
+        unsetenv("UET_PDS_MP_RANGE");
+    }
     return true;
 }
 
@@ -760,7 +777,8 @@ void uet_engine_describe(const struct uet_engine *e, char *buf, size_t len)
 
     /* Composed in a buffer that holds it all, then cut to fit. */
     char out[sizeof(cfg) + 64];
-    snprintf(out, sizeof(out), "%s ack every %u bytes%s", cfg,
+    snprintf(out, sizeof(out), "%s window %u ack every %u bytes%s", cfg,
+             (unsigned)(e->cfg.window != 0 ? e->cfg.window : 128u),
              (unsigned)e->wire_info.ack_gen_trigger,
              e->wire_info.tx_zero_copy ? " zero-copy tx" : "");
     size_t n = strlen(out);
