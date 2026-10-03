@@ -1464,11 +1464,14 @@ void uet_engine_get_stats(const struct uet_engine *e,
                           struct uet_engine_stats *out)
 {
     struct uet_nic_ernic_stats ns;
+    struct uet_target_stats ts;
 
     if (e == NULL || out == NULL)
         return;
 
     *out = e->stats;
+    if (uet_get_target_stats(e->uet, &ts) == 0)
+        out->writes_to_dead_key = ts.dead_key_pkts;
     uet_nic_ernic_get_stats(e->nic, &ns);
     out->rx_frames = ns.rx_frames;
     out->rx_frames_ext = ns.rx_frames_ext;

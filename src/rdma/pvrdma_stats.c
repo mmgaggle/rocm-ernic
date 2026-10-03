@@ -41,6 +41,17 @@ PVRDMAQPStats *pvrdma_get_qp_stats(PVRDMADev *dev, uint32_t qp_handle)
     return stats;
 }
 
+/* More sections, from outside the device: the UET engine's. */
+static void (*stats_extra_fn)(FILE *fp, void *ctx);
+static void *stats_extra_ctx;
+
+void pvrdma_set_stats_extra(void (*fn)(FILE *fp, void *ctx), void *ctx);
+void pvrdma_set_stats_extra(void (*fn)(FILE *fp, void *ctx), void *ctx)
+{
+    stats_extra_fn = fn;
+    stats_extra_ctx = ctx;
+}
+
 /* Write stats to file */
 void pvrdma_write_stats_impl(PVRDMADev *dev)
 {
@@ -188,6 +199,9 @@ void pvrdma_write_stats_impl(PVRDMADev *dev)
     } else {
         fprintf(fp, "  (no QPs created yet)\n\n");
     }
+
+    if (stats_extra_fn != NULL)
+        stats_extra_fn(fp, stats_extra_ctx);
 
     fclose(fp);
     dev->stats.stats_write_count++;

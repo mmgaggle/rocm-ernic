@@ -104,6 +104,7 @@ enum case_kind {
     CASE_ABORT,          /* two writes on a dead wire, the first taken back */
     CASE_LOOPBACK,       /* one engine writes to itself, off the wire */
     CASE_LOOPBACK_ABORT, /* the same, taken back at once */
+    CASE_DEAD_KEY, /* a write, then its duplicates after the key changed */
 };
 
 struct test_case {
@@ -217,6 +218,14 @@ static const struct test_case cases[] = {
     {"loopback-abort-rud", "RUD write to the engine itself, taken back", false,
      UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
      UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_LOOPBACK_ABORT},
+    /* The target records the write's frames, closes its region, registers
+     * until the provider's index comes round again, clears the memory and
+     * registers it anew, then gets the recorded frames again, as the late
+     * duplicates RUDI can produce: none may land. */
+    {"dead-key-rudi",
+     "duplicates of a RUDI write after the target re-registered its memory",
+     true, UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_DEAD_KEY},
 };
 
 /* ------------------------------------------------------------------ */
@@ -341,6 +350,11 @@ struct node {
     uint64_t tx_iov_frames; /* frames sent in pieces, payload in place */
     uint64_t wire_lost;     /* frames this test dropped on purpose */
     bool link_down;         /* lose every IP frame (ARP still passes) */
+    /* CASE_DEAD_KEY: the UET frames received, for a later replay */
+    bool recording;
+    uint8_t **rec;
+    size_t *rec_len;
+    size_t nrec;
     uint64_t rx_unclaimed;
     uint64_t rng;
     uint8_t probe[PROBE_LEN];
@@ -552,6 +566,14 @@ static void pump(struct node *n)
             ssize_t r = recv(n->wire_fd, buf, sizeof(buf), MSG_DONTWAIT);
             if (r <= 0)
                 break;
+            if (n->recording && r > 14 && rd16(buf + 12) == 0x0800 &&
+                n->nrec < 4096) {
+                n->rec[n->nrec] = malloc((size_t)r);
+                if (n->rec[n->nrec] != NULL) {
+                    memcpy(n->rec[n->nrec], buf, (size_t)r);
+                    n->rec_len[n->nrec++] = (size_t)r;
+                }
+            }
             if (!uet_engine_rx_frame(n->e, buf, (size_t)r))
                 n->rx_unclaimed++;
         }
@@ -598,6 +620,11 @@ struct report {
     bool second_reposted;  /* it failed with the closed PDC and went again */
     uint64_t req_at_abort; /* requests on the wire when it was taken back */
     uint64_t req_quiet;    /* requests once everything had completed */
+    /* CASE_DEAD_KEY */
+    uint64_t replayed; /* frames given to the target again */
+    uint64_t old_key, new_key;
+    uint64_t dead_key_hits; /* writes_to_dead_key afterwards */
+    uint64_t landed;        /* bytes of the new registration not zero */
 };
 
 static void fail(struct report *rep, const char *fmt, ...)
@@ -649,6 +676,9 @@ static bool node_start(struct node *n, uint32_t ip, size_t len,
     cfg.encap = n->tc->encap;
     cfg.mtu = n->tc->mtu;
     cfg.pds = n->tc->pds;
+    /* CASE_DEAD_KEY closes regions at once, to reuse their index */
+    if (n->tc->kind == CASE_DEAD_KEY)
+        cfg.mr_quarantine_ms = 0;
 
     struct uet_engine_wire wire = {
         .tx = wire_tx, .tx_iov = wire_tx_iov, .ctx = n};
@@ -684,6 +714,78 @@ static void node_finish(struct node *n, struct report *rep)
     free(n->g.mem);
 }
 
+/*
+ * CASE_DEAD_KEY, on the target once the write has landed and compared:
+ * close the region, register and close again until the provider's next
+ * index is the region's old one, clear the memory, register it anew, and
+ * hand the engine the write's frames again, as late duplicates.  The new
+ * registration must not take any of them.
+ */
+static void replay_after_reregistration(struct node *n, struct report *rep,
+                                        uint32_t *mr,
+                                        const struct uet_engine_mr_desc *d,
+                                        uint64_t old_key)
+{
+    struct uet_engine_stats st;
+    uint64_t key = 0, before;
+    uint32_t h;
+    int rc;
+
+    n->recording = false;
+    rep->old_key = old_key;
+    (void)uet_engine_mr_dereg(n->e, *mr);
+    pump(n);
+    /* the provider hands indices out in turn, 256 of them */
+    for (unsigned i = 0; i < 255; i++) {
+        rc = uet_engine_mr_reg(n->e, d, &h, &key);
+        if (rc != 0) {
+            fail(rep, "mr_reg %u: %s", i, strerror(-rc));
+            return;
+        }
+        (void)uet_engine_mr_dereg(n->e, h);
+        pump(n);
+    }
+    for (size_t off = 0; off < n->r.len; off++)
+        *region_byte(&n->g, &n->r, off) = 0;
+    rc = uet_engine_mr_reg(n->e, d, mr, &key);
+    if (rc != 0) {
+        fail(rep, "mr_reg anew: %s", strerror(-rc));
+        return;
+    }
+    rep->new_key = key;
+    if ((key & 0xffffffu) != (old_key & 0xffffffu))
+        fail(rep,
+             "the new region has index %#" PRIx64 ", not the old %#" PRIx64,
+             key & 0xffffffu, old_key & 0xffffffu);
+
+    uet_engine_get_stats(n->e, &st);
+    before = st.writes_to_dead_key;
+    for (size_t i = 0; i < n->nrec; i++) {
+        (void)uet_engine_rx_frame(n->e, n->rec[i], n->rec_len[i]);
+        rep->replayed++;
+        if (i % 64 == 63)
+            uet_engine_poll(n->e);
+    }
+    for (double end = now_ms() + 200.0; now_ms() < end;)
+        pump(n);
+    uet_engine_get_stats(n->e, &st);
+    rep->dead_key_hits = st.writes_to_dead_key - before;
+
+    for (size_t off = 0; off < n->r.len; off++)
+        rep->landed += *region_byte(&n->g, &n->r, off) != 0 ? 1u : 0u;
+    if (rep->landed != 0)
+        fail(rep,
+             "%" PRIu64 " bytes of the duplicates landed in the new "
+             "registration",
+             rep->landed);
+    if (rep->dead_key_hits == 0)
+        fail(rep, "the duplicates were not counted as writes to a dead key");
+    for (size_t i = 0; i < n->nrec; i++)
+        free(n->rec[i]);
+    free(n->rec);
+    free(n->rec_len);
+}
+
 static void run_target(struct node *n, struct report *rep)
 {
     struct uet_engine_mr_desc d;
@@ -714,6 +816,11 @@ static void run_target(struct node *n, struct report *rep)
     m.type = CTL_KEY;
     m.rkey = rkey;
     m.a = n->r.len;
+    if (n->tc->kind == CASE_DEAD_KEY) {
+        n->rec = calloc(4096, sizeof(*n->rec));
+        n->rec_len = calloc(4096, sizeof(*n->rec_len));
+        n->recording = n->rec != NULL && n->rec_len != NULL;
+    }
     if (!ctl_send(n->ctl_fd, &m)) {
         fail(rep, "cannot send the key");
         return;
@@ -752,6 +859,9 @@ static void run_target(struct node *n, struct report *rep)
                 fail(rep, "byte %zu outside the write was changed", off);
         }
     }
+
+    if (n->tc->kind == CASE_DEAD_KEY && rep->ok)
+        replay_after_reregistration(n, rep, &mr, &d, rkey);
 
     memset(&m, 0, sizeof(m));
     m.type = CTL_VERIFIED;
@@ -1508,9 +1618,15 @@ static bool run_case(const struct test_case *tc)
              !WIFEXITED(st_tgt) || WEXITSTATUS(st_tgt) != 0)
         fail(&verdict, "a process exited badly (initiator %#x, target %#x)",
              (unsigned)st_ini, (unsigned)st_tgt);
-    else if (tc->kind == CASE_WRITE)
+    else if (tc->kind == CASE_WRITE || tc->kind == CASE_DEAD_KEY)
         check_wire(tc, &ini, &tgt, &verdict);
 
+    if (have_ini && have_tgt && tc->kind == CASE_DEAD_KEY)
+        printf("  key %#" PRIx64 " closed; anew at the same index as %#" PRIx64
+               "; %" PRIu64 " frames given again: %" PRIu64
+               " counted as writes to a dead key, %" PRIu64 " bytes landed\n",
+               tgt.old_key, tgt.new_key, tgt.replayed, tgt.dead_key_hits,
+               tgt.landed);
     if (have_ini && have_tgt && tc->kind == CASE_ABORT) {
         printf("  taken back after %" PRIu64 " requests on a dead wire; the "
                "other write completed %s%s; %" PRIu64

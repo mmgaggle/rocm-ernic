@@ -355,6 +355,9 @@ struct uet_engine_stats {
     uint64_t dma_write_maps;
     uint64_t dma_faults;
     uint64_t revoked_hits; /* page-list reads refused after deregistration */
+    uint64_t writes_to_dead_key; /* request packets naming a key no region
+                                  * has (any more): nothing placed, each
+                                  * answered "bad key" */
     /* tables, now */
     uint32_t mrs;   /* region handles held, quarantined ones included */
     uint32_t peers; /* peer handles held, ones being removed included */

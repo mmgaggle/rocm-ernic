@@ -901,6 +901,37 @@ static void uet_dpdk_close(rocm_ernic_dev_t *dev)
 }
 #endif /* ERNIC_HAVE_UET_DPDK */
 
+/* The UET engine's section of the stats file (--stats-file). */
+static void uet_stats_section(FILE *fp, void *ctx)
+{
+    rocm_ernic_dev_t *dev = ctx;
+    struct uet_engine_stats st;
+
+    if (!dev->uet_engine)
+        return;
+    uet_engine_get_stats(dev->uet_engine, &st);
+    fprintf(fp, "UET Engine:\n");
+#define UET_STAT(name, v) \
+    fprintf(fp, "  %-23s : %" PRIu64 "\n", name, (uint64_t)(v))
+    UET_STAT("rx_frames", st.rx_frames);
+    UET_STAT("rx_dropped", st.rx_dropped);
+    UET_STAT("tx_frames", st.tx_frames);
+    UET_STAT("tx_dropped", st.tx_dropped);
+    UET_STAT("tx_loopback", st.tx_loopback);
+    UET_STAT("loop_flushed", st.loop_flushed);
+    UET_STAT("icmp_echo_replies", st.icmp_echo_replies);
+    UET_STAT("ops_posted", st.ops_posted);
+    UET_STAT("ops_completed", st.ops_completed);
+    UET_STAT("ops_failed", st.ops_failed);
+    UET_STAT("ops_aborted", st.ops_aborted);
+    UET_STAT("ops_in_flight", st.ops_in_flight);
+    UET_STAT("writes_to_dead_key", st.writes_to_dead_key);
+    UET_STAT("revoked_hits", st.revoked_hits);
+    UET_STAT("dma_faults", st.dma_faults);
+#undef UET_STAT
+    fprintf(fp, "\n");
+}
+
 static int uet_engine_start(rocm_ernic_dev_t *dev,
                             const struct uet_engine_cfg *opts, bool have_wire)
 {
@@ -990,6 +1021,8 @@ static int uet_engine_start(rocm_ernic_dev_t *dev,
         return -1;
     }
 
+    pvrdma_set_stats_extra(uet_stats_section, dev);
+
     uet_engine_describe(dev->uet_engine, desc, sizeof(desc));
     ernic_startup_report("rocm-ernic: UET engine %s%s", desc,
                          have_wire ? ""
@@ -1003,6 +1036,7 @@ static void uet_engine_stop(rocm_ernic_dev_t *dev)
 
     if (!dev->uet_engine)
         return;
+    pvrdma_set_stats_extra(NULL, NULL);
 
     uet_engine_get_stats(dev->uet_engine, &st);
     ernic_startup_report(

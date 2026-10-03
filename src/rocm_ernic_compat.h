@@ -182,6 +182,13 @@ void pvrdma_qp_stats_forget(pvrdma_handle_t handle, uint32_t qp_id);
 void pvrdma_set_stats_file(pvrdma_handle_t handle, const char *stats_file);
 
 /**
+ * pvrdma_set_stats_extra - Append more sections to every stats file
+ * @fn: called with the open file at the end of each write, or NULL
+ * @ctx: passed to @fn
+ */
+void pvrdma_set_stats_extra(void (*fn)(FILE *fp, void *ctx), void *ctx);
+
+/**
  * pvrdma_set_stats_instance_info - Set instance info for stats file display
  * @handle: Device handle
  * @socket_path: Socket path for this instance (may be NULL)
