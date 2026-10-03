@@ -376,6 +376,7 @@ struct ionic_datapath {
     bool mesh_reported;
     uint32_t next_req_id;
     struct dp_pending pending[MAX_PENDING];
+    uint32_t pending_live; /* entries with valid set */
 
     pthread_mutex_t rx_lock;
     struct dp_inmsg *rx_head;
@@ -1594,6 +1595,7 @@ static struct dp_pending *pending_alloc(struct ionic_datapath *dp)
         if (!dp->pending[i].valid) {
             memset(&dp->pending[i], 0, sizeof(dp->pending[i]));
             dp->pending[i].valid = true;
+            dp->pending_live++;
             dp->pending[i].req_id = ++dp->next_req_id;
             dp->pending[i].deadline_ms = dp_now_ms() + PENDING_MS;
             return &dp->pending[i];
@@ -1624,6 +1626,7 @@ static void pending_complete(struct ionic_datapath *dp, struct dp_pending *p,
             cq_post_send_npg(dp, q->sq_cq_id, p->qp_id, p->wqe_id);
     }
     p->valid = false;
+    dp->pending_live--;
 }
 
 static int dp_mesh_tx(struct ionic_datapath *dp, uint32_t dst_node,
@@ -2750,8 +2753,10 @@ void ionic_datapath_poll(struct ionic_datapath *dp)
         pthread_mutex_unlock(&dp->rx_lock);
     }
 
-    /* A peer that never answers must not wedge the guest's send queue. */
-    for (int i = 0; i < MAX_PENDING; i++) {
+    /* A peer that never answers must not wedge the guest's send queue.
+     * The table is 1024 entries of over 500 bytes, so it is only walked
+     * while something is in it. */
+    for (int i = 0; dp->pending_live != 0 && i < MAX_PENDING; i++) {
         struct dp_pending *p = &dp->pending[i];
         if (p->valid && now > p->deadline_ms) {
             vfu_log(dp->vfu_ctx, LOG_WARNING,

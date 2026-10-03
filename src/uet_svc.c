@@ -112,6 +112,7 @@ struct uet_svc {
     struct svc_mr mrs[SVC_MAX_MRS];
     struct svc_peer peers[SVC_MAX_PEERS];
     struct svc_op ops_tab[SVC_MAX_OPS];
+    uint32_t nops_live; /* ops_tab entries with used set */
     uint64_t next_seq;
     uint64_t rudi_out;    /* RUDI bytes in the engine */
     uint64_t rudi_seg;    /* bytes per RUDI segment */
@@ -261,6 +262,7 @@ static void op_finish(struct uet_svc *s, struct svc_op *op, int status)
             s->stats.ops_failed++;
     }
     memset(op, 0, sizeof(*op));
+    s->nops_live--;
 }
 
 /*
@@ -395,6 +397,7 @@ static void cmd_rma(struct uet_svc *s, uint32_t qp_id, const void *capsule,
     uint64_t now = now_ms();
     memset(op, 0, sizeof(*op));
     op->used = true;
+    s->nops_live++;
     op->opcode = opcode;
     op->qp_id = qp_id;
     op->mr = (uint32_t)(m - s->mrs);
@@ -785,7 +788,9 @@ void uet_svc_poll(struct uet_svc *s)
             op_seg_done(s, comp[i].cookie, -comp[i].status, now);
     }
 
-    for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
+    /* The table is walked only while an op is in it: this runs on every
+     * turn of the server's loop. */
+    for (uint32_t i = 0; s->nops_live != 0 && i < SVC_MAX_OPS; i++) {
         struct svc_op *op = &s->ops_tab[i];
 
         if (op->used && !op->stop && op->sent < op->rma.len)
@@ -798,7 +803,7 @@ void uet_svc_poll(struct uet_svc *s)
 
 bool uet_svc_has_work(const struct uet_svc *s)
 {
-    if (s == NULL)
+    if (s == NULL || s->nops_live == 0)
         return false;
     for (uint32_t i = 0; i < SVC_MAX_OPS; i++) {
         const struct svc_op *op = &s->ops_tab[i];
@@ -840,6 +845,7 @@ void uet_svc_qp_gone(struct uet_svc *s, uint32_t qp_id)
             op->stop = true;
         } else {
             memset(op, 0, sizeof(*op));
+            s->nops_live--;
         }
     }
     for (uint32_t i = 0; i < SVC_MAX_MRS; i++) {
