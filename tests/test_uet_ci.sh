@@ -25,13 +25,13 @@ NC='\033[0m'
 
 # Each entry is "<--uet argument>|<substring the startup log must contain>".
 declare -a CONFIGS=(
-    "ip=192.168.200.101|UET engine ip 192.168.200.101 mac 02:55:c0:a8:c8:65 job 1 pid 0 index 15 pds pds sec none mtu 1500 payload 1024 encap udp port 4793 ack every 16384 bytes"
+    "ip=192.168.200.101|UET engine ip 192.168.200.101 mac 02:55:c0:a8:c8:65 job 1 pid 0 index 15 pds pds sec none mtu 1500 payload 1024 encap udp port 4793 window 128 ack every 16384 bytes"
     "ip=10.0.0.7,job=42,pid=3,index=9|ip 10.0.0.7 mac 02:55:0a:00:00:07 job 42 pid 3 index 9"
     "ip=192.168.200.102,mac=02:00:00:00:00:44|mac 02:00:00:00:00:44"
     "ip=192.168.200.103,sec=cluster|sec cluster"
     "ip=192.168.200.104,sec=direct,ssi=7|sec direct"
     "ip=192.168.200.105,pds=sng|pds sng"
-    "ip=192.168.200.106,mtu=9000,rto=25,retries=8|mtu 9000 payload 8192 encap udp port 4793 ack every 32768 bytes"
+    "ip=192.168.200.106,mtu=9000,rto=25,retries=8|mtu 9000 payload 8192 encap udp port 4793 window 128 ack every 32768 bytes"
     "ip=192.168.200.107,encap=ip|payload 1024 encap ip proto 253"
     "ip=192.168.200.108,mtu=4500,port=5000|mtu 4500 payload 4096 encap udp port 5000"
     "ip=192.168.200.109,mtu=9000,payload=2048,encap=ip,proto=254|mtu 9000 payload 2048 encap ip proto 254"
@@ -62,6 +62,7 @@ declare -a BAD_CONFIGS=(
     "ip=192.168.200.1,port=0"
     "ip=192.168.200.1,port=65536"
     "ip=192.168.200.1,proto=17"
+    "ip=192.168.200.1,proto=1"
     "ip=192.168.200.1,payload=3000"
     "ip=192.168.200.1,mtu=1500,payload=8192"
     "ip=192.168.200.1,nonsense=1"
