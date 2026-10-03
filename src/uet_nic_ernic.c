@@ -111,6 +111,7 @@ struct uet_nic_ernic {
     } *loop;
     unsigned loop_head;
     unsigned loop_count;
+    bool loop_turn; /* the loopback queue is served next */
 
     struct neigh neigh[NEIGH_MAX];
 
@@ -579,10 +580,9 @@ static int shim_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
 
     if (n == NULL)
         return 0;
-    if (n->rx_count == 0) {
-        /* Then what the engine sent itself. */
-        if (n->loop_count == 0)
-            return 0;
+    /* The wire's queue and the engine's own take turns, so a busy wire
+     * cannot hold back a looped frame, nor the other way round. */
+    if (n->loop_count > 0 && (n->rx_count == 0 || n->loop_turn)) {
         struct loop_frame *f = &n->loop[n->loop_head];
         int got = 0;
 
@@ -598,8 +598,12 @@ static int shim_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
         }
         free(f->data);
         f->data = NULL;
+        n->loop_turn = false;
         return got;
     }
+    if (n->rx_count == 0)
+        return 0;
+    n->loop_turn = n->loop_count > 0;
 
     struct rx_slot *s = &n->slots[n->rx_head];
     n->rx_head = (n->rx_head + 1) % RX_SLOTS;
@@ -863,6 +867,21 @@ bool uet_nic_ernic_rx_frame_ext(struct uet_nic_ernic *n, const void *frame,
                                 void (*release)(void *cookie), void *cookie)
 {
     return rx_frame(n, frame, len, true, csum_ok, release, cookie);
+}
+
+void uet_nic_ernic_loop_flush(struct uet_nic_ernic *n)
+{
+    if (n == NULL || n->loop == NULL)
+        return;
+    for (unsigned i = 0; i < n->loop_count; i++) {
+        struct loop_frame *f = &n->loop[(n->loop_head + i) % LOOP_SLOTS];
+
+        free(f->data);
+        f->data = NULL;
+    }
+    n->stats.loop_flushed += n->loop_count;
+    n->loop_head = 0;
+    n->loop_count = 0;
 }
 
 bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n)

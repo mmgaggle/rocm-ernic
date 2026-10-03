@@ -100,9 +100,10 @@ static uint32_t rto_override_ms;
 /* What a case does.  A plain write is checked on the wire too; the others
  * check what they are about. */
 enum case_kind {
-    CASE_WRITE = 0, /* the initiator writes, the target compares */
-    CASE_ABORT,     /* two writes on a dead wire, the first taken back */
-    CASE_LOOPBACK,  /* one engine writes to itself, off the wire */
+    CASE_WRITE = 0,      /* the initiator writes, the target compares */
+    CASE_ABORT,          /* two writes on a dead wire, the first taken back */
+    CASE_LOOPBACK,       /* one engine writes to itself, off the wire */
+    CASE_LOOPBACK_ABORT, /* the same, taken back at once */
 };
 
 struct test_case {
@@ -209,6 +210,13 @@ static const struct test_case cases[] = {
     {"loopback-rudi-jumbo", "the same at mtu=9000", true, UET_ENGINE_SEC_NONE,
      0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_UDP, 9000,
      UET_ENGINE_PDS_FULL, CASE_LOOPBACK},
+    /* Taken back before the engine reads what it sent itself. */
+    {"loopback-abort-rudi", "RUDI write to the engine itself, taken back", true,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_LOOPBACK_ABORT},
+    {"loopback-abort-rud", "RUD write to the engine itself, taken back", false,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_LOOPBACK_ABORT},
 };
 
 /* ------------------------------------------------------------------ */
@@ -1139,17 +1147,34 @@ static void run_loopback(struct node *n, struct report *rep)
         fail(rep, "post_write: %s", strerror(-rc));
         return;
     }
-    if (!wait_comp(n, rep, w.cookie, 30000.0, &status))
-        return;
-    rep->xfer_ms = now_ms() - t0;
-    if (status != 0) {
-        fail(rep, "the write failed: %s", strerror(-status));
-        return;
+    bool aborted = n->tc->kind == CASE_LOOPBACK_ABORT;
+    if (aborted) {
+        /* The first window is queued, unread, on the loopback. */
+        struct uet_engine_comp c;
+
+        rc = uet_engine_abort(n->e, w.cookie);
+        if (rc != 0) {
+            fail(rep, "abort: %s", strerror(-rc));
+            return;
+        }
+        for (double end = now_ms() + 300.0; now_ms() < end;) {
+            pump(n);
+            if (uet_engine_poll_comp(n->e, &c, 1) == 1)
+                fail(rep, "the write taken back completed");
+        }
+    } else {
+        if (!wait_comp(n, rep, w.cookie, 30000.0, &status))
+            return;
+        rep->xfer_ms = now_ms() - t0;
+        if (status != 0) {
+            fail(rep, "the write failed: %s", strerror(-status));
+            return;
+        }
     }
 
     for (size_t off = xfer_len; off < n->r.len; off++) {
         uint8_t got = *region_byte(&n->g, &n->r, off);
-        bool inside = off >= dst && off < dst + xfer_len;
+        bool inside = !aborted && off >= dst && off < dst + xfer_len;
         uint8_t want = inside ? pattern(off - dst) : 0;
 
         if (got == want) {
@@ -1168,6 +1193,9 @@ static void run_loopback(struct node *n, struct report *rep)
         fail(rep, "%" PRIu64 " UET frames went on the wire", n->tx.uet);
     if (st.tx_loopback == 0)
         fail(rep, "nothing went through the loopback");
+    if (aborted && (st.loop_flushed == 0 || st.ops_in_flight != 0))
+        fail(rep, "%" PRIu64 " looped frames dropped, %u in flight",
+             st.loop_flushed, st.ops_in_flight);
     (void)uet_engine_peer_remove(n->e, peer);
     (void)uet_engine_mr_dereg(n->e, mr);
 }
@@ -1217,7 +1245,7 @@ static pid_t spawn(const struct test_case *tc, const char *role, int wire_fd,
 
     if (strcmp(role, "target") == 0)
         run_target(&n, &rep);
-    else if (tc->kind == CASE_LOOPBACK)
+    else if (tc->kind == CASE_LOOPBACK || tc->kind == CASE_LOOPBACK_ABORT)
         run_loopback(&n, &rep);
     else if (tc->kind == CASE_ABORT)
         run_initiator_abort(&n, &rep);
@@ -1397,15 +1425,16 @@ static bool run_loopback_case(const struct test_case *tc)
 
     if (have) {
         printf("  %zu bytes in %.1f ms (%.1f MiB/s); %" PRIu64
-               " frames through the loopback, %" PRIu64
-               " UET frames on the wire; compared %" PRIu64 " bytes, %" PRIu64
-               " wrong, %" PRIu64 " untouched bytes changed\n",
+               " frames through the loopback (%" PRIu64 " dropped by the "
+               "abort), %" PRIu64 " UET frames on the wire; compared %" PRIu64
+               " bytes, %" PRIu64 " wrong, %" PRIu64
+               " untouched bytes changed\n",
                xfer_len, rep.xfer_ms,
                rep.xfer_ms > 0 ? ((double)xfer_len / (1024.0 * 1024.0)) /
                                      (rep.xfer_ms / 1000.0)
                                : 0.0,
-               rep.st.tx_loopback, rep.tx.uet, rep.compared, rep.mismatches,
-               rep.guard_bad);
+               rep.st.tx_loopback, rep.st.loop_flushed, rep.tx.uet,
+               rep.compared, rep.mismatches, rep.guard_bad);
     }
     if (verdict.ok) {
         printf("  PASS\n\n");
@@ -1864,8 +1893,10 @@ int main(int argc, char **argv)
                 continue;
         }
         run++;
-        passed += (cases[i].kind == CASE_LOOPBACK ? run_loopback_case(&cases[i])
-                                                  : run_case(&cases[i]))
+        passed += (cases[i].kind == CASE_LOOPBACK ||
+                           cases[i].kind == CASE_LOOPBACK_ABORT
+                       ? run_loopback_case(&cases[i])
+                       : run_case(&cases[i]))
                       ? 1u
                       : 0u;
     }

@@ -1429,6 +1429,14 @@ int uet_engine_abort(struct uet_engine *e, uint64_t cookie)
     if (op == NULL)
         return -ENOENT;
 
+    /*
+     * Its packets the engine sent itself may still be queued, unread: they
+     * go first, or they would land after the abort.  Other transfers'
+     * go with them, as frames lost on a wire, and are sent again.  First,
+     * so what the abort itself sends (a CLOSE of the PDC) is kept.
+     */
+    uet_nic_ernic_loop_flush(e->nic);
+
     /* The provider finds the operation by the context it was posted with,
      * which is the slot. */
     rc = uet_ep_abort_op(e->ep, op);
@@ -1468,6 +1476,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->tx_frames = ns.tx_frames;
     out->tx_frames_iov = ns.tx_frames_iov;
     out->tx_loopback = ns.tx_loopback;
+    out->loop_flushed = ns.loop_flushed;
     out->tx_dropped = ns.tx_dropped;
     out->arp_requests = ns.arp_requests;
     out->arp_replies = ns.arp_replies;

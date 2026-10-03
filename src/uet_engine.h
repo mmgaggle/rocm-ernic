@@ -339,6 +339,7 @@ struct uet_engine_stats {
     uint64_t tx_frames;
     uint64_t tx_frames_iov; /* of which with the payload left in place */
     uint64_t tx_loopback;   /* of which to the engine itself, off the wire */
+    uint64_t loop_flushed;  /* of those, dropped unread by an abort */
     uint64_t tx_dropped;
     uint64_t arp_requests;
     uint64_t arp_replies;

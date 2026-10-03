@@ -81,6 +81,7 @@ struct uet_nic_ernic_stats {
     uint64_t icmp_dropped;      /* other or malformed ICMP to the engine */
     uint64_t tx_loopback;       /* of tx_frames, to the engine itself: never on
                                  * the wire */
+    uint64_t loop_flushed;      /* looped frames dropped by an abort */
 };
 
 /*
@@ -126,6 +127,13 @@ bool uet_nic_ernic_rx_frame_ext(struct uet_nic_ernic *n, const void *frame,
 
 /* True while received frames are waiting for the provider to poll them. */
 bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n);
+
+/*
+ * Drop every frame the engine has sent itself and not read yet.  To the
+ * transports that is loss on the wire, which they recover from; it is how
+ * a transfer taken back stops landing through the loopback.
+ */
+void uet_nic_ernic_loop_flush(struct uet_nic_ernic *n);
 
 /*
  * Resend ARP for next hops that have not answered yet, and give up on ones
