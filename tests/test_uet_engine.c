@@ -102,6 +102,7 @@ static uint32_t rto_override_ms;
 enum case_kind {
     CASE_WRITE = 0, /* the initiator writes, the target compares */
     CASE_ABORT,     /* two writes on a dead wire, the first taken back */
+    CASE_LOOPBACK,  /* one engine writes to itself, off the wire */
 };
 
 struct test_case {
@@ -196,6 +197,18 @@ static const struct test_case cases[] = {
      "carries the rest",
      false, UET_ENGINE_SEC_NONE, 0, 0, 50, 100, false, false, false,
      UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_ABORT},
+    /* One engine, one region: a write from its first half to its second,
+     * through the engine's own address, as between two daemons in one
+     * guest. */
+    {"loopback-rudi", "RUDI write from the engine to itself", true,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, true, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_LOOPBACK},
+    {"loopback-rud", "RUD write from the engine to itself", false,
+     UET_ENGINE_SEC_NONE, 0, 0, 20, 10, false, false, false,
+     UET_ENGINE_ENCAP_UDP, 0, UET_ENGINE_PDS_FULL, CASE_LOOPBACK},
+    {"loopback-rudi-jumbo", "the same at mtu=9000", true, UET_ENGINE_SEC_NONE,
+     0, 0, 20, 10, true, false, false, UET_ENGINE_ENCAP_UDP, 9000,
+     UET_ENGINE_PDS_FULL, CASE_LOOPBACK},
 };
 
 /* ------------------------------------------------------------------ */
@@ -1072,6 +1085,93 @@ static void run_initiator_abort(struct node *n, struct report *rep)
     (void)uet_engine_mr_dereg(n->e, mr);
 }
 
+/*
+ * One engine writes from the first part of its region to a later part,
+ * peer the engine's own address.  Nothing may cross the wire, and the
+ * target part must hold the data, its edges untouched.
+ */
+static void run_loopback(struct node *n, struct report *rep)
+{
+    struct uet_engine_mr_desc d;
+    struct uet_engine_rma w;
+    struct uet_engine_stats st;
+    uint32_t mr, peer;
+    uint64_t rkey;
+    int rc, status;
+    size_t dst = xfer_len + DST_OFF; /* where the copy goes */
+    double t0;
+
+    if (!node_start(n, IP_INITIATOR, dst + xfer_len + PAGE, DST_PGOFF, rep))
+        return;
+    for (size_t off = 0; off < xfer_len; off++)
+        *region_byte(&n->g, &n->r, off) = pattern(off);
+
+    memset(&d, 0, sizeof(d));
+    d.root = n->r.root;
+    d.page_size = PAGE;
+    d.level = 1;
+    d.page_offset = n->r.page_offset;
+    d.len = n->r.len;
+    d.remote_write = true;
+    d.idempotent_safe = true;
+    rc = uet_engine_mr_reg(n->e, &d, &mr, &rkey);
+    if (rc != 0) {
+        fail(rep, "mr_reg: %s", strerror(-rc));
+        return;
+    }
+    rc = uet_engine_peer_add(n->e, IP_INITIATOR, PEER_PID, PEER_INDEX, &peer);
+    if (rc != 0) {
+        fail(rep, "peer_add of the engine itself: %s", strerror(-rc));
+        return;
+    }
+
+    memset(&w, 0, sizeof(w));
+    w.peer = peer;
+    w.mr = mr;
+    w.len = xfer_len;
+    w.remote_addr = dst;
+    w.rkey = rkey;
+    w.rudi = n->tc->rudi;
+    w.cookie = 0x100;
+    t0 = now_ms();
+    rc = post_retry(n, &w);
+    if (rc != 0) {
+        fail(rep, "post_write: %s", strerror(-rc));
+        return;
+    }
+    if (!wait_comp(n, rep, w.cookie, 30000.0, &status))
+        return;
+    rep->xfer_ms = now_ms() - t0;
+    if (status != 0) {
+        fail(rep, "the write failed: %s", strerror(-status));
+        return;
+    }
+
+    for (size_t off = xfer_len; off < n->r.len; off++) {
+        uint8_t got = *region_byte(&n->g, &n->r, off);
+        bool inside = off >= dst && off < dst + xfer_len;
+        uint8_t want = inside ? pattern(off - dst) : 0;
+
+        if (got == want) {
+            rep->compared += inside ? 1u : 0u;
+        } else if (inside) {
+            if (rep->mismatches++ == 0)
+                fail(rep, "byte %zu of the copy is %#x, not %#x", off - dst,
+                     got, want);
+        } else if (rep->guard_bad++ == 0) {
+            fail(rep, "byte %zu outside the copy was changed", off);
+        }
+    }
+
+    uet_engine_get_stats(n->e, &st);
+    if (n->tx.uet != 0)
+        fail(rep, "%" PRIu64 " UET frames went on the wire", n->tx.uet);
+    if (st.tx_loopback == 0)
+        fail(rep, "nothing went through the loopback");
+    (void)uet_engine_peer_remove(n->e, peer);
+    (void)uet_engine_mr_dereg(n->e, mr);
+}
+
 /* ------------------------------------------------------------------ */
 /* Driver                                                             */
 /* ------------------------------------------------------------------ */
@@ -1117,6 +1217,8 @@ static pid_t spawn(const struct test_case *tc, const char *role, int wire_fd,
 
     if (strcmp(role, "target") == 0)
         run_target(&n, &rep);
+    else if (tc->kind == CASE_LOOPBACK)
+        run_loopback(&n, &rep);
     else if (tc->kind == CASE_ABORT)
         run_initiator_abort(&n, &rep);
     else
@@ -1252,6 +1354,68 @@ static void check_wire(const struct test_case *tc, const struct report *ini,
      * data packets. */
     if (tc->want_retx && i->retx == 0 && i->rud_req + i->rudi_req <= data_pkts)
         fail(verdict, "no retransmission was needed");
+}
+
+/* One process, one engine, writing to itself. */
+static bool run_loopback_case(const struct test_case *tc)
+{
+    int wire[2], ctl[2], rp[2];
+    char log[256];
+    struct report rep, verdict;
+    int st = 0;
+
+    printf("case %s: %s\n", tc->name, tc->what);
+    fflush(stdout);
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, wire) != 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, ctl) != 0 || pipe(rp) != 0) {
+        printf("  FAIL: %s\n", strerror(errno));
+        return false;
+    }
+    const int others[] = {wire[1], ctl[1], rp[0]};
+    pid_t pid = spawn(tc, "loopback", wire[0], ctl[0], rp[1], log, sizeof(log),
+                      others, sizeof(others) / sizeof(others[0]));
+    close(wire[0]);
+    close(ctl[0]);
+    close(rp[1]);
+
+    memset(&rep, 0, sizeof(rep));
+    bool have = read_report(rp[0], &rep);
+    close(rp[0]);
+    (void)waitpid(pid, &st, 0);
+    close(wire[1]);
+    close(ctl[1]);
+
+    memset(&verdict, 0, sizeof(verdict));
+    verdict.ok = 1;
+    if (!have)
+        fail(&verdict, "the process died without reporting (%#x)",
+             (unsigned)st);
+    else if (!rep.ok)
+        fail(&verdict, "%s", rep.why);
+    else if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        fail(&verdict, "the process exited badly (%#x)", (unsigned)st);
+
+    if (have) {
+        printf("  %zu bytes in %.1f ms (%.1f MiB/s); %" PRIu64
+               " frames through the loopback, %" PRIu64
+               " UET frames on the wire; compared %" PRIu64 " bytes, %" PRIu64
+               " wrong, %" PRIu64 " untouched bytes changed\n",
+               xfer_len, rep.xfer_ms,
+               rep.xfer_ms > 0 ? ((double)xfer_len / (1024.0 * 1024.0)) /
+                                     (rep.xfer_ms / 1000.0)
+                               : 0.0,
+               rep.st.tx_loopback, rep.tx.uet, rep.compared, rep.mismatches,
+               rep.guard_bad);
+    }
+    if (verdict.ok) {
+        printf("  PASS\n\n");
+        unlink(log);
+        return true;
+    }
+    printf("  FAIL: %s\n", verdict.why);
+    dump_log(log);
+    printf("\n");
+    return false;
 }
 
 static bool run_case(const struct test_case *tc)
@@ -1700,7 +1864,10 @@ int main(int argc, char **argv)
                 continue;
         }
         run++;
-        passed += run_case(&cases[i]) ? 1u : 0u;
+        passed += (cases[i].kind == CASE_LOOPBACK ? run_loopback_case(&cases[i])
+                                                  : run_case(&cases[i]))
+                      ? 1u
+                      : 0u;
     }
 
     printf("%u/%u cases passed\n", passed, run);

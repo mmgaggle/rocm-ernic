@@ -79,6 +79,8 @@ struct uet_nic_ernic_stats {
     uint64_t icmp_echo_replies; /* pings to the engine answered */
     uint64_t icmp_limited;      /* echo requests over the rate, unanswered */
     uint64_t icmp_dropped;      /* other or malformed ICMP to the engine */
+    uint64_t tx_loopback;       /* of tx_frames, to the engine itself: never on
+                                 * the wire */
 };
 
 /*

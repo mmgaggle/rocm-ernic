@@ -1467,6 +1467,7 @@ void uet_engine_get_stats(const struct uet_engine *e,
     out->rx_dropped = ns.rx_dropped;
     out->tx_frames = ns.tx_frames;
     out->tx_frames_iov = ns.tx_frames_iov;
+    out->tx_loopback = ns.tx_loopback;
     out->tx_dropped = ns.tx_dropped;
     out->arp_requests = ns.arp_requests;
     out->arp_replies = ns.arp_replies;

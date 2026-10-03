@@ -224,6 +224,13 @@ ARP request goes out, and a retry succeeds once the reply has
 arrived. Peers must be on the same Ethernet segment. There is
 no gateway support yet.
 
+A peer can be the engine itself. Several programs in one guest
+share its engine, and so its address, and one may write into
+another's region. The engine resolves its own address to its own
+MAC, and a frame it sends to that MAC goes straight to its own
+receive queue, never to the wire. The provider then plays both
+sides, as initiator and as target, over RUDI or RUD.
+
 Guest memory
 ^^^^^^^^^^^^
 
@@ -609,6 +616,11 @@ case checks what really crossed the wire.
    * - ``sng-1MiB``, ``sng-1MiB-ip``
      - The write over the stop-and-go PDS (``pds=sng``), in
        both encapsulations.
+   * - ``loopback-rudi``, ``loopback-rud``,
+       ``loopback-rudi-jumbo``
+     - One engine writes from one part of its region to another,
+       its own address as the peer. The copy compares, the bytes
+       around it are untouched, and no UET frame reaches the wire.
    * - ``abort-rudi``, ``abort-rud``
      - Two writes of half a megabyte each while the wire loses
        every IP frame. The first is taken back, the wire comes

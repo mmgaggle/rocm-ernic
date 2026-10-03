@@ -48,6 +48,10 @@
 /* Frames received but not yet polled by the provider. */
 #define RX_SLOTS 256u
 
+/* Frames the engine sent to itself, waiting to be read: room for a whole
+ * RUDI window (512 packets) with its responses. */
+#define LOOP_SLOTS 2048u
+
 /* Next-hop resolution. */
 #define NEIGH_MAX        32u
 #define ARP_RETRY_MS     250u    /* resend an unanswered request after this */
@@ -97,6 +101,16 @@ struct uet_nic_ernic {
     struct rx_slot slots[RX_SLOTS];
     unsigned rx_head; /* next slot the provider reads */
     unsigned rx_count;
+
+    /* Loopback: frames to the engine's own MAC, each in its own buffer,
+     * never on the wire.  Several daemons in one guest share its engine,
+     * and write to each other through it. */
+    struct loop_frame {
+        uint8_t *data;
+        size_t len;
+    } *loop;
+    unsigned loop_head;
+    unsigned loop_count;
 
     struct neigh neigh[NEIGH_MAX];
 
@@ -434,6 +448,52 @@ static int shim_getinfo(struct uet_nic *nic, struct uet_nic_info *info)
     return 0;
 }
 
+/* A frame to the engine's own MAC goes to its own receive queue. */
+static bool to_self(const struct uet_nic_ernic *n, const uint8_t *frame)
+{
+    return memcmp(frame, n->mac, 6) == 0;
+}
+
+/*
+ * Queue a looped frame for the provider, gathered from @iov.  A full queue
+ * loses it, as a congested wire would, and PDS recovers.  The frame is the
+ * engine's own, so it is not checked the way one off the wire is.
+ */
+static int loop_frame(struct uet_nic_ernic *n, const struct iovec *iov,
+                      unsigned cnt, size_t len)
+{
+    struct loop_frame *f;
+    size_t off = 0;
+
+    if (n->loop == NULL) {
+        n->loop = calloc(LOOP_SLOTS, sizeof(*n->loop));
+        if (n->loop == NULL)
+            return -ENOMEM;
+    }
+    if (n->loop_count == LOOP_SLOTS) {
+        n->stats.rx_dropped++;
+        return 0;
+    }
+    f = &n->loop[(n->loop_head + n->loop_count) % LOOP_SLOTS];
+    f->data = malloc(len);
+    if (f->data == NULL)
+        return -ENOMEM;
+    for (unsigned i = 0; i < cnt; i++) {
+        if (iov[i].iov_len > len - off) {
+            free(f->data);
+            f->data = NULL;
+            return -EINVAL;
+        }
+        memcpy(f->data + off, iov[i].iov_base, iov[i].iov_len);
+        off += iov[i].iov_len;
+    }
+    f->len = off;
+    n->loop_count++;
+    n->stats.tx_frames++;
+    n->stats.tx_loopback++;
+    return 0;
+}
+
 static int shim_tx_pkt(struct uet_nic *nic, void *pkt, void *iphdr,
                        size_t pkt_size)
 {
@@ -446,6 +506,11 @@ static int shim_tx_pkt(struct uet_nic *nic, void *pkt, void *iphdr,
     if (pkt_size > (size_t)n->mtu + ETH_HLEN_) {
         n->stats.tx_dropped++;
         return -EMSGSIZE;
+    }
+    if (pkt_size >= ETH_HLEN_ && to_self(n, pkt)) {
+        struct iovec v = {.iov_base = pkt, .iov_len = pkt_size};
+
+        return loop_frame(n, &v, 1, pkt_size);
     }
 
     int rc = n->tx(n->tx_ctx, pkt, pkt_size);
@@ -474,6 +539,8 @@ static int shim_tx_pkt_iov(struct uet_nic *nic, const struct iovec *iov,
         n->stats.tx_dropped++;
         return -EMSGSIZE;
     }
+    if (iov[0].iov_len >= ETH_HLEN_ && to_self(n, iov[0].iov_base))
+        return loop_frame(n, iov, (unsigned)iovcnt, pkt_size);
 
     int rc = n->tx_iov(n->tx_ctx, iov, (unsigned)iovcnt, pkt_size);
     if (rc == -ENOTSUP)
@@ -492,7 +559,7 @@ static int shim_rx_poll(struct uet_nic *nic)
 {
     struct uet_nic_ernic *n = shim_of(nic);
 
-    return (n != NULL && n->rx_count > 0) ? 1 : 0;
+    return (n != NULL && (n->rx_count > 0 || n->loop_count > 0)) ? 1 : 0;
 }
 
 /* Give a wire's buffer back once the frame in it has been read. */
@@ -510,8 +577,29 @@ static int shim_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
 {
     struct uet_nic_ernic *n = shim_of(nic);
 
-    if (n == NULL || n->rx_count == 0)
+    if (n == NULL)
         return 0;
+    if (n->rx_count == 0) {
+        /* Then what the engine sent itself. */
+        if (n->loop_count == 0)
+            return 0;
+        struct loop_frame *f = &n->loop[n->loop_head];
+        int got = 0;
+
+        n->loop_head = (n->loop_head + 1) % LOOP_SLOTS;
+        n->loop_count--;
+        if (f->len <= pkt_buf_size && f->len >= nic->min_pkt_size) {
+            memcpy(pkt, f->data, f->len);
+            *rx_pkt_size = f->len;
+            n->stats.rx_frames++;
+            got = 1;
+        } else {
+            n->stats.rx_dropped++;
+        }
+        free(f->data);
+        f->data = NULL;
+        return got;
+    }
 
     struct rx_slot *s = &n->slots[n->rx_head];
     n->rx_head = (n->rx_head + 1) % RX_SLOTS;
@@ -545,8 +633,13 @@ static int shim_resolve_nh(struct uet_nic *nic, const struct uet_fa *fa,
         return -ENODEV;
     if (is_ipv6)
         return -EAFNOSUPPORT;
-    if (fa->v4 == n->ip || fa->v4 == 0)
+    if (fa->v4 == 0)
         return -EHOSTUNREACH;
+    /* The engine itself: its frames loop back without the wire. */
+    if (fa->v4 == n->ip) {
+        memcpy(mac, n->mac, 6);
+        return 0;
+    }
 
     uint64_t now = now_ms();
     struct neigh *e = neigh_find(n, fa->v4);
@@ -644,6 +737,9 @@ void uet_nic_ernic_destroy(struct uet_nic_ernic *n)
         return;
     for (unsigned i = 0; i < n->rx_count; i++)
         slot_release(&n->slots[(n->rx_head + i) % RX_SLOTS]);
+    for (unsigned i = 0; n->loop != NULL && i < n->loop_count; i++)
+        free(n->loop[(n->loop_head + i) % LOOP_SLOTS].data);
+    free(n->loop);
     free(n->slot_mem);
     free(n);
 }
@@ -771,7 +867,7 @@ bool uet_nic_ernic_rx_frame_ext(struct uet_nic_ernic *n, const void *frame,
 
 bool uet_nic_ernic_rx_pending(const struct uet_nic_ernic *n)
 {
-    return n != NULL && n->rx_count > 0;
+    return n != NULL && (n->rx_count > 0 || n->loop_count > 0);
 }
 
 void uet_nic_ernic_tick(struct uet_nic_ernic *n, uint64_t now)
